@@ -1,0 +1,7 @@
+# keep repo/meta files out of the release zip (git archive)
+.gitattributes export-ignore
+.gitignore export-ignore
+.github export-ignore
+docs export-ignore
+tests export-ignore
+ci export-ignore
