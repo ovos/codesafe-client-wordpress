@@ -30,6 +30,10 @@ function wp_shim_reset(): void
 		'options' => [],
 		// apply_filters() callbacks, by hook name
 		'filters' => [],
+		// the accounts get_user_by() finds: login => [ID, email, capabilities]
+		'users' => [],
+		// the ids is_super_admin() answers true for
+		'super_admins' => [],
 	];
 }
 
@@ -43,6 +47,50 @@ class WP_Error
 	)
 	{
 	}
+}
+
+class WP_User
+{
+	public function __construct(
+		public int $ID = 0,
+		public string $user_login = '',
+		public string $user_email = '',
+		/** the capabilities user_can() grants, by name */
+		public array $caps = [],
+	)
+	{
+	}
+}
+
+function get_user_by(
+	string $field,
+	string $value,
+): WP_User|false
+{
+	foreach($GLOBALS['wp']['users'] as $login => [$id, $email, $caps])
+	{
+		if(($field === 'login' && $login === $value) || ($field === 'email' && $email === $value))
+		{
+			return new WP_User($id, $login, $email, $caps);
+		}
+	}
+	
+	return false;
+}
+
+function user_can(
+	WP_User $user,
+	string $capability,
+): bool
+{
+	return in_array($capability, $user->caps, true);
+}
+
+function is_super_admin(
+	int $userId = 0,
+): bool
+{
+	return in_array($userId, $GLOBALS['wp']['super_admins'], true);
 }
 
 function add_filter(

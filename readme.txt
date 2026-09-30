@@ -94,6 +94,8 @@ Errors with their request context, redacted first: credentials and nonces droppe
 == Changelog ==
 
 = 1.0.1 =
+* A failed login on an **administrator** account (`manage_options`, or a multisite super admin) is reported as a WARNING: codesafe makes it an issue and alerts where the project alerts at that level, while every other wrong password stays at the kind's default and pages nobody.
+* A failed login on an existing account now names the account, as a login that succeeded after failures already did: codesafe keeps each account's failures as one issue, and can tell many accounts refused at once — an outage, a group locked out — from one person retrying. A username no account carries stays nameless.
 * A security event can carry the priority its sender gives it: `Sender::reportRefusal()` takes a last, optional priority, which codesafe keeps when it is more severe than the kind's default, so a refusal a site knows matters becomes an issue, and an alert where the project alerts at that level. Without one, every event goes out as before and codesafe applies the kind's default.
 
 = 1.0.0 =

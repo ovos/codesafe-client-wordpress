@@ -14,6 +14,7 @@ use function is_scalar;
 use function max;
 use function md5;
 use function method_exists;
+use function str_contains;
 use function strtolower;
 
 /**
@@ -60,6 +61,15 @@ class Security
 	 */
 	protected const FAILURE_WINDOW = 900;
 	
+	/**
+	 * The priority a failed login on an ADMINISTRATOR account is reported at:
+	 * WARNING, where every other refusal stays at codesafe's default for the
+	 * kind (INFO). An admin's wrong password is the one worth an issue and an
+	 * alert — the account an intruder wants, and one that is rarely mistyped
+	 * twice (codesafe docs/plans/sender-security-priority.md)
+	 */
+	protected const ADMIN_FAILURE_PRIORITY = 4;
+	
 	public function __construct(
 		protected Sender $sender,
 	)
@@ -88,6 +98,12 @@ class Security
 	 * whatever the door (wp-login, XML-RPC, REST basic auth). The username
 	 * is masked; the WP_Error CODES (invalid_username, incorrect_password)
 	 * say why without quoting core's HTML error messages.
+	 *
+	 * When the name belongs to an account, the account travels as
+	 * context.userId — codesafe groups a security event by kind and account,
+	 * so each account's failures are one issue, and many accounts refused at
+	 * once can be counted as many. A name no account carries stays nameless.
+	 * An administrator's failure is raised to WARNING.
 	 */
 	public function reportLoginFailed(
 		$username,
@@ -108,7 +124,44 @@ class Security
 		$this->countFailure('user', $username);
 		$this->countFailure('ip', $this->clientIp());
 		
-		$this->sender->reportRefusal('auth_failure', $message);
+		$account = $this->account($username);
+		
+		$this->sender->reportRefusal('auth_failure', $message, [],
+			$account === null ? [] : ['userId' => (string)$account->ID],
+			$account !== null && $this->isAdministrator($account) ? self::ADMIN_FAILURE_PRIORITY : null);
+	}
+	
+	/**
+	 * The account a presentation named — by login, or by e-mail, the other
+	 * name wp-login accepts; null for a name no account carries
+	 */
+	protected function account(
+		string $username,
+	): ?WP_User
+	{
+		if($username === '')
+		{
+			return null;
+		}
+		
+		$user = get_user_by('login', $username);
+		if($user instanceof WP_User === false && str_contains($username, '@'))
+		{
+			$user = get_user_by('email', $username);
+		}
+		
+		return $user instanceof WP_User && (int)$user->ID > 0 ? $user : null;
+	}
+	
+	/**
+	 * Whether the account runs the site — manage_options, or a multisite
+	 * super admin, who holds it on every site of the network
+	 */
+	protected function isAdministrator(
+		WP_User $user,
+	): bool
+	{
+		return user_can($user, 'manage_options') || is_super_admin((int)$user->ID);
 	}
 	
 	/**
