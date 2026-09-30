@@ -4,7 +4,7 @@ Tags: error monitoring, error reporting, javascript errors, logging, debugging
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -92,6 +92,9 @@ Install ovos codesafe beside it and activate it. Its settings are copied, the ol
 Errors with their request context, redacted first: credentials and nonces dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Nothing is ever deleted or changed on the site.
 
 == Changelog ==
+
+= 1.0.1 =
+* A security event can carry the priority its sender gives it: `Sender::reportRefusal()` takes a last, optional priority, which codesafe keeps when it is more severe than the kind's default, so a refusal a site knows matters becomes an issue, and an alert where the project alerts at that level. Without one, every event goes out as before and codesafe applies the kind's default.
 
 = 1.0.0 =
 * First public release: PHP and JavaScript error reporting, security events, traffic rollups, the software inventory and auto-update of probed vulnerable plugins, the integrity scan, and the Shield — match and rate rules, at `plugins_loaded` and optionally before WordPress. Every release is signed, and the plugin verifies the signature before WordPress installs an update.

@@ -26,7 +26,9 @@ use function in_array;
 use function is_int;
 use function is_string;
 use function json_encode;
+use function max;
 use function mb_substr;
+use function min;
 use function register_shutdown_function;
 use function rtrim;
 use function session_id;
@@ -265,21 +267,28 @@ class Sender
 	}
 	
 	/**
-	 * Reports a refused action as a kind=security event (priority 6, INFO) —
-	 * what was REFUSED, beside what broke: failed logins, rejected nonce
-	 * checks, forbidden REST calls, sensitive admin changes. $kind must come
-	 * from SECURITY_KINDS (the console refuses unknown kinds; anything else
-	 * is a silent no-op) and rides events[0].className, the same slot an
-	 * exception's class occupies. No-op unless the security_events setting
-	 * is on; rate-capped so an attack cannot flood its own report channel.
-	 * The console accepts these apart from the project's severity threshold
-	 * (a kind, not a severity) but has its own per-project off switch.
+	 * Reports a refused action as a kind=security event — what was REFUSED,
+	 * beside what broke: failed logins, rejected nonce checks, forbidden REST
+	 * calls, sensitive admin changes. $kind must come from SECURITY_KINDS (the
+	 * console refuses unknown kinds; anything else is a silent no-op) and rides
+	 * events[0].className, the same slot an exception's class occupies. No-op
+	 * unless the security_events setting is on; rate-capped so an attack cannot
+	 * flood its own report channel. The console accepts these apart from the
+	 * project's severity threshold (a kind, not a severity) but has its own
+	 * per-project off switch.
+	 *
+	 * $priority is the site's word that THIS one matters: codesafe stores the
+	 * event at its kind's default (a refusal INFO) unless a MORE severe value
+	 * (0-7) is named here, and never below the default (codesafe
+	 * docs/plans/sender-security-priority.md). Without one the event goes out
+	 * at INFO, below every kind's default.
 	 */
 	public function reportRefusal(
 		string $kind,
 		string $message = '',
 		array $extra = [],
 		array $context = [],
+		?int $priority = null,
 	): void
 	{
 		// a shield kind rides on "Exploit detection" alone: detection is its own
@@ -305,7 +314,7 @@ class Sender
 				? Redactor::maskEmails(mb_substr($message, 0, 512))
 				: $kind;
 			
-			$payload = Payload::fromMessage($message, 6, $extra);
+			$payload = Payload::fromMessage($message, $priority === null ? 6 : max(0, min(7, $priority)), $extra);
 			$payload['kind'] = 'security';
 			$payload['type'] = 'security';
 			$payload['events'] = [
