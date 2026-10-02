@@ -4,7 +4,7 @@ Tags: error monitoring, error reporting, javascript errors, logging, debugging
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
-Stable tag: 1.0.1
+Stable tag: 1.0.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -89,9 +89,12 @@ Install ovos codesafe beside it and activate it. Its settings are copied, the ol
 
 = What leaves the site? =
 
-Errors with their request context, redacted first: credentials and nonces dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Nothing is ever deleted or changed on the site.
+Errors with their request context, redacted first: credentials and nonces dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Once a day, which of the plugin's own switches are on, and its version. Nothing is ever deleted or changed on the site.
 
 == Changelog ==
+
+= 1.0.2 =
+* The plugin tells codesafe which of its own switches are on — 404 reports, traffic rollups, security events, the software inventory, auto-update, the integrity scan, the executed-file watch, the Shield, the JavaScript client — once a day and whenever one changes. Every feature needs its switch on in codesafe AND here, and codesafe's project list used to show only its own half: a feature switched on there but off on this site now shows dimmed, with the reason. It also shows this site's plugin version even when the site reports no errors. Nothing else is sent: no setting values, no keys, no content.
 
 = 1.0.1 =
 * A failed login on an **administrator** account (`manage_options`, or a multisite super admin) is reported as a WARNING: codesafe makes it an issue and alerts where the project alerts at that level, while every other wrong password stays at the kind's default and pages nobody.

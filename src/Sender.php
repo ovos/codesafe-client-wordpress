@@ -1030,6 +1030,48 @@ class Sender
 		return (int)wp_remote_retrieve_response_code($response);
 	}
 	
+	/**
+	 * Tells codesafe which of this plugin's own switches are on (codesafe
+	 * docs/plans/project-features-live.md, SENDER.md §7 "Hello"): POST
+	 * /api/v1/ingest/hello with the key — the client and its version, the
+	 * platform, the switches in codesafe's words. Synchronous through the WP
+	 * HTTP API and best-effort: the response code back, 0 when the sender is
+	 * off or codesafe is out of reach. Hello::maybeSend() calls it.
+	 *
+	 * @param array<string, bool> $features Hello::features()
+	 */
+	public function hello(
+		array $features,
+	): int
+	{
+		if($this->isEnabled() === false)
+		{
+			return 0;
+		}
+		
+		$response = wp_remote_post($this->config->url() . '/api/v1/ingest/hello', [
+			'timeout' => 5,
+			'headers' => [
+				'Content-Type' => 'application/json',
+				'X-Codesafe-Key' => $this->config->apiKey(),
+			],
+			'body' => (string)json_encode([
+				'v' => 1,
+				'client' => 'wordpress/' . Plugin::VERSION,
+				'platform' => 'wordpress',
+				'features' => $features,
+			]),
+			'sslverify' => $this->verifyTls(),
+		]);
+		
+		if(is_wp_error($response))
+		{
+			return 0;
+		}
+		
+		return (int)wp_remote_retrieve_response_code($response);
+	}
+	
 	protected function send(
 		string $json,
 	): void

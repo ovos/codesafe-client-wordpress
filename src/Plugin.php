@@ -12,7 +12,7 @@ use function strtok;
  */
 final class Plugin
 {
-	public const VERSION = '1.0.1';
+	public const VERSION = '1.0.2';
 	
 	/**
 	 * Fixed 60-second cap on 404 access-event reports, so a hard scan cannot
@@ -94,6 +94,10 @@ final class Plugin
 		{
 			(new Inventory($this->config, $this->sender))->register();
 		}
+		
+		// which of this plugin's switches are on, told to codesafe once a day
+		// and whenever one changes (codesafe docs/plans/project-features-live.md)
+		(new Hello($this->config, $this->sender))->register();
 		
 		// the integrity scan: a Scan now button on the settings page always,
 		// a shutdown-time background pass when its own switch is on — read-

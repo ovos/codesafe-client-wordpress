@@ -34,6 +34,9 @@ function wp_shim_reset(): void
 		'users' => [],
 		// the ids is_super_admin() answers true for
 		'super_admins' => [],
+		// wp_remote_post(): every [url, args] posted, and the status it answers (0 = unreachable)
+		'posted' => [],
+		'post_status' => 202,
 	];
 }
 
@@ -204,6 +207,29 @@ function add_option(
 	$GLOBALS['wp']['options'][$name] = $value;
 	
 	return true;
+}
+
+function update_option(
+	string $name,
+	mixed $value,
+	mixed $autoload = null,
+): bool
+{
+	$GLOBALS['wp']['options'][$name] = $value;
+	
+	return true;
+}
+
+function wp_remote_post(
+	string $url,
+	array $args,
+): mixed
+{
+	$GLOBALS['wp']['posted'][] = [$url, $args];
+	
+	return $GLOBALS['wp']['post_status'] === 0
+		? new WP_Error('http_request_failed', 'unreachable')
+		: ['code' => $GLOBALS['wp']['post_status'], 'body' => ''];
 }
 
 function apply_filters(

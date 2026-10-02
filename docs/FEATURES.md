@@ -468,6 +468,10 @@ again on its side as a backstop, but the first cut happens here:
   only while a body rule is live.
 - **Browser reports** strip input values and scripts from a DOM snapshot in
   the browser, before upload.
+- **The hello** says which of the plugin's own switches are on, on or off,
+  and the plugin's version — once a day and whenever a box changes, so
+  codesafe's project list can dim a feature switched on there but off here.
+  Never a setting's value, a URL or a key.
 
 ## Automatic, signed updates
 
