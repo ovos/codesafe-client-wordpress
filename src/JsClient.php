@@ -123,7 +123,7 @@ class JsClient
 			. "\t\tcaptureMessage: function () { stub.calls.push(['captureMessage'].concat([].slice.call(arguments))); },\n"
 			. "\t\tflush: function () {}\n"
 			. "\t};\n"
-			. "\tvar options = " . wp_json_encode($options, JSON_UNESCAPED_SLASHES) . ";" . $context . "\n"
+			. "\tvar options = " . wp_json_encode($options, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP) . ";" . $context . "\n"
 			. "\tw.ovosConsole.init(options);\n"
 			. "})(window);\n"
 			. "</script>\n"

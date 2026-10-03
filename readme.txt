@@ -4,7 +4,7 @@ Tags: error monitoring, error reporting, javascript errors, logging, debugging
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
-Stable tag: 1.0.3
+Stable tag: 1.0.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -92,6 +92,12 @@ Install ovos codesafe beside it and activate it. Its settings are copied, the ol
 Errors with their request context, redacted first: credentials, nonces, card and bank fields and password-reset keys dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Once a day, which of the plugin's own switches are on, and its version. Nothing is ever deleted or changed on the site.
 
 == Changelog ==
+
+= 1.0.4 =
+**Update today — a page could freeze.** The bundled JavaScript client recorded the page's last `console.warn`/`console.error` calls as breadcrumbs, and an argument that was a page element (a framework warning passing a component or a node is common) was walked as data: through the element's document, the window and every sibling — one `console.warn('x', element)` blocked the page for over 30 seconds in testing. A page element, the window and an event are now recorded by name (`<span#cart>`, `[window]`), and every logged or attached object is read with limits: its own keys only, at most 100 per object and 500 objects per call, a cycle named instead of followed. The same limits apply to the extra data a page attaches to a reported error.
+
+* The bundled client is codesafe's current one again (it was the copy from before the rename): it also drops `otp`, `pin` and `hash` from reported URLs, `jwt`, `bearer` and `signature` from logged data, and honours `data-codesafe-mask` on snapshots beside `data-console-mask`.
+* The settings printed into the page for the client are encoded with `<`, `>` and `&` escaped, so no value — a release name from `wp-config.php` included — can end the inline script.
 
 = 1.0.3 =
 **Security release — update today.** Everything below was found in an audit of the plugin on 2026-10-03; none of it is known to have been exploited.

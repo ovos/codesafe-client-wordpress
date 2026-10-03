@@ -1,10 +1,10 @@
 /**
- * ovos/console browser error client — no dependencies, no build.
+ * ovos/codesafe browser error client — no dependencies, no build.
  *
- *   <script src="https://console.example/js/console-client.js"></script>
+ *   <script src="https://codesafe.example/js/codesafe-client.js"></script>
  *   <script>
- *     ovosConsole.init({
- *       url: 'https://console.example',   // console instance base URL
+ *     ovosCodesafe.init({
+ *       url: 'https://codesafe.example',   // codesafe instance base URL
  *       key: 'PUBLIC_JS_KEY',             // project js_key (public by design)
  *       logLevel: 4,                      // send priority <= logLevel
  *       release: '2026.06.28',            // optional deploy label (indexed)
@@ -13,7 +13,7 @@
  *     });
  *   </script>
  *
- * Loading async (recommended — a slow or unreachable console then never
+ * Loading async (recommended — a slow or unreachable codesafe then never
  * blocks the page): emit the pre-init stub inline BEFORE the async script
  * tag (canonical snippet in docs/CLIENT.md). The stub buffers window
  * error/unhandledrejection events (capture phase, so resource failures are
@@ -38,16 +38,16 @@
  *   instrumentFetch (true), instrumentXhr (true).
  * - Trace correlation: trace (true — send a W3C traceparent header on the
  *   page's same-origin fetch/XHR calls, so a backend sender that honors
- *   it (php-library's Console\Sender does) reports the same trace id and
- *   frontend + backend errors of one request correlate in the console;
+ *   it (php-library's Codesafe sender does) reports the same trace id and
+ *   frontend + backend errors of one request correlate in codesafe;
  *   failed-request reports carry the id as traceId, fetch/xhr
  *   breadcrumbs too), traceOrigins (null — extra origins to propagate
  *   to, string prefixes or RegExp; traceparent is not CORS-safelisted,
  *   so a listed origin must allow it via Access-Control-Allow-Headers).
  * - OTLP export: otlp ('' — an OpenTelemetry Collector's OTLP/HTTP logs
  *   endpoint, e.g. https://collector:4318/v1/logs; when set, reports are
- *   sent there as OTLP/JSON log records instead of to the console's js
- *   endpoint — a webjs-tagged resource, so a console fed by the
+ *   sent there as OTLP/JSON log records instead of to codesafe's js
+ *   endpoint — a webjs-tagged resource, so a codesafe instance fed by the
  *   collector still ingests them as type js; url/key become optional,
  *   only snapshots still need them; the export uses fetch + CORS, so the
  *   collector must allow the page's origin), otlpHeaders (null — extra
@@ -89,7 +89,7 @@
  * embedded browsers, because a SyntaxError would silence error reporting
  * exactly where the errors live. Newer runtime APIs are feature-detected
  * instead (sendBeacon, fetch), and every handler swallows its own
- * exceptions. The "latest browsers only" rule covers the console UI, not
+ * exceptions. The "latest browsers only" rule covers codesafe UI, not
  * this embed.
  */
 (function () {
@@ -123,7 +123,7 @@
 	// are webhook signatures, but matched loosely they would also eat
 	// ?design=, ?assign= and ?barcode=. Server side: Scrubber::NAMES (substring)
 	// and Scrubber::QUERY_NAMES (exact); keep the two lists in step.
-	var SCRUB_PARAMS = /([?&#](?:[^=&#]*(?:token|key|password|passwd|pwd|auth|session|secret|email)[^=&#]*|code|sig|signature)=)[^&#]*/gi;
+	var SCRUB_PARAMS = /([?&#](?:[^=&#]*(?:token|key|password|passwd|pwd|auth|session|secret|email)[^=&#]*|code|sig|signature|otp|pin|hash)=)[^&#]*/gi;
 	// Token-shaped PATH segments -> [redacted]. Query params live in
 	// SCRUB_PARAMS, but single-use credentials travel in paths and are followed
 	// over GET: /reset-password/<jwt>, /invite/<token>, a magic link.
@@ -146,7 +146,12 @@
 	// values the e-mail mask already handled)
 	var SCRUB_USER_PARAMS = /([?&#](?:user(?:[_-]?(?:name|login))?|login)=)(?![^&#]*(?:\*{3}|@|%40))([^&#]+)/gi;
 	// secret-named keys of the extra bag -> [redacted]
-	var SCRUB_KEYS = /pass(word|wd)?|pwd|token|secret|authorization|cookie|api[-_]?key/i;
+	/* scrubBag's bounds (JS audit 2026-10-03, C1): keys per object — the
+		server keeps 100 too (Scrubber::MAX_ITEMS) — and objects per bag */
+	var SCRUB_KEYS_MAX = 100;
+	var SCRUB_OBJECTS_MAX = 500;
+	
+	var SCRUB_KEYS = /pass(word|wd)?|pwd|token|secret|authorization|cookie|api[-_]?key|jwt|bearer|signature/i;
 	// anchored username keys of the extra bag -> maskName()
 	var USER_KEYS = /^(user([_-]?(name|login))?|login)$/i;
 	
@@ -174,11 +179,11 @@
 		ignore: [/^Script error\.?$/, /^ResizeObserver loop/],
 		release: '',        // deploy label (git sha, version) — indexed server-side
 		environment: '',    // deployment stage (staging, development) — indexed server-side;
-		                    // the console badges non-production values beside the project name
+		                    // codesafe badges non-production values beside the project name
 		tags: [],           // tags on every report (docs/plans/event-tags.md): an array of
 		                    // tokens (['shop', 'eu']) or one string split on commas and
 		                    // whitespace — indexed server-side, one filter per tag; the
-		                    // console lowercases and validates them. Per-report tags go
+		                    // codesafe lowercases and validates them. Per-report tags go
 		                    // into the extra bag (context() or a capture's extra) as `tags`
 		context: null,
 		breadcrumbs: true,
@@ -210,7 +215,7 @@
 			config.url = String(config.url || '').replace(/\/+$/, '');
 			config.otlp = String(config.otlp || '').replace(/\/+$/, '');
 			tags = normalizeTags(config.tags);
-			// OTLP mode stands alone; the console transport needs url + key
+			// OTLP mode stands alone; codesafe transport needs url + key
 			if (config.otlp === '' && (!config.url || !config.key)) {
 				config = null;
 				return;
@@ -332,7 +337,7 @@
 			// endpoint or the call site is ours (isFirstPartyRequest). An untagged
 			// rejection must carry a first-party frame in its reason's stack — a
 			// reason-less rejection (undefined/null) has none and drops here too.
-			var request = reason && reason.__ovosConsoleRequest;
+			var request = reason && reason.__ovosCodesafeRequest;
 			if (request
 				? !isFirstPartyRequest(request)
 				: !isFirstParty('', reason && reason.stack)) {
@@ -372,7 +377,7 @@
 			crumb('resource', {tag: tag, url: scrub(url, 200)});
 			
 			// one of OUR scripts failed: whatever the inline code throws next is
-			// a dependency failure, not a bug — the console flags it scripts_failed
+			// a dependency failure, not a bug — codesafe flags it scripts_failed
 			if (tag === 'script' && failedScripts.length < 10 && isFirstParty(url, '', 0)) {
 				failedScripts.push(scrub(url, 200));
 			}
@@ -392,7 +397,7 @@
 	
 	function captureException(error, extra, priority) {
 		try {
-			var request = error && error.__ovosConsoleRequest;
+			var request = error && error.__ovosCodesafeRequest;
 			report({
 				message: error && error.message || String(error),
 				name: error && error.name || 'Error',
@@ -482,7 +487,7 @@
 			entry.environment = truncate(config.environment, 64);
 		}
 		// the tags on every report (docs/plans/event-tags.md) — indexed
-		// server-side as one filter per tag; the console does the shape work
+		// server-side as one filter per tag; codesafe does the shape work
 		// (lowercase, its pattern, its cap), this only lists them
 		if (tags.length > 0) {
 			entry.tags = tags;
@@ -534,7 +539,7 @@
 		}
 		
 		// secrets dropped, e-mails masked (domain kept), username fields
-		// anonymized — the console scrubs again server-side as a backstop
+		// anonymized — codesafe scrubs again server-side as a backstop
 		return scrubBag(merged, 0);
 	}
 	
@@ -559,8 +564,8 @@
 			// the spec'd automation admission — Selenium, Puppeteer and
 			// Playwright (and the AI browsing agents built on them) set it by
 			// default. Only ever sent as true: absence is the common case and
-			// claims nothing. The console lifts it into the indexed `flags`
-			// field (Console\Error\Row), where the issue panel facets it.
+			// claims nothing. codesafe lifts it into the indexed `flags`
+			// field (Codesafe\Error\Row), where the issue panel facets it.
 			if (navigator.webdriver === true) {
 				extra.webdriver = true;
 			}
@@ -791,7 +796,7 @@
 			for (var i = 0; i < levels.length; i++) {
 				(function (level) {
 					var original = console[level];
-					if (!original || original.__ovosConsole) {
+					if (!original || original.__ovosCodesafe) {
 						return;
 					}
 					console[level] = function () {
@@ -800,7 +805,7 @@
 						} catch (ignored) {}
 						return original.apply(console, arguments);
 					};
-					console[level].__ovosConsole = true;
+					console[level].__ovosCodesafe = true;
 				})(levels[i]);
 			}
 		} catch (ignored) {}
@@ -822,6 +827,8 @@
 				parts.push(scrubBag(value, 0));
 			} else if (value instanceof Error) {
 				parts.push(value.name + ': ' + scrubBag(value.message, 0));
+			} else if (hostMarker(value) !== null) {
+				parts.push(hostMarker(value));
 			} else {
 				try {
 					parts.push(JSON.stringify(scrubBag(value, 0)));
@@ -831,6 +838,35 @@
 			}
 		}
 		return parts.join(' ');
+	}
+	
+	/**
+		A host object named instead of walked: a DOM node as its selector, a
+		window or an event as a marker, null for anything else. Walking one
+		is not a scrub but a freeze — a node reaches ownerDocument, the window
+		and every sibling, and console.warn('x', element) blocked a page for
+		35 s (JS audit 2026-10-03, C1). A cross-origin window throws on the
+		probe, which names it too */
+	function hostMarker(value) {
+		if (value === null || typeof value !== 'object' && typeof value !== 'function') {
+			return null;
+		}
+		try {
+			if (value === window || value.window === value) {
+				return '[window]';
+			}
+			if (typeof value.nodeType === 'number' && typeof value.nodeName === 'string') {
+				return value.nodeType === 1 && value.tagName
+					? '<' + selectorFor(value) + '>'
+					: '[' + value.nodeName + ']';
+			}
+			if (typeof Event !== 'undefined' && value instanceof Event) {
+				return '[' + value.type + ' event]';
+			}
+		} catch (crossOrigin) {
+			return '[window]';
+		}
+		return null;
 	}
 	
 	/** short ancestor-path selector — never element text or HTML */
@@ -859,7 +895,7 @@
 	
 	function instrumentFetch() {
 		try {
-			if (!window.fetch || window.fetch.__ovosConsole) {
+			if (!window.fetch || window.fetch.__ovosCodesafe) {
 				return;
 			}
 			
@@ -913,7 +949,7 @@
 					throw error;
 				});
 			};
-			wrapped.__ovosConsole = true;
+			wrapped.__ovosCodesafe = true;
 			window.fetch = wrapped;
 		} catch (ignored) {}
 	}
@@ -924,7 +960,7 @@
 				return;
 			}
 			var proto = XMLHttpRequest.prototype;
-			if (!proto.open || proto.open.__ovosConsole) {
+			if (!proto.open || proto.open.__ovosCodesafe) {
 				return;
 			}
 			
@@ -934,31 +970,31 @@
 			
 			proto.open = function (method, url) {
 				try {
-					this.__ovosConsole = {
+					this.__ovosCodesafe = {
 						method: String(method || 'GET').toUpperCase(),
 						url: String(url || ''),
 					};
 				} catch (ignored) {}
 				return open.apply(this, arguments);
 			};
-			proto.open.__ovosConsole = true;
+			proto.open.__ovosCodesafe = true;
 			
 			// remember an app-set traceparent: XHR COMBINES repeated headers,
 			// so injecting a second value would corrupt the app's own tracing
 			proto.setRequestHeader = function (name, value) {
 				try {
-					if (this.__ovosConsole && String(name).toLowerCase() === 'traceparent') {
-						this.__ovosConsole.traceparent = String(value || '');
+					if (this.__ovosCodesafe && String(name).toLowerCase() === 'traceparent') {
+						this.__ovosCodesafe.traceparent = String(value || '');
 					}
 				} catch (ignored) {}
 				return setHeader.apply(this, arguments);
 			};
-			proto.setRequestHeader.__ovosConsole = true;
+			proto.setRequestHeader.__ovosCodesafe = true;
 			
 			proto.send = function () {
 				var xhr = this;
 				try {
-					var info = xhr.__ovosConsole;
+					var info = xhr.__ovosCodesafe;
 					if (info && isOwnTraffic(info.url) === false) {
 						info.started = sinceLoad();
 						if (config.trace && traceEligible(info.url)) {
@@ -1011,7 +1047,7 @@
 	function tagError(error, info) {
 		try {
 			if (error && typeof error === 'object') {
-				error.__ovosConsoleRequest = {
+				error.__ovosCodesafeRequest = {
 					method: info.method,
 					url: scrub(info.url, 500),
 					status: info.status || 0,
@@ -1019,7 +1055,7 @@
 					callStack: info.stack,
 				};
 				if (info.traceId) {
-					error.__ovosConsoleRequest.traceId = info.traceId;
+					error.__ovosCodesafeRequest.traceId = info.traceId;
 				}
 			}
 		} catch (ignored) {}
@@ -1046,7 +1082,7 @@
 	 */
 	function maybeSnapshot(entry) {
 		try {
-			// snapshots upload to the console's origin-gated endpoint — an
+			// snapshots upload to codesafe's origin-gated endpoint — an
 			// OTLP-only setup (no url/key) has nowhere to put them
 			if (!config.snapshot || !config.url || !config.key
 				|| snapshotsSent >= config.snapshotPerPage
@@ -1137,7 +1173,7 @@
 			}
 		}
 		
-		var selectors = ['[data-console-mask]'].concat(config.snapshotMask || []);
+		var selectors = ['[data-codesafe-mask]', '[data-console-mask]'].concat(config.snapshotMask || []);
 		for (i = 0; i < selectors.length; i++) {
 			try {
 				var masked = clone.querySelectorAll(selectors[i]);
@@ -1148,7 +1184,7 @@
 		}
 		
 		// resolve relative urls (images, and any stylesheet left as a <link>)
-		// when viewed on the console host — pages carrying their own <base>
+		// when viewed on codesafe host — pages carrying their own <base>
 		// already resolve correctly and must not have it overridden
 		try {
 			var head = clone.querySelector('head');
@@ -1747,7 +1783,11 @@
 	/** extra bag (and nested request bags): secret-named keys dropped,
 		e-mail values masked (domain kept), username keys masked to their
 		groups (maskName) */
-	function scrubBag(bag, depth) {
+	function scrubBag(bag, depth, walk) {
+		// one budget per top-level call: the objects already entered (a cycle
+		// or a shared child is named, not walked again) and how many more may
+		// be — a bag is evidence, and a graph past 500 objects is not one
+		walk = walk || {seen: [], left: SCRUB_OBJECTS_MAX};
 		try {
 			if (typeof bag === 'string') {
 				return maskEmails(bag);
@@ -1758,21 +1798,43 @@
 			if (depth >= 6) {
 				return '[redacted]';
 			}
+			var marker = hostMarker(bag);
+			if (marker !== null) {
+				return marker;
+			}
+			if (walk.seen.indexOf(bag) !== -1) {
+				return '[circular]';
+			}
+			if (walk.left <= 0) {
+				return '[truncated]';
+			}
+			walk.left--;
+			walk.seen.push(bag);
 			if (Array.isArray(bag)) {
 				var list = [];
-				for (var i = 0; i < bag.length; i++) {
-					list.push(scrubBag(bag[i], depth + 1));
+				for (var i = 0; i < bag.length && i < SCRUB_KEYS_MAX; i++) {
+					list.push(scrubBag(bag[i], depth + 1, walk));
 				}
 				return list;
 			}
 			var out = {};
+			var keys = 0;
 			for (var key in bag) {
+				// own keys only: an inherited getter is the class's, not the
+				// evidence's, and reading one may run code
+				if (!Object.prototype.hasOwnProperty.call(bag, key)) {
+					continue;
+				}
+				if (++keys > SCRUB_KEYS_MAX) {
+					out._truncated = true;
+					break;
+				}
 				var value = bag[key];
 				if (SCRUB_KEYS.test(key)) {
 					// dropped wholesale — even when the value is an object
 					out[key] = '[redacted]';
 				} else if (value !== null && typeof value === 'object') {
-					out[key] = scrubBag(value, depth + 1);
+					out[key] = scrubBag(value, depth + 1, walk);
 				} else if (typeof value === 'string') {
 					var masked = maskEmails(value);
 					// a one-character local part masks to itself and an already-
@@ -2027,9 +2089,9 @@
 	}
 	
 	/**
-	 * The tags option as the list the console reads: an array's strings, or
+	 * The tags option as the list codesafe reads: an array's strings, or
 	 * one string split on commas, semicolons and whitespace — trimmed, empties
-	 * dropped, at most 10 (the console's own cap per event)
+	 * dropped, at most 10 (codesafe's own cap per event)
 	 */
 	function normalizeTags(value) {
 		var list = Array.isArray(value)
@@ -2075,7 +2137,7 @@
 	}
 	
 	// syslog priority -> OTLP severityNumber band (higher = more severe
-	// there); the console maps the bands back to 2/3/4/6/7 — 0/1 collapse
+	// there); codesafe maps the bands back to 2/3/4/6/7 — 0/1 collapse
 	// into critical and 5 into info on the round trip
 	var OTLP_SEVERITY = {0: 21, 1: 21, 2: 21, 3: 17, 4: 13, 5: 9, 6: 9, 7: 5};
 	var OTLP_SEVERITY_TEXT = {
@@ -2106,7 +2168,7 @@
 	}
 	
 	/** report entries -> ExportLogsServiceRequest. The webjs-tagged
-		resource is what makes a console behind the collector ingest these
+		resource is what makes a codesafe instance behind the collector ingest these
 		as type js (browser grouping, page host, extra.col). */
 	function toOtlp(batch) {
 		var records = [];
@@ -2115,7 +2177,7 @@
 		}
 		
 		var resource = [
-			attr('telemetry.sdk.name', 'ovos-console-client'),
+			attr('telemetry.sdk.name', 'ovos-codesafe-client'),
 			attr('telemetry.sdk.language', 'webjs'),
 			attr('service.name', String(location.host || '')),
 		];
@@ -2130,7 +2192,7 @@
 		return {resourceLogs: [{
 			resource: {attributes: resource.filter(Boolean)},
 			scopeLogs: [{
-				scope: {name: 'ovos-console-client'},
+				scope: {name: 'ovos-codesafe-client'},
 				logRecords: records,
 			}],
 		}]};
@@ -2164,7 +2226,7 @@
 		}
 		
 		// extra fields become one attribute each — unmapped attributes spill
-		// into the console's context.extra verbatim, so pageId, breadcrumbs,
+		// into codesafe's context.extra verbatim, so pageId, breadcrumbs,
 		// request and snapshotId land exactly where the js endpoint puts them
 		for (var key in entry.extra || {}) {
 			attributes.push(attr(key, entry.extra[key]));
@@ -2311,22 +2373,25 @@
 	}
 	
 	// Async-loader stub takeover (docs/CLIENT.md): when a page loaded this
-	// file async, an inline stub is already on ovosConsole — buffering
+	// file async, an inline stub is already on ovosCodesafe (or ovosConsole) — buffering
 	// events and holding the init() options. Detach its blind listeners,
 	// publish the real API over the shim, then init with the recorded
 	// options; init() ends by draining the buffers. No task boundary exists
 	// between removeEventListener and init()'s addEventListener, so no
 	// event slips between them and none is seen twice. Synchronous
 	// includes have no stub — nothing changes for them.
-	var stub = window.ovosConsole && window.ovosConsole.stub;
+	var stub = (window.ovosCodesafe && window.ovosCodesafe.stub)
+		|| (window.ovosConsole && window.ovosConsole.stub);
 	
-	window.ovosConsole = {
+	// ovosConsole is the name from before the rename (2026-09-24): pages
+	// written against it call ovosConsole.init() and keep working
+	window.ovosCodesafe = window.ovosConsole = {
 		init: init,
 		captureException: captureException,
 		captureMessage: captureMessage,
 		flush: flush,
 		// capability marker: this build drains the async-loader stub. Loaders
-		// that must work against older consoles too (ovos-play) probe it
+		// that must work against older codesafe instances too (ovos-play) probe it
 		// onload — absent means a pre-drain client swallowed the stub and
 		// never initialised, so such loaders fall back to init()ing directly.
 		stubAware: true,
