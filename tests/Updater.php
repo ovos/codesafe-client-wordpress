@@ -3,12 +3,14 @@ declare(strict_types=1);
 
 namespace Tests;
 
+use Ovos\Codesafe\Plugin;
 use Ovos\Codesafe\Updater as BaseUpdater;
 use Ovos\Test;
 use Ovos\Test\Exception\SkipException;
 use Ovos\Test\Internal;
 use Tests\Files\TestUpdater;
 use WP_Error;
+use ZipArchive;
 
 use function base64_decode;
 use function base64_encode;
@@ -36,6 +38,8 @@ use function sodium_crypto_sign_secretkey;
 use function str_repeat;
 use function substr;
 use function substr_replace;
+use function sys_get_temp_dir;
+use function tempnam;
 use function unlink;
 use function wp_shim_reset;
 
@@ -82,7 +86,9 @@ class Updater extends Test
 		$this->secret = sodium_crypto_sign_secretkey($pair);
 		$this->otherSecret = sodium_crypto_sign_secretkey(sodium_crypto_sign_keypair());
 		$this->public = bin2hex(sodium_crypto_sign_publickey($pair));
-		$this->zip = "PK\x03\x04" . random_bytes(2000);
+		// a real release zip: the plugin's main file under git archive's prefix,
+		// carrying the version the release tag offers (M15)
+		$this->zip = $this->zipOf('9.9.9');
 		$this->good = $this->sign($this->zip, $this->secret);
 		
 		TestUpdater::$key = $this->public;
@@ -198,7 +204,9 @@ class Updater extends Test
 	
 	public function flippedByteInSignatureDoesNotVerify(): bool
 	{
-		$tampered = base64_encode(substr_replace(base64_decode($this->good), "\x00", 3, 1));
+		// a flip, never a write of \x00 — the byte may already be one (1 run in 256)
+		$raw = base64_decode($this->good);
+		$tampered = base64_encode(substr_replace($raw, chr(ord($raw[3]) ^ 1), 3, 1));
 		
 		return BaseUpdater::verify($this->zip, $tampered, $this->public) === false;
 	}
@@ -292,7 +300,76 @@ class Updater extends Test
 		return $this->downloaded(self::OURS, $this->zip, $this->good, '/already/decided.zip') === '/already/decided.zip';
 	}
 	
+	// ---- the version inside the zip (M15) ------------------------------------
+	
+	/**
+	 * A GENUINE signed build of another version, re-released under a newer
+	 * tag, is not an update: the signature covers the bytes, the header inside
+	 * them names the version, and it must be the one offered
+	 */
+	public function aSignedOldBuildUnderANewTagIsRefusedAndTheFileIsGone(): bool
+	{
+		$old = $this->zipOf('1.0.0');
+		$result = $this->downloaded(self::OURS, $old, $this->sign($old, $this->secret));
+		$path = end($GLOBALS['wp']['downloaded']);
+		
+		return $result instanceof WP_Error
+			&& $result->code === 'ovos_codesafe_version'
+			&& is_string($path)
+			&& is_file($path) === false;
+	}
+	
+	/** signed bytes that are no zip, or a zip without the plugin's main file, carry no version: refused */
+	public function aSignedPackageWithoutAReadableVersionIsRefused(): bool
+	{
+		$bytes = "PK\x03\x04" . random_bytes(2000);
+		$empty = $this->zipOf(null);
+		
+		return $this->downloaded(self::OURS, $bytes, $this->sign($bytes, $this->secret)) instanceof WP_Error
+			&& $this->downloaded(self::OURS, $empty, $this->sign($empty, $this->secret)) instanceof WP_Error;
+	}
+	
+	public function theOfferedVersionIsTheTagTheAssetSitsUnder(): bool
+	{
+		return BaseUpdater::versionOfPackage(self::OURS) === '9.9.9'
+			&& BaseUpdater::versionOfPackage('https://github.com/ovos/codesafe-client-wordpress/releases/download/1.0.3/ovos-codesafe.zip') === '1.0.3'
+			&& BaseUpdater::versionOfPackage('https://github.com/ovos/codesafe-client-wordpress/releases/download/latest/ovos-codesafe.zip') === null
+			&& BaseUpdater::versionOfPackage(self::THEIRS) === null;
+	}
+	
+	public function theHeaderVersionIsReadTheWayWordPressReadsIt(): bool
+	{
+		return BaseUpdater::headerVersion("<?php\n/**\n * Plugin Name: x\n * Version: 1.0.3\n */\n") === '1.0.3'
+			&& BaseUpdater::headerVersion("<?php\n// Version: 2.1 */\n") === '2.1'
+			&& BaseUpdater::headerVersion("<?php\n/* Version: 1.0.3-beta */") === null
+			&& BaseUpdater::headerVersion("<?php\n/* Plugin Name: x */") === null
+			&& BaseUpdater::headerVersion((string)file_get_contents(__DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'ovos-codesafe.php')) === Plugin::VERSION;
+	}
+	
 	// ---- helpers --------------------------------------------------------------
+	
+	/**
+	 * The bytes of a release-shaped zip whose main file says Version: $version
+	 * — null leaves the main file out
+	 */
+	protected function zipOf(
+		?string $version,
+	): string
+	{
+		$path = tempnam(sys_get_temp_dir(), 'zip');
+		$zip = new ZipArchive();
+		$zip->open($path, ZipArchive::OVERWRITE);
+		$zip->addFromString('ovos-codesafe/readme.txt', random_bytes(64));
+		if($version !== null)
+		{
+			$zip->addFromString(BaseUpdater::MAIN_FILE, "<?php\n/**\n * Plugin Name: ovos codesafe\n * Version: " . $version . "\n */\n");
+		}
+		$zip->close();
+		$bytes = (string)file_get_contents($path);
+		unlink($path);
+		
+		return $bytes;
+	}
 	
 	/**
 	 * The .sig the workflow publishes: base64 of the 64 raw bytes, one line

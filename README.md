@@ -61,7 +61,7 @@ wp config set CODESAFE_JS_KEY 'the project js_key'
 | Enabled | on | the master switch |
 | Log level | `4 — warning` (the default) | warnings and worse; `3 — error` for a noisy legacy site, `5 — notice` when you want more |
 | Report 404s | on | scanner and broken-link traffic, counted apart from errors and never turned into issues — this is the probe signal |
-| Security events | on | failed logins, the login that succeeded after failures, rejected nonces, forbidden REST calls, sensitive admin changes — usernames masked, 60 per minute at most |
+| Security events | on | failed logins, the login that succeeded after failures, rejected nonces, forbidden REST calls, sensitive admin changes — usernames masked, a per-minute budget per kind (a flood is summarised, admin changes never held back) |
 | Software inventory | on, **and** the project's CVE switch in codesafe | your plugin and theme versions against the vulnerability feeds; "vulnerable and being probed" needs this |
 | Exploit detection | on | pulls the exploit rules for the CVEs you run and **reports** matches; blocks nothing |
 | Integrity scan | on, weekly | a read-only walk for files nobody shipped and the site's hardening posture; press **Scan now** once right after installing |
@@ -90,7 +90,7 @@ wp config set CODESAFE_JS_KEY 'the project js_key'
 APCu is PHP's shared memory between requests. On this page it matters for one switch:
 
 - **Traffic rollups need it.** The per-minute counters accumulate in APCu and one request per minute ships them. Without APCu the switch collects nothing and sends nothing — deliberately silent, because a host without shared memory could only produce wrong numbers. The Shield's per-rule hit counters ride the same memory, so they are missing too.
-- **Everything else works without it.** Errors, security events, the inventory, the integrity scan and the Shield's matching itself — the Shield keeps its rules in `wp-content/ovos-codesafe/shield.json` when there is no APCu. Only the Shield's rate rules need it too: without APCu they are skipped.
+- **Everything else works without it.** Errors, security events, the inventory, the integrity scan and the Shield's matching itself — the Shield keeps its rules in a file under `wp-content/ovos-codesafe/` (or `CODESAFE_STORE_DIR`) when there is no APCu. Only the Shield's rate rules need it too: without APCu they are skipped.
 
 **How to tell:** the settings page says so on the **APCu** line right above *Traffic rollups* — *available* or *NOT available on this server's PHP*. Ask your host to enable the `apcu` extension for the **web server's** PHP (mod_php or PHP-FPM); on your own server that is `apt install php-apcu` or the equivalent, then a restart of PHP. The command line's `php -m` does not count: CLI PHP usually has APCu off even when the web server has it on.
 
@@ -106,7 +106,7 @@ Every value lives under **Settings → ovos codesafe**, or as a constant in `wp-
 | Log level | `CODESAFE_LOG_LEVEL` | `4` | send errors with syslog priority ≤ this (0 emergency … 7 debug) |
 | Report 404s | `CODESAFE_REPORT_404` | `false` | front-end not-found requests as access events — rate-limited, static assets ignored, never issues |
 | Traffic rollups | `CODESAFE_ROLLUPS` | `false` | anonymous per-minute request counters and duration histograms; needs APCu and the project's rollups switch |
-| Security events | `CODESAFE_SECURITY_EVENTS` | `false` | refused actions and sensitive admin changes as `security` events; 60/min at most |
+| Security events | `CODESAFE_SECURITY_EVENTS` | `false` | refused actions and sensitive admin changes as `security` events; a per-minute budget per kind, the excess summarised |
 | Software inventory | `CODESAFE_INVENTORY` | `false` | installed plugin/theme/core versions, daily and on change; needs the project's CVE switch |
 | Auto-update probed vulnerable plugins | `CODESAFE_AUTO_UPDATE_VULNERABLE` | `false` | WordPress' own auto-update, switched on for a plugin that is vulnerable and probed; needs the inventory and the project's Auto-update switch |
 | Exploit detection | `CODESAFE_SHIELD_DETECT` | `false` | pull this site's exploit rules every five minutes and match every request before WordPress runs; matches are reported, nothing is blocked; fails open |
@@ -124,6 +124,9 @@ Every value lives under **Settings → ovos codesafe**, or as a constant in `wp-
 | DOM snapshot | `CODESAFE_SNAPSHOT` | `false` | masked DOM snapshot with the first error per page load |
 | Inline snapshot styles | `CODESAFE_SNAPSHOT_STYLES` | `false` | embed the page's CSS so snapshots render styled |
 | Load in wp-admin | `CODESAFE_JS_ADMIN` | `false` | also report browser errors from wp-admin and the login page |
+| Trusted proxy header | `CODESAFE_TRUSTED_PROXY_HEADER` | — | behind a proxy/CDN only: the header naming the visitor (`CF-Connecting-IP`, `X-Forwarded-For`); read only from the ranges below |
+| Trusted proxy ranges | `CODESAFE_TRUSTED_PROXIES` | — | the proxies' CIDRs or addresses, comma-separated; `cloudflare` = Cloudflare's published ranges (bundled). Empty: `REMOTE_ADDR` is the visitor |
+| — | `CODESAFE_STORE_DIR` | — | constant only: an absolute directory **outside the document root** for the Shield's and the watch's store (recommended on nginx/IIS); the prepend stub stays in `wp-content/ovos-codesafe/` |
 
 Example `wp-config.php` block:
 
@@ -140,7 +143,7 @@ define('CODESAFE_ENVIRONMENT', 'production');
 
 Every report is reduced in the plugin before it is sent; codesafe redacts again on its side as a backstop.
 
-- **Errors** travel with their request context: the URL, method, headers and variables, the logged-in user id, WordPress version, active theme, and which plugin or theme the failing file belongs to. **Credentials are dropped by field name** wherever they stand — passwords in every spelling, tokens, keys, cookies, authorization headers and CSRF nonces — **usernames are masked** to every fourth character and **e-mail addresses** keep only their domain. The request body is parsed and cleaned the same way (`structure`), or not sent at all (`off`).
+- **Errors** travel with their request context: the URL, method, headers and variables, the logged-in user id, WordPress version, active theme, and which plugin or theme the failing file belongs to. **Credentials are dropped by field name** wherever they stand — passwords in every spelling, tokens, keys, cookies, authorization headers, CSRF nonces, card numbers and security codes, account numbers and IBANs, and in the request's query and post the reset link's `key`, `code`, `otp`, `sig` and their kin — **usernames are masked** to every fourth character and **e-mail addresses** keep only their domain. The request body is parsed and cleaned the same way (`structure`), or not sent at all (`off`).
 - **Security events** carry the refused action's kind, the masked username or the option's *name*, never a value.
 - **Traffic rollups** are counts under names WordPress defines — never a URL, an address, a user agent or a cookie.
 - **The inventory** is the list of what is installed with versions — never paths, options or user data.
@@ -220,7 +223,7 @@ auto_prepend_file = "/var/www/site/wp-content/ovos-codesafe/prepend.php"
 php_value auto_prepend_file "/var/www/site/wp-content/ovos-codesafe/prepend.php"
 ```
 
-With it, every anonymous request is judged before WordPress exists; a request carrying a login cookie is judged at `plugins_loaded` as before. The stub is outside the plugin directory and includes the plugin only if it is still there, so removing the plugin never leaves PHP with a missing prepend file; the layer fails open on everything; the settings page says *ACTIVE* once PHP reports the directive. The plugin never edits your server configuration. Details in [docs/FEATURES.md](docs/FEATURES.md#the-shield).
+With it, every anonymous request is judged before WordPress exists; a request carrying a login cookie to a file WordPress runs through (`index.php`, `wp-login.php`, wp-admin's own pages …) is judged at `plugins_loaded` as before, and anywhere else — a direct hit on a plugin's file — by this layer, cookie or not. The stub is outside the plugin directory and includes the plugin only if it is still there, so removing the plugin never leaves PHP with a missing prepend file; the layer fails open on everything; the settings page says *ACTIVE* once PHP reports the directive. The plugin never edits your server configuration. Every file in the store begins with a PHP `exit` and the ruleset's file name is random, so a server that ignores `.htaccess` (nginx, IIS) serves nothing from it — the settings page warns there, and `CODESAFE_STORE_DIR` moves the data out of the document root. **Deactivating** the plugin switches the layer off through its consent file; **uninstalling** removes the store, leaving the stub in place (doing nothing) while PHP still names it — remove the `auto_prepend_file` line, then the directory. On a **multisite** network the Shield, the watch and the trusted proxy are the main site's, set by a super admin. Details in [docs/FEATURES.md](docs/FEATURES.md#the-shield).
 
 **The executed-file watch** rides the same layer (on by default while it is active; the *Executed-file watch* box or `CODESAFE_ENTRY_WATCH` switches it off): every PHP file the site runs that WordPress did not ship as an entry point is recorded the moment it runs — size, md5, the request's address — and judged on the next request against what wordpress.org shipped. A file nobody shipped becomes an integrity finding in the console, with one security event (`file_executed`) for the address that ran it. Details in [docs/FEATURES.md](docs/FEATURES.md#the-executed-file-watch).
 

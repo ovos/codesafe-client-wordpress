@@ -14,6 +14,8 @@ declare(strict_types=1);
 
 const HOUR_IN_SECONDS = 3600;
 
+const DAY_IN_SECONDS = 86400;
+
 function wp_shim_reset(): void
 {
 	$GLOBALS['wp_version'] = '6.8';
@@ -21,6 +23,14 @@ function wp_shim_reset(): void
 		// the Updater's GitHub API answer, and the transient it caches it in
 		'api' => null,
 		'transient' => null,
+		// every transient by name, beside the one above (the Updater's tests read that)
+		'transients' => [],
+		// multisite: whether this is a network, whether the current site is its main
+		// one, the user's id (is_super_admin), and the main site's options
+		'multisite' => false,
+		'main_site' => true,
+		'user_id' => 0,
+		'main_options' => [],
 		// .sig and zip downloads, by URL
 		'sig_by_url' => [],
 		'sig_status' => 200,
@@ -93,7 +103,7 @@ function is_super_admin(
 	int $userId = 0,
 ): bool
 {
-	return in_array($userId, $GLOBALS['wp']['super_admins'], true);
+	return in_array($userId === 0 ? $GLOBALS['wp']['user_id'] : $userId, $GLOBALS['wp']['super_admins'], true);
 }
 
 function add_filter(
@@ -121,7 +131,9 @@ function get_transient(
 	string $key,
 ): mixed
 {
-	return $GLOBALS['wp']['transient'];
+	return array_key_exists($key, $GLOBALS['wp']['transients'])
+		? $GLOBALS['wp']['transients'][$key]
+		: $GLOBALS['wp']['transient'];
 }
 
 function set_transient(
@@ -131,8 +143,51 @@ function set_transient(
 ): bool
 {
 	$GLOBALS['wp']['transient'] = $value;
+	$GLOBALS['wp']['transients'][$key] = $value;
 	
 	return true;
+}
+
+function delete_transient(
+	string $key,
+): bool
+{
+	unset($GLOBALS['wp']['transients'][$key]);
+	
+	return true;
+}
+
+function delete_option(
+	string $name,
+): bool
+{
+	unset($GLOBALS['wp']['options'][$name]);
+	
+	return true;
+}
+
+function is_multisite(): bool
+{
+	return $GLOBALS['wp']['multisite'];
+}
+
+function is_main_site(): bool
+{
+	return $GLOBALS['wp']['main_site'];
+}
+
+function get_main_site_id(): int
+{
+	return 1;
+}
+
+function get_blog_option(
+	int $id,
+	string $name,
+	mixed $default = false,
+): mixed
+{
+	return $GLOBALS['wp']['main_options'][$name] ?? $default;
 }
 
 function is_wp_error(
@@ -262,6 +317,13 @@ function sanitize_text_field(
 ): string
 {
 	return trim(strip_tags($value));
+}
+
+function esc_url_raw(
+	string $url,
+): string
+{
+	return $url;
 }
 
 function wp_get_environment_type(): string

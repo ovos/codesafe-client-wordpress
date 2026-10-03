@@ -4,7 +4,7 @@ Tags: error monitoring, error reporting, javascript errors, logging, debugging
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
-Stable tag: 1.0.2
+Stable tag: 1.0.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -89,9 +89,23 @@ Install ovos codesafe beside it and activate it. Its settings are copied, the ol
 
 = What leaves the site? =
 
-Errors with their request context, redacted first: credentials and nonces dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Once a day, which of the plugin's own switches are on, and its version. Nothing is ever deleted or changed on the site.
+Errors with their request context, redacted first: credentials, nonces, card and bank fields and password-reset keys dropped by field name, usernames and e-mail addresses masked, the request body parsed and cleaned (or off). Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Once a day, which of the plugin's own switches are on, and its version. Nothing is ever deleted or changed on the site.
 
 == Changelog ==
+
+= 1.0.3 =
+**Security release — update today.** Everything below was found in an audit of the plugin on 2026-10-03; none of it is known to have been exploited.
+
+* **A password-reset key could leave the site.** The reset link's `key` was dropped from the reported URL but sent whole in the request's query bag, and the reset form's `rp_key` in its post bag — next to the account's name — whenever a warning, a 404 or a security event fired on `wp-login.php?action=rp` (every version up to 1.0.2). Anyone who could read the event in codesafe could have reset that password while the key was valid (24 hours by default). The query-only names (`key`, `code`, `auth`, `sig`, `otp`, `pin`, `hash`) are now dropped from the request bags too, by exact name. Card fields in every gateway's spelling (`card_number`, `cc-number`, `x_card_num`, `card_cvc`, `cvv`, `csc`, the expiry), `rp_key`, an account number and an IBAN are dropped everywhere. On `wp-login.php` and `xmlrpc.php` the login name (`log`, `user_login`) leaves masked instead of as typed. If a reset key from before this update sits in codesafe, it has long expired; card fields a gateway posted server-side may — delete those events.
+* **The Shield's files were readable on nginx and IIS.** The store under `wp-content/ovos-codesafe/` was protected only by an Apache `.htaccess`: elsewhere its ruleset (the CVE patterns), the consent (the site's path) and the queued reports (visitor addresses, user agents, URLs) could be downloaded. Every file now begins with a PHP `exit`, the ruleset's name is drawn at random, URLs are scrubbed before they are queued, and `CODESAFE_STORE_DIR` moves the store outside the document root (the stub stays where your PHP configuration names it). The settings page warns on a server that does not read `.htaccess`. The old files are converted on the first request after the update.
+* **The prepend layer skipped any request carrying a login cookie** — by its name alone — even on a direct hit to a plugin's PHP file, where nothing else judges. It now leaves a signed-in request to WordPress only where WordPress runs.
+* **Multisite:** the Shield's store is one for the whole network, and a subsite admin's boxes could pull another console's rules into it. On a network the Shield, the executed-file watch and the trusted proxy are now the main site's, set by a super admin; a subsite's boxes are locked.
+* **Updates:** a signed release zip must carry, in its own plugin header, the version the release offers — a genuine old build re-released under a new tag can no longer roll a site back.
+* **Deactivating** the plugin now switches the prepend layer off (it kept judging and recording before); **uninstalling** removes every option and transient and the store with its visitor data. A stub your PHP configuration still names is left in place, doing nothing: remove the `auto_prepend_file` line, then the directory.
+* **Security events** have a budget per kind instead of one for all: sixty failed logins in a minute no longer silence the privilege grant or the Shield block that follows. Sensitive admin changes are never held back, and what goes over a budget is sent as one summary event with the count.
+* **Behind a proxy or CDN** (Cloudflare, a load balancer), the new *Trusted proxy header* and *Trusted proxy ranges* settings (`CODESAFE_TRUSTED_PROXY_HEADER`, `CODESAFE_TRUSTED_PROXIES`; `cloudflare` stands for Cloudflare's published ranges) make reports, rate rules and the prepend layer name the visitor instead of the edge. The header is read only from those ranges; without them, the connecting address is the visitor, as before.
+
+**Configuration change on update:** none required. On nginx or IIS, consider `define('CODESAFE_STORE_DIR', '/path/outside/the/docroot');` in `wp-config.php`.
 
 = 1.0.2 =
 * The plugin tells codesafe which of its own switches are on — 404 reports, traffic rollups, security events, the software inventory, auto-update, the integrity scan, the executed-file watch, the Shield, the JavaScript client — once a day and whenever one changes. Every feature needs its switch on in codesafe AND here, and codesafe's project list used to show only its own half: a feature switched on there but off on this site now shows dimmed, with the reason. It also shows this site's plugin version even when the site reports no errors. Nothing else is sent: no setting values, no keys, no content.

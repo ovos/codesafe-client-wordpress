@@ -3,7 +3,7 @@ declare(strict_types=1);
 /**
  * Plugin Name: ovos codesafe
  * Description: Connects this site to an ovos codesafe instance — PHP and browser JavaScript errors, with grouping, alerting and issue lifecycle handled by the console.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Requires at least: 6.0
  * Requires PHP: 8.3
  * Author: ovos media gmbh
@@ -39,6 +39,10 @@ spl_autoload_register(static function ($class) {
 });
 
 Ovos\Codesafe\Plugin::boot(__FILE__);
+
+// the prepend layer runs whether or not the plugin does: deactivating switches
+// it off through its consent file (security audit 2026-10-03 M16)
+register_deactivation_hook(__FILE__, [Ovos\Codesafe\Lifecycle::class, 'deactivate']);
 
 if(function_exists('ovos_codesafe') === false)
 {

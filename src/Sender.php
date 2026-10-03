@@ -8,6 +8,7 @@ namespace Ovos\Codesafe;
 use ErrorException;
 use Throwable;
 
+use function array_keys;
 use function array_map;
 use function array_replace;
 use function array_slice;
@@ -19,10 +20,12 @@ use function curl_setopt_array;
 use function defined;
 use function error_get_last;
 use function error_reporting;
+use function file_get_contents;
 use function function_exists;
 use function gmdate;
 use function http_response_code;
 use function in_array;
+use function is_array;
 use function is_int;
 use function is_string;
 use function json_encode;
@@ -35,11 +38,15 @@ use function session_id;
 use function session_status;
 use function set_error_handler;
 use function spl_object_id;
+use function sprintf;
 use function str_replace;
 use function str_starts_with;
+use function stripos;
 use function strlen;
 use function strpos;
+use function strtolower;
 use function substr;
+use function time;
 use function trim;
 
 use const PHP_SESSION_ACTIVE;
@@ -87,10 +94,36 @@ class Sender
 	];
 	
 	/**
-	 * Fixed 60-second cap on security-event reports, so a credential-stuffing
-	 * run cannot turn this reporter into the flood it is meant to surface
+	 * Per-KIND 60-second caps on security-event reports, so a credential-
+	 * stuffing run cannot turn this reporter into the flood it is meant to
+	 * surface — and cannot silence the event that matters next: until 1.0.3
+	 * one budget served every kind, and sixty bad logins in a minute swallowed
+	 * the privilege grant that followed them (security audit 2026-10-03 M17).
+	 *
+	 * A kind missing here has no cap: privileged_action needs an administrator
+	 * to happen at all, and the executed-file watch reports a path once. A
+	 * kind past its cap is never dropped silently: the excess is counted and
+	 * goes out as ONE summary event of that kind when its window closes
+	 * (summariseSecurity) — and shield_block, whose every refusal is also in
+	 * the rollups' per-rule counts, gets the widest budget of all
 	 */
-	protected const MAX_SECURITY_PER_MINUTE = 60;
+	protected const SECURITY_BUDGETS = [
+		'auth_failure' => 30,
+		'auth_success' => 30,
+		'csrf_reject' => 30,
+		'permission_denied' => 30,
+		'rate_limited' => 30,
+		'validation_refused' => 30,
+		'shield_observe' => 60,
+		'shield_rate' => 30,
+		'shield_block' => 120,
+	];
+	
+	/** the window every budget counts in, in seconds */
+	protected const SECURITY_WINDOW = 60;
+	
+	/** the one transient that holds every kind's window: {kind: {start, count, over}} */
+	protected const SECURITY_RATE_KEY = 'ovos_codesafe_security_rate';
 	
 	protected const MAX_QUEUE = 100;
 	
@@ -303,11 +336,26 @@ class Sender
 		if($gate === false
 			|| in_array($kind, self::SECURITY_KINDS, true) === false
 			|| count($this->queue) >= self::MAX_QUEUE
-			|| $this->allowSecurity() === false)
+			|| $this->allowSecurity($kind) === false)
 		{
 			return;
 		}
 		
+		$this->queueSecurity($kind, $message, $extra, $context, $priority);
+	}
+	
+	/**
+	 * One security event onto the queue, past every gate — reportRefusal's
+	 * own, and summariseSecurity's for a window that closed over its budget
+	 */
+	protected function queueSecurity(
+		string $kind,
+		string $message,
+		array $extra,
+		array $context,
+		?int $priority,
+	): void
+	{
 		try
 		{
 			$message = $message !== ''
@@ -352,22 +400,115 @@ class Sender
 	}
 	
 	/**
-	 * Fixed 60-second window cap on security reports (a transient counter,
-	 * same mechanism as the 404 throttle)
+	 * Whether one more $kind event may go out in its window (SECURITY_BUDGETS).
+	 * Every kind counts in its own window, kept in one transient; a kind
+	 * without a budget always may. A refusal is counted, never forgotten: the
+	 * windows that closed over their budget are summarised first, whatever
+	 * kind this call is for
 	 */
-	protected function allowSecurity(): bool
+	protected function allowSecurity(
+		string $kind,
+	): bool
 	{
-		$key = 'ovos_codesafe_security_rate';
-		$count = (int)get_transient($key);
+		$now = $this->now();
+		$stored = get_transient(self::SECURITY_RATE_KEY);
+		// 1.0.2 kept one plain count here
+		$windows = $this->summariseSecurity(is_array($stored) ? $stored : [], $now);
+		$budget = self::SECURITY_BUDGETS[$kind] ?? null;
+		$allowed = true;
 		
-		if($count >= self::MAX_SECURITY_PER_MINUTE)
+		if($budget !== null)
 		{
-			return false;
+			$window = is_array($windows[$kind] ?? null)
+				? $windows[$kind]
+				: ['start' => $now, 'count' => 0, 'over' => 0];
+			
+			if((int)$window['count'] >= $budget)
+			{
+				$window['over'] = (int)$window['over'] + 1;
+				$allowed = false;
+			}
+			else
+			{
+				$window['count'] = (int)$window['count'] + 1;
+			}
+			
+			$windows[$kind] = $window;
 		}
 		
-		set_transient($key, $count + 1, 60);
+		if($windows !== (is_array($stored) ? $stored : []))
+		{
+			// a day, not a minute: the count of a window that closed over its
+			// budget must survive until the next security event carries it
+			set_transient(self::SECURITY_RATE_KEY, $windows, DAY_IN_SECONDS);
+		}
 		
-		return true;
+		return $allowed;
+	}
+	
+	/**
+	 * The windows that closed: each one that refused events goes out as ONE
+	 * event of its kind saying how many — a flood summarised, not a silence —
+	 * and every closed window is dropped. Returns the windows still open
+	 *
+	 * @param array<string, mixed> $windows
+	 * @return array<string, array{start: int, count: int, over: int}>
+	 */
+	protected function summariseSecurity(
+		array $windows,
+		int $now,
+	): array
+	{
+		$open = [];
+		
+		foreach($windows as $kind => $window)
+		{
+			if(is_array($window) === false || in_array($kind, self::SECURITY_KINDS, true) === false)
+			{
+				continue;
+			}
+			
+			$start = (int)($window['start'] ?? 0);
+			if($now - $start < self::SECURITY_WINDOW)
+			{
+				$open[$kind] = $window;
+				
+				continue;
+			}
+			
+			$over = (int)($window['over'] ?? 0);
+			if($over > 0)
+			{
+				$this->queueSecurity((string)$kind,
+					sprintf('%1$d more %2$s events within %3$d seconds were over this site\'s budget and are counted here, not sent one by one',
+						$over, $kind, self::SECURITY_WINDOW),
+					['summary' => true, 'suppressed' => $over, 'sent' => (int)($window['count'] ?? 0), 'window' => self::SECURITY_WINDOW],
+					['at' => $start + self::SECURITY_WINDOW],
+					null);
+			}
+		}
+		
+		return $open;
+	}
+	
+	/** the clock the security budgets count by — a method so a test can move it */
+	protected function now(): int
+	{
+		return time();
+	}
+	
+	/**
+	 * The visitor's address: REMOTE_ADDR, unless the site named a trusted
+	 * proxy and REMOTE_ADDR is one of its ranges — then the address the proxy
+	 * forwarded in the header the site named (security audit 2026-10-03 M5;
+	 * Shield\Prepend::clientIp holds the rule, the prepend layer and this read
+	 * it alike). Opt-in: no header named, REMOTE_ADDR it is, whatever arrives
+	 */
+	public function clientIp(): string
+	{
+		$ip = Shield\Prepend::clientIp($_SERVER, $this->config->trustedProxyHeader(), $this->config->trustedProxies());
+		
+		return sanitize_text_field(wp_unslash($ip));
 	}
 	
 	/**
@@ -603,7 +744,7 @@ class Sender
 			$context['uri'] = Redactor::scrubUrl($this->server('REQUEST_URI'));
 			$context['method'] = $this->server('REQUEST_METHOD');
 			$context['referer'] = Redactor::scrubUrl($this->server('HTTP_REFERER'));
-			$context['ip'] = $this->server('REMOTE_ADDR');
+			$context['ip'] = $this->clientIp();
 			$context['ua'] = $this->server('HTTP_USER_AGENT');
 			// the response status the request ended with — final here, since
 			// buildContext() runs from the shutdown flush after the response
@@ -674,15 +815,20 @@ class Sender
 		// the request data keeps its e-mail addresses and usernames: the
 		// console masks them on arrival and keeps the original encrypted for
 		// an audited reveal and a replay (console docs/plans/reveal-everything.md).
-		// Secrets are dropped here exactly as always; src/Body.php does the same
+		// Secrets are dropped here exactly as always; src/Body.php does the same.
+		// A CREDENTIAL route is the exception (security audit 2026-10-03 H3):
+		// wp-login.php's `log` and `user_login`, XML-RPC's username — the name
+		// beside the password a scanner tried — leave masked, never whole
+		$credential = Body::isCredentialRoute($this->server('REQUEST_URI'));
+		
 		if(!empty($_GET))
 		{
-			$request['get'] = Redactor::scrub(wp_unslash((array)$_GET), identities: false);
+			$request['get'] = Redactor::scrub(wp_unslash((array)$_GET), identities: $credential, request: true);
 		}
 		
 		if(!empty($_POST))
 		{
-			$request['post'] = Redactor::scrub(wp_unslash((array)$_POST), identities: false);
+			$request['post'] = Redactor::scrub(wp_unslash((array)$_POST), identities: $credential, request: true);
 		}
 		// phpcs:enable WordPress.Security.NonceVerification, WordPress.Security.ValidatedSanitizedInput
 		

@@ -3,19 +3,29 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use PclZip;
 use Throwable;
 use WP_Error;
+use ZipArchive;
 
 use function base64_decode;
+use function class_exists;
+use function defined;
+use function explode;
 use function file_get_contents;
 use function hex2bin;
 use function is_array;
+use function is_file;
 use function is_string;
 use function json_decode;
 use function ltrim;
 use function preg_match;
+use function preg_replace;
+use function rawurldecode;
 use function sodium_crypto_sign_verify_detached;
 use function str_starts_with;
+use function strlen;
+use function substr;
 use function trim;
 use function unlink;
 use function version_compare;
@@ -78,6 +88,9 @@ class Updater
 	protected const PACKAGE_PREFIX = 'https://github.com/ovos/codesafe-client-wordpress/releases/download/';
 	
 	protected const CACHE_KEY = 'ovos_codesafe_latest_release';
+	
+	/** the plugin's main file inside a release zip — git archive's ovos-codesafe/ prefix */
+	public const MAIN_FILE = 'ovos-codesafe/ovos-codesafe.php';
 	
 	public function __construct(
 		protected string $file,
@@ -185,7 +198,101 @@ class Updater
 				__('ovos codesafe: the update package is not signed by ovos, or its signature does not match the package. Nothing was installed. If this persists, download the release from github.com/ovos/codesafe-client-wordpress and compare its signature with the published key.', 'ovos-codesafe'));
 		}
 		
+		// the signature covers the zip's bytes and nothing else: the version
+		// came from the release's TAG, which whoever can cut a release names
+		// freely — an old signed build re-released as a new tag would install
+		// as an "update" and roll the site back to what it fixed. The version
+		// the zip itself carries must be the one offered (security audit
+		// 2026-10-03 M15); anything else, or nothing readable, installs nothing
+		$offered = self::versionOfPackage($package);
+		$carried = self::zipVersion($file);
+		if($offered === null || $carried === null || $carried !== $offered)
+		{
+			@unlink($file);
+			
+			return new WP_Error('ovos_codesafe_version',
+				__('ovos codesafe: the update package is signed, but the version inside it is not the version the release offered. Nothing was installed — a genuine old build re-released under a new number would roll this site back. If this persists, tell ovos.', 'ovos-codesafe'));
+		}
+		
 		return $file;
+	}
+	
+	/**
+	 * The version a package URL offers: the tag its release asset sits under
+	 * (…/releases/download/v1.0.3/ovos-codesafe.zip), without the v — null when
+	 * the URL names none
+	 */
+	public static function versionOfPackage(
+		string $package,
+	): ?string
+	{
+		if(self::isOurs($package) === false)
+		{
+			return null;
+		}
+		$tag = explode('/', substr($package, strlen(self::PACKAGE_PREFIX)), 2)[0];
+		$version = ltrim(rawurldecode($tag), 'v');
+		
+		return preg_match('~^\d+(?:\.\d+){1,3}$~', $version) === 1 ? $version : null;
+	}
+	
+	/**
+	 * The `Version:` header of the plugin's main file inside a zip
+	 * (ovos-codesafe/ovos-codesafe.php, the release's own prefix) — null when
+	 * the zip cannot be opened, holds no such file, or the file names no
+	 * plausible version. ZipArchive where PHP has it, else WordPress's own
+	 * PclZip, which every install ships for exactly this
+	 */
+	public static function zipVersion(
+		string $file,
+	): ?string
+	{
+		$source = null;
+		try
+		{
+			if(class_exists('ZipArchive'))
+			{
+				$zip = new ZipArchive();
+				if($zip->open($file) === true)
+				{
+					$read = $zip->getFromName(self::MAIN_FILE);
+					$source = is_string($read) ? $read : null;
+					$zip->close();
+				}
+			}
+			elseif(defined('ABSPATH') && is_file(ABSPATH . 'wp-admin/includes/class-pclzip.php'))
+			{
+				require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+				$archive = new \PclZip($file);
+				$read = $archive->extract(PCLZIP_OPT_BY_NAME, self::MAIN_FILE, PCLZIP_OPT_EXTRACT_AS_STRING);
+				$source = is_array($read) && is_string($read[0]['content'] ?? null) ? $read[0]['content'] : null;
+			}
+		}
+		catch(Throwable)
+		{
+			return null;
+		}
+		
+		return $source === null ? null : self::headerVersion($source);
+	}
+	
+	/**
+	 * The `Version:` header of a plugin file, read the way WordPress's
+	 * get_file_data() reads it — from the first 8 KB, a line that is the
+	 * header name after comment markers — and kept only when it is a plausible
+	 * version
+	 */
+	public static function headerVersion(
+		string $source,
+	): ?string
+	{
+		if(preg_match('~^[ \t/*#@]*Version:(.*)$~mi', substr($source, 0, 8192), $match) !== 1)
+		{
+			return null;
+		}
+		$version = trim(preg_replace('~\s*(?:\*/|\?>).*~', '', $match[1]) ?? '');
+		
+		return preg_match('~^\d+(?:\.\d+){1,3}$~', $version) === 1 ? $version : null;
 	}
 	
 	/**

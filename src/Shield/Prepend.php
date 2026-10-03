@@ -12,8 +12,11 @@ use Throwable;
 
 use function array_filter;
 use function array_keys;
+use function array_reverse;
 use function array_slice;
 use function array_values;
+use function basename;
+use function bin2hex;
 use function class_exists;
 use function count;
 use function define;
@@ -21,21 +24,32 @@ use function defined;
 use function explode;
 use function file_get_contents;
 use function file_put_contents;
+use function glob;
 use function header;
 use function headers_sent;
 use function http_response_code;
+use function in_array;
+use function inet_pton;
 use function ini_get;
 use function is_array;
 use function is_file;
 use function is_int;
 use function is_string;
-use function in_array;
 use function json_decode;
 use function json_encode;
 use function max;
+use function mb_strlen;
+use function mb_substr;
 use function md5_file;
+use function min;
+use function preg_match;
+use function preg_replace_callback;
+use function random_bytes;
+use function rawurldecode;
+use function rawurlencode;
 use function realpath;
 use function register_shutdown_function;
+use function rename;
 use function rtrim;
 use function sprintf;
 use function stat;
@@ -44,10 +58,14 @@ use function str_ends_with;
 use function str_replace;
 use function str_starts_with;
 use function strlen;
+use function strpos;
 use function strtolower;
+use function strtoupper;
+use function strtr;
 use function substr;
 use function time;
 use function trim;
+use function unlink;
 use function var_export;
 
 use const DIRECTORY_SEPARATOR;
@@ -75,11 +93,17 @@ if(class_exists(Kernel::class, false) === false)
  *   removing the plugin never leaves PHP with a missing prepend file — a fatal
  *   on every request — and the stub itself includes this file only if it is
  *   there;
- * - a request carrying a WordPress login cookie is left to the plugins_loaded
- *   judge: only WordPress can say who the user is, the alarm's logged-in
- *   signal needs the user on the row, and an editor must never be refused by
- *   a layer that cannot tell them from a bot;
- * - the consent is what the plugin last wrote (shield-consent.json): the two
+ * - a request carrying a WordPress login cookie to a file WordPress runs
+ *   through is left to the plugins_loaded judge: only WordPress can say who
+ *   the user is, the alarm's logged-in signal needs the user on the row, and
+ *   an editor must never be refused by a layer that cannot tell them from a
+ *   bot. Anywhere else — a direct hit on a plugin's file — no adapter will
+ *   ever run, and the cookie's NAME proves nothing, so this layer judges
+ *   (loadsWordPress(), 1.0.3);
+ * - every file it reads or writes but the stub and the kernel's ruleset
+ *   begins with `<?php exit; ?>` (GUARD), and the ruleset's name is drawn at
+ *   random: the directory's .htaccess is read by Apache alone (1.0.3);
+ * - the consent is what the plugin last wrote (shield-consent.php): the two
  *   checkboxes and the kill constant as of the site's last request, so an
  *   unticked box reaches this layer one request later than it reaches the
  *   adapter;
@@ -105,17 +129,42 @@ if(class_exists(Kernel::class, false) === false)
  */
 final class Prepend
 {
-	/** the ruleset the adapter's kernel writes and this layer reads (Adapter::FILE is this) */
+	/**
+	 * The ruleset's name before 1.0.3, a fixed one in a web-served directory.
+	 * Since then the kernel's store is `shield-<24 hex>.json`, the name drawn
+	 * once and kept in the consent (rules()): the kernel writes plain JSON and
+	 * is not this plugin's to change, so where no .htaccess is read (nginx,
+	 * IIS) an unguessable name is what keeps the CVE patterns off the web
+	 * (security audit 2026-10-03 M13). migrate() renames an old one
+	 */
 	public const RULES = 'shield.json';
 	
-	/** the stub the directive points at, beside shield.json */
+	/** the ruleset's name, as the consent may carry it */
+	public const RULES_PATTERN = '~^shield-[0-9a-f]{24}\.json$~';
+	
+	/** the stub the directive points at, beside the store */
 	public const STUB = 'prepend.php';
 	
+	/**
+	 * What every file this layer and the plugin write begins with (1.0.3,
+	 * M13): served by a web server that ignores the directory's .htaccess,
+	 * the file is PHP that exits before a byte of its JSON goes out
+	 */
+	public const GUARD = "<?php exit; ?>\n";
+	
 	/** the consent the plugin writes for this layer */
-	public const CONSENT = 'shield-consent.json';
+	public const CONSENT = 'shield-consent.php';
 	
 	/** the blocks this layer refused before the plugin could report them */
-	public const QUEUE = 'shield-reports.json';
+	public const QUEUE = 'shield-reports.php';
+	
+	/** the names before 1.0.3 — plain JSON, served wherever .htaccess is not read — and what each became */
+	public const LEGACY_FILES = [
+		'shield-consent.json' => self::CONSENT,
+		'shield-reports.json' => self::QUEUE,
+		'entries.json' => self::ENTRIES,
+		'entries-seen.json' => self::SEEN,
+	];
 	
 	/** at most this many queued reports — a flood is counted by the hits, not narrated */
 	public const QUEUE_MAX = 100;
@@ -137,10 +186,10 @@ final class Prepend
 	public const LOGIN_COOKIE = 'wordpress_logged_in_';
 	
 	/** the executed-file watch's known set, exported by the plugin (Entries): {core, plugin, known: {path: core|learnt}} */
-	public const ENTRIES = 'entries.json';
+	public const ENTRIES = 'entries.php';
 	
 	/** the executed files waiting for the plugin's judge: {paths: {path: record}, dropped} */
-	public const SEEN = 'entries-seen.json';
+	public const SEEN = 'entries-seen.php';
 	
 	/** at most this many distinct paths wait; a flood past it is counted, not listed */
 	public const SEEN_MAX = 100;
@@ -156,7 +205,40 @@ final class Prepend
 	public const ROOT_ENTRIES = ['index.php', 'wp-activate.php', 'wp-blog-header.php', 'wp-comments-post.php',
 		'wp-config.php', 'wp-config-sample.php', 'wp-cron.php', 'wp-links-opml.php', 'wp-load.php', 'wp-login.php',
 		'wp-mail.php', 'wp-settings.php', 'wp-signup.php', 'wp-trackback.php', 'xmlrpc.php'];
-		
+	
+	/**
+	 * The root entries a request runs WordPress THROUGH — every plugin loaded,
+	 * plugins_loaded fired, the adapter judging with the user known. Only a
+	 * request to one of these (or to wp-admin's own, loadsWordPress()) may
+	 * leave a login cookie to the adapter: on any other file nothing would
+	 * judge it at all (security audit 2026-10-03 M12)
+	 */
+	public const LOADS_WORDPRESS = ['index.php', 'wp-activate.php', 'wp-blog-header.php', 'wp-comments-post.php',
+		'wp-cron.php', 'wp-links-opml.php', 'wp-load.php', 'wp-login.php', 'wp-mail.php', 'wp-signup.php',
+		'wp-trackback.php', 'xmlrpc.php'];
+	
+	/** wp-admin files that load WordPress without its plugins — the adapter never runs there */
+	public const ADMIN_WITHOUT_PLUGINS = ['load-scripts.php', 'load-styles.php'];
+	
+	/**
+	 * Redactor's secret names and query names, restated: this layer references
+	 * no other plugin class, and a queued uri is scrubbed BEFORE it is written
+	 * (M13). Tests\Prepend holds both copies equal to Redactor's
+	 */
+	public const SECRET_NAMES = 'pass(?:word|wd)?|pwd|token|secret|authorization|cookie|api[-_]key'
+		. '|jwt|bearer|signature'
+		. '|(?<![a-z])nonce|wpnonce'
+		. '|rp[-_]?key'
+		. '|card[-_]?(?:num(?:ber)?|no(?![a-z])|code|cvc|cvv|exp(?:iry|iration|(?![a-z])))'
+		. '|cc[-_]?(?:num(?:ber)?|no(?![a-z]))'
+		. '|(?<![a-z])(?:cvv2?|cvc2?|csc|ccv)(?![a-z])|security[-_]?code'
+		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])';
+	
+	public const QUERY_NAMES = ['key', 'auth', 'code', 'sig', 'signature', 'otp', 'pin', 'hash'];
+	
+	/** Redactor's username names (USERNAME_PATTERN), restated for the same reason */
+	public const USERNAME_PATTERN = '/^(user([_-]?(name|login))?|log(in)?)$/i';
+	
 	/**
 	 * The stub's one call. Never throws, never blocks a request it cannot
 	 * judge; exits only on a block
@@ -176,6 +258,7 @@ final class Prepend
 			{
 				return;
 			}
+			$ip = self::clientIp($_SERVER, $consent['proxy_header'], $consent['proxies']);
 			// the executed-file watch first: it records, whatever the Shield's
 			// boxes say, and a signed-in request is recorded like any other
 			self::entry($dir, $_SERVER, $consent);
@@ -194,13 +277,13 @@ final class Prepend
 			{
 				if($judged['report'] !== null)
 				{
-					self::queue($dir, $judged['report'], self::contextOf($_SERVER, $verdict->status()));
+					self::queue($dir, $judged['report'], self::contextOf($_SERVER, $verdict->status(), $ip));
 				}
 				self::refuse((int)$verdict->rule['id'], $verdict->status(), $verdict->retryAfter);
 			}
 			// an observe verdict: the adapter claims it at plugins_loaded — unless
 			// WordPress never loads for this request, when shutdown queues it
-			register_shutdown_function(static fn(): bool => self::settle($dir));
+			register_shutdown_function(static fn(): bool => self::settle($dir, null, null, $ip));
 		}
 		catch(Throwable)
 		{
@@ -234,15 +317,21 @@ final class Prepend
 		{
 			return null;
 		}
-		foreach(array_keys($cookies) as $name)
+		// a login cookie is the adapter's — but only where WordPress runs and the
+		// adapter with it; anyone can send a cookie by that NAME, and a direct hit
+		// on a plugin file is the request this layer exists for (M12)
+		if(self::loadsWordPress($server, (string)($consent['root'] ?? '')))
 		{
-			if(str_starts_with((string)$name, self::LOGIN_COOKIE))
+			foreach(array_keys($cookies) as $name)
 			{
-				return null;
+				if(str_starts_with((string)$name, self::LOGIN_COOKIE))
+				{
+					return null;
+				}
 			}
 		}
 		$report = null;
-		$kernel = new Kernel('', '', new Store($dir . DIRECTORY_SEPARATOR . self::RULES, $consent['prefix']),
+		$kernel = new Kernel('', '', new Store(self::rules($dir, $consent), $consent['prefix']),
 			// this layer never pulls: a transport that answers nothing keeps even a mis-call harmless
 			static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''],
 			static function(string $kind, string $message, array $extra) use (&$report): void
@@ -250,6 +339,7 @@ final class Prepend
 				$report = [$kind, $message, $extra];
 			});
 		$facts = Facts::fromServer($server, $post, static fn(): string => (string)file_get_contents('php://input'), false,
+			ip: self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])),
 			user: self::loginName($server, $post));
 		$verdict = $kernel->handle($facts, new Consent(true, $consent['enforce'], false), $now);
 		if($verdict->isPass())
@@ -264,24 +354,25 @@ final class Prepend
 	 * The consent as the plugin last wrote it — null when the file is not
 	 * there or does not parse: the layer then does nothing. `root` is the
 	 * site root the executed-file watch measures against (realpath of
-	 * ABSPATH), `entries` whether that watch is on
+	 * ABSPATH), `entries` whether that watch is on, `rules` the ruleset's
+	 * name in the store (RULES_PATTERN, '' for none), `proxy_header` and
+	 * `proxies` the trusted proxy the site named (clientIp())
 	 *
-	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, entries: bool}
+	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>}
 	 */
 	public static function consent(
 		string $dir,
 	): ?array
 	{
-		$path = $dir . DIRECTORY_SEPARATOR . self::CONSENT;
-		if(is_file($path) === false)
-		{
-			return null;
-		}
-		$decoded = json_decode((string)file_get_contents($path), true);
+		$decoded = self::read($dir . DIRECTORY_SEPARATOR . self::CONSENT);
 		if(is_array($decoded) === false)
 		{
 			return null;
 		}
+		$rules = is_string($decoded['rules'] ?? null) && preg_match(self::RULES_PATTERN, $decoded['rules']) === 1 ? $decoded['rules'] : '';
+		$header = is_string($decoded['proxy_header'] ?? null) && preg_match('~^[A-Za-z0-9-]{1,64}$~', $decoded['proxy_header']) === 1
+			? $decoded['proxy_header']
+			: '';
 		
 		return [
 			'detect' => ($decoded['detect'] ?? false) === true,
@@ -290,14 +381,19 @@ final class Prepend
 			'prefix' => is_string($decoded['prefix'] ?? null) ? $decoded['prefix'] : '',
 			'root' => is_string($decoded['root'] ?? null) ? $decoded['root'] : '',
 			'entries' => ($decoded['entries'] ?? false) === true,
+			'rules' => $rules,
+			'proxy_header' => $header,
+			'proxies' => is_array($decoded['proxies'] ?? null) ? array_values(array_filter($decoded['proxies'], 'is_string')) : [],
 		];
 	}
 	
 	/**
 	 * The plugin's half: the consent written when it differs from what is
-	 * there (one small read per request, one write per change)
+	 * there (one small read per request, one write per change). The ruleset's
+	 * name is drawn once and kept: the one there, else the one given, else a
+	 * new one
 	 *
-	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, entries?: bool} $consent
+	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>} $consent
 	 * @return bool whether the file was (re)written
 	 */
 	public static function writeConsent(
@@ -305,8 +401,13 @@ final class Prepend
 		array $consent,
 	): bool
 	{
-		$path = $dir . DIRECTORY_SEPARATOR . self::CONSENT;
 		$current = self::consent($dir);
+		$rules = match(true)
+		{
+			($current['rules'] ?? '') !== '' => $current['rules'],
+			is_string($consent['rules'] ?? null) && preg_match(self::RULES_PATTERN, $consent['rules']) === 1 => $consent['rules'],
+			default => 'shield-' . bin2hex(random_bytes(12)) . '.json',
+		};
 		$wanted = [
 			'detect' => $consent['detect'] === true,
 			'enforce' => $consent['enforce'] === true,
@@ -314,13 +415,130 @@ final class Prepend
 			'prefix' => (string)$consent['prefix'],
 			'root' => (string)($consent['root'] ?? ''),
 			'entries' => ($consent['entries'] ?? false) === true,
+			'rules' => $rules,
+			'proxy_header' => (string)($consent['proxy_header'] ?? ''),
+			'proxies' => array_values(array_filter((array)($consent['proxies'] ?? []), 'is_string')),
 		];
 		if($current === $wanted)
 		{
 			return false;
 		}
 		
-		return @file_put_contents($path, (string)json_encode($wanted + ['written_at' => time()]), LOCK_EX) !== false;
+		return self::write($dir . DIRECTORY_SEPARATOR . self::CONSENT, $wanted + ['written_at' => time()]);
+	}
+	
+	/**
+	 * The full path of the ruleset the kernel's store keeps — '' when there is
+	 * no consent naming one: the kernel then runs on APCu alone
+	 *
+	 * @param ?array{rules: string} $consent the consent read already, or null to read it
+	 */
+	public static function rules(
+		string $dir,
+		?array $consent = null,
+	): string
+	{
+		$consent ??= self::consent($dir);
+		$name = (string)($consent['rules'] ?? '');
+		
+		return $name === '' ? '' : $dir . DIRECTORY_SEPARATOR . $name;
+	}
+	
+	/**
+	 * One of the store's files, read: the JSON after the GUARD (or a whole
+	 * plain-JSON file, as a test or an older plugin writes it), null when the
+	 * file is not there or does not parse
+	 */
+	public static function read(
+		string $path,
+	): mixed
+	{
+		if(is_file($path) === false)
+		{
+			return null;
+		}
+		$raw = (string)file_get_contents($path);
+		if(str_starts_with($raw, self::GUARD))
+		{
+			$raw = substr($raw, strlen(self::GUARD));
+		}
+		
+		return json_decode($raw, true);
+	}
+	
+	/** one of the store's files, written behind the GUARD; false when it could not be */
+	public static function write(
+		string $path,
+		mixed $data,
+	): bool
+	{
+		$json = json_encode($data);
+		
+		return is_string($json) && @file_put_contents($path, self::GUARD . $json, LOCK_EX) !== false;
+	}
+	
+	/**
+	 * The store as 1.0.2 and earlier left it, brought to this version's: each
+	 * plain-JSON file rewritten behind the GUARD (the queue and the seen list
+	 * carry reports not sent yet), the ruleset renamed to the name the consent
+	 * draws, and the old files gone. $to is where the data lives now
+	 * (CODESAFE_STORE_DIR), $from by default: a store the constant moved is
+	 * carried over the same way, the stub alone staying behind. Run by the
+	 * plugin AFTER it wrote the consent in $to; returns how many files moved
+	 */
+	public static function migrate(
+		string $from,
+		?string $to = null,
+	): int
+	{
+		$to ??= $from;
+		$moved = 0;
+		$files = self::LEGACY_FILES;
+		if($to !== $from)
+		{
+			$files += [self::CONSENT => self::CONSENT, self::QUEUE => self::QUEUE, self::ENTRIES => self::ENTRIES, self::SEEN => self::SEEN];
+		}
+		foreach($files as $old => $new)
+		{
+			$path = $from . DIRECTORY_SEPARATOR . $old;
+			if(is_file($path) === false)
+			{
+				continue;
+			}
+			$data = self::read($path);
+			$target = $to . DIRECTORY_SEPARATOR . $new;
+			// the consent is the plugin's, written in $to on this request; the
+			// others carry what has not been judged or sent yet
+			if($new !== self::CONSENT && is_array($data) && is_file($target) === false)
+			{
+				self::write($target, $data);
+			}
+			@unlink($path);
+			$moved++;
+		}
+		$rules = self::rules($to);
+		$old = glob($from . DIRECTORY_SEPARATOR . 'shield*.json') ?: [];
+		foreach($old as $path)
+		{
+			$name = basename($path);
+			if($name !== self::RULES && preg_match(self::RULES_PATTERN, $name) !== 1)
+			{
+				continue;
+			}
+			if($path === $rules)
+			{
+				continue;
+			}
+			if($rules !== '' && is_file($rules) === false && @rename($path, $rules))
+			{
+				$moved++;
+				
+				continue;
+			}
+			@unlink($path);
+		}
+		
+		return $moved;
 	}
 	
 	/**
@@ -371,7 +589,8 @@ final class Prepend
 			{
 				return null;
 			}
-			self::record($dir, $relative, $file, $server, $now ?? time());
+			self::record($dir, $relative, $file, $server, $now ?? time(),
+				self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])));
 			
 			return $relative;
 		}
@@ -393,12 +612,7 @@ final class Prepend
 		string $dir,
 	): ?array
 	{
-		$path = $dir . DIRECTORY_SEPARATOR . self::ENTRIES;
-		if(is_file($path) === false)
-		{
-			return null;
-		}
-		$decoded = json_decode((string)file_get_contents($path), true);
+		$decoded = self::read($dir . DIRECTORY_SEPARATOR . self::ENTRIES);
 		if(is_array($decoded) === false || is_array($decoded['known'] ?? null) === false)
 		{
 			return null;
@@ -423,14 +637,12 @@ final class Prepend
 		array $known,
 	): bool
 	{
-		$path = $dir . DIRECTORY_SEPARATOR . self::ENTRIES;
-		
-		return @file_put_contents($path, (string)json_encode([
+		return self::write($dir . DIRECTORY_SEPARATOR . self::ENTRIES, [
 			'core' => $core,
 			'plugin' => $plugin,
 			'known' => $known === [] ? new stdClass : $known,
 			'written_at' => time(),
-		]), LOCK_EX) !== false;
+		]);
 	}
 	
 	/**
@@ -445,8 +657,7 @@ final class Prepend
 		string $dir,
 	): array
 	{
-		$path = $dir . DIRECTORY_SEPARATOR . self::SEEN;
-		$decoded = is_file($path) ? json_decode((string)file_get_contents($path), true) : null;
+		$decoded = self::read($dir . DIRECTORY_SEPARATOR . self::SEEN);
 		$paths = is_array($decoded) && is_array($decoded['paths'] ?? null) ? array_filter($decoded['paths'], 'is_array') : [];
 		
 		return ['paths' => $paths, 'dropped' => is_array($decoded) ? max(0, (int)($decoded['dropped'] ?? 0)) : 0];
@@ -469,13 +680,7 @@ final class Prepend
 		{
 			unset($seen['paths'][$relative]);
 		}
-		if($seen['paths'] === [])
-		{
-			@file_put_contents($path, '{"paths":{},"dropped":0}', LOCK_EX);
-			
-			return;
-		}
-		@file_put_contents($path, (string)json_encode(['paths' => $seen['paths'], 'dropped' => 0]), LOCK_EX);
+		self::write($path, ['paths' => $seen['paths'] === [] ? new stdClass : $seen['paths'], 'dropped' => 0]);
 	}
 	
 	/**
@@ -491,11 +696,12 @@ final class Prepend
 		string $file,
 		array $server,
 		int $now,
+		string $ip = '',
 	): void
 	{
 		$path = $dir . DIRECTORY_SEPARATOR . self::SEEN;
 		$seen = self::seen($dir);
-		$context = self::contextOf($server, null);
+		$context = self::contextOf($server, null, $ip);
 		if(isset($seen['paths'][$relative]))
 		{
 			$seen['paths'][$relative]['n'] = (int)($seen['paths'][$relative]['n'] ?? 0) + 1;
@@ -520,7 +726,7 @@ final class Prepend
 				'context' => $context,
 			];
 		}
-		@file_put_contents($path, (string)json_encode($seen), LOCK_EX);
+		self::write($path, $seen);
 	}
 	
 	/**
@@ -582,14 +788,14 @@ final class Prepend
 	): void
 	{
 		$path = $dir . DIRECTORY_SEPARATOR . self::QUEUE;
-		$queued = is_file($path) ? json_decode((string)file_get_contents($path), true) : [];
+		$queued = self::read($path);
 		$queued = is_array($queued) ? array_values(array_filter($queued, 'is_array')) : [];
 		$queued[] = ['kind' => $report[0], 'message' => $report[1], 'extra' => $report[2], 'context' => $context, 'at' => time()];
 		if(count($queued) > self::QUEUE_MAX)
 		{
 			$queued = array_slice($queued, -self::QUEUE_MAX);
 		}
-		@file_put_contents($path, (string)json_encode($queued), LOCK_EX);
+		self::write($path, $queued);
 	}
 	
 	/**
@@ -622,11 +828,13 @@ final class Prepend
 	 *
 	 * @param ?array<string, mixed> $server the request, $_SERVER by default
 	 * @param ?int $status the response status, PHP's own by default
+	 * @param ?string $ip the visitor's address (clientIp()), REMOTE_ADDR by default
 	 */
 	public static function settle(
 		string $dir,
 		?array $server = null,
 		?int $status = null,
+		?string $ip = null,
 	): bool
 	{
 		$report = self::claim();
@@ -639,7 +847,7 @@ final class Prepend
 			$code = http_response_code();
 			$status = is_int($code) ? $code : null;
 		}
-		self::queue($dir, $report, self::contextOf($server ?? $_SERVER, $status));
+		self::queue($dir, $report, self::contextOf($server ?? $_SERVER, $status, $ip));
 		
 		return true;
 	}
@@ -647,23 +855,27 @@ final class Prepend
 	/**
 	 * The refused request's own facts for its row — the plugin reports a
 	 * queued verdict from a LATER request, whose URI, address and user agent
-	 * are somebody else's; the console's offender score follows the ip. Raw
-	 * here (no WordPress to sanitize with); the adapter scrubs on the drain
+	 * are somebody else's; the console's offender score follows the ip. The
+	 * uri and referer are scrubbed HERE, before the file holds them (scrubUri(),
+	 * M13) — the adapter scrubs them again with the Redactor on the drain;
+	 * the rest is raw (no WordPress to sanitize with)
 	 *
 	 * @param array<string, mixed> $server
+	 * @param ?string $ip the visitor's address (clientIp()), REMOTE_ADDR by default
 	 * @return array<string, int|string>
 	 */
 	public static function contextOf(
 		array $server,
 		?int $status,
+		?string $ip = null,
 	): array
 	{
 		$context = [
-			'uri' => trim((string)($server['REQUEST_URI'] ?? '')),
+			'uri' => self::scrubUri(trim((string)($server['REQUEST_URI'] ?? ''))),
 			'method' => trim((string)($server['REQUEST_METHOD'] ?? '')),
-			'ip' => trim((string)($server['REMOTE_ADDR'] ?? '')),
+			'ip' => trim($ip ?? (string)($server['REMOTE_ADDR'] ?? '')),
 			'ua' => trim((string)($server['HTTP_USER_AGENT'] ?? '')),
-			'referer' => trim((string)($server['HTTP_REFERER'] ?? '')),
+			'referer' => self::scrubUri(trim((string)($server['HTTP_REFERER'] ?? ''))),
 			'host' => trim((string)($server['HTTP_HOST'] ?? '')),
 			'at' => time(),
 		];
@@ -693,8 +905,12 @@ final class Prepend
 		{
 			return 0;
 		}
-		$queued = json_decode((string)file_get_contents($path), true);
-		@file_put_contents($path, '[]', LOCK_EX);
+		$queued = self::read($path);
+		if($queued === [])
+		{
+			return 0;
+		}
+		self::write($path, []);
 		$handed = 0;
 		foreach(is_array($queued) ? $queued : [] as $entry)
 		{
@@ -760,6 +976,180 @@ final class Prepend
 			'ini' => 'auto_prepend_file = "' . $stub . '"',
 			'htaccess' => 'php_value auto_prepend_file "' . $stub . '"',
 		];
+	}
+	
+	/**
+	 * Whether the file this request runs is one WordPress runs through — a
+	 * root entry of LOADS_WORDPRESS, or a file directly in wp-admin/,
+	 * wp-admin/network/ or wp-admin/user/ but the two that load no plugin —
+	 * measured against the site root the consent carries. False when the root
+	 * is unknown or the file is outside it: then nothing proves the adapter
+	 * will judge, and this layer does
+	 *
+	 * @param array<string, mixed> $server
+	 */
+	public static function loadsWordPress(
+		array $server,
+		string $root,
+	): bool
+	{
+		$script = $server['SCRIPT_FILENAME'] ?? '';
+		$file = $root !== '' && is_string($script) && $script !== '' ? realpath($script) : false;
+		if($file === false)
+		{
+			return false;
+		}
+		$file = str_replace('\\', '/', $file);
+		$root = rtrim(str_replace('\\', '/', $root), '/') . '/';
+		if(str_starts_with($file, $root) === false)
+		{
+			return false;
+		}
+		$relative = substr($file, strlen($root));
+		if(in_array($relative, self::LOADS_WORDPRESS, true))
+		{
+			return true;
+		}
+		
+		return preg_match('~^wp-admin/(?:(?:network|user)/)?([a-z0-9_-]+\.php)$~', $relative, $match) === 1
+			&& in_array($match[1], self::ADMIN_WITHOUT_PLUGINS, true) === false;
+	}
+	
+	/**
+	 * The visitor's address (security audit 2026-10-03 M5): REMOTE_ADDR, unless
+	 * a header is named AND REMOTE_ADDR is in one of the trusted ranges — then
+	 * the address that header carries. A list (X-Forwarded-For) is walked from
+	 * the right, past every hop a trusted proxy added, to the first that is
+	 * not one; anything that is not an address falls back to REMOTE_ADDR. The
+	 * one rule for the whole plugin: the Sender, the security events and the
+	 * adapter call this, the layer reads its header and ranges from the consent
+	 *
+	 * @param array<string, mixed> $server
+	 * @param list<string> $ranges CIDRs or bare addresses (Kernel::inCidr)
+	 */
+	public static function clientIp(
+		array $server,
+		string $header = '',
+		array $ranges = [],
+	): string
+	{
+		$remote = trim(is_string($server['REMOTE_ADDR'] ?? null) ? $server['REMOTE_ADDR'] : '');
+		if($header === '' || $ranges === [] || self::trusted($remote, $ranges) === false)
+		{
+			return $remote;
+		}
+		$value = $server['HTTP_' . strtoupper(str_replace('-', '_', $header))] ?? null;
+		if(is_string($value) === false || trim($value) === '')
+		{
+			return $remote;
+		}
+		$visitor = $remote;
+		foreach(array_reverse(explode(',', $value)) as $hop)
+		{
+			$hop = self::bareAddress($hop);
+			if($hop === '')
+			{
+				return $remote;
+			}
+			$visitor = $hop;
+			if(self::trusted($hop, $ranges) === false)
+			{
+				break;
+			}
+		}
+		
+		return $visitor;
+	}
+	
+	/** whether an address is in one of the ranges */
+	protected static function trusted(
+		string $address,
+		array $ranges,
+	): bool
+	{
+		foreach($ranges as $range)
+		{
+			if(is_string($range) && Kernel::inCidr($range, $address))
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/** one hop of a forwarding header as a bare address — a port or IPv6 brackets dropped — '' when it is none */
+	protected static function bareAddress(
+		string $hop,
+	): string
+	{
+		$hop = trim($hop);
+		if(preg_match('~^\[([0-9A-Fa-f:.]+)\](?::\d+)?$~', $hop, $match) === 1)
+		{
+			$hop = $match[1];
+		}
+		elseif(preg_match('~^(\d{1,3}(?:\.\d{1,3}){3}):\d+$~', $hop, $match) === 1)
+		{
+			$hop = $match[1];
+		}
+		
+		return @inet_pton($hop) === false ? '' : $hop;
+	}
+	
+	/**
+	 * A uri scrubbed before this layer writes it to a file (M13): the value of
+	 * every secret-named query parameter (SECRET_NAMES, QUERY_NAMES) dropped,
+	 * a username parameter masked and every e-mail's local part masked the
+	 * way the Redactor masks them, so the adapter's Redactor finds nothing
+	 * left to change but what only it knows (token-shaped path segments)
+	 */
+	public static function scrubUri(
+		string $uri,
+	): string
+	{
+		$at = strpos($uri, '?');
+		if($at !== false)
+		{
+			$query = (string)preg_replace_callback('~(^|&)([^&=]+)=([^&]*)~', static function(array $match): string
+			{
+				$name = rawurldecode($match[2]);
+				if(preg_match('/' . self::SECRET_NAMES . '/i', $name) === 1
+					|| in_array(strtolower(trim($name)), self::QUERY_NAMES, true))
+				{
+					return $match[1] . $match[2] . '=[redacted]';
+				}
+				if(preg_match(self::USERNAME_PATTERN, $name) === 1 && str_contains(rawurldecode($match[3]), '@') === false)
+				{
+					return $match[1] . $match[2] . '=' . strtr(rawurlencode(self::mask(rawurldecode($match[3]))), ['%2A' => '*', '%5B' => '[', '%5D' => ']']);
+				}
+				
+				return $match[0];
+			}, substr($uri, $at + 1));
+			$uri = substr($uri, 0, $at + 1) . $query;
+		}
+		
+		return (string)preg_replace_callback('/([a-z0-9._%+\-]+)(@|%40)([a-z0-9.\-]+\.[a-z]{2,})/i',
+			static fn(array $match): string => self::mask($match[1]) . $match[2] . $match[3], $uri);
+	}
+	
+	/** Redactor::maskName restated: every fourth character kept, the rest starred, past 24 the length stated */
+	public static function mask(
+		string $value,
+	): string
+	{
+		if($value === '' || preg_match('~^(?:.\*{3})+\[\d+\]$~u', $value) === 1)
+		{
+			return $value;
+		}
+		$length = mb_strlen($value);
+		$cut = min($length, 24);
+		$masked = '';
+		for($index = 0; $index < $cut; $index++)
+		{
+			$masked.= $index % 4 === 0 ? mb_substr($value, $index, 1) : '*';
+		}
+		
+		return $length > $cut ? $masked . '[' . $length . ']' : $masked;
 	}
 	
 	/**

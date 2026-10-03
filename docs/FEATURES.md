@@ -152,8 +152,13 @@ Nothing of it is stored or sent except the matched fragment.
 
 **Where the rules live:** the kernel pulls `GET /api/v1/shield` from codesafe
 every five minutes as a conditional request (a `304` costs nothing), and caches
-the ruleset in APCu and in `wp-content/ovos-codesafe/shield.json` behind a deny
-`.htaccess` — the file alone on a host without APCu. A codesafe that goes
+the ruleset in APCu and in a file under `wp-content/ovos-codesafe/` behind a
+deny `.htaccess` — the file alone on a host without APCu. The file's name is
+drawn at random and every other file in the directory begins with a PHP
+`exit`, so a server that ignores `.htaccess` (nginx, IIS) serves nothing from
+it; the settings page warns there, and the `CODESAFE_STORE_DIR` constant moves
+the store to a directory outside the document root (the prepend stub stays
+where PHP's configuration names it). A codesafe that goes
 silent for a day lifts the rules: a stale shield is not a shield. The rules a
 site holds are never more than 25, and each is one of `uri`, `ua`, `ip` or
 `body` with `equals`, `prefix`, `contains`, `cidr` or a **bounded regex** —
@@ -220,9 +225,21 @@ auto_prepend_file "…"` for `.htaccess` under mod_php). With it, every
 exists — the same rules, the same two switches, read from a small consent
 file the plugin rewrites whenever a box changes — and a block answers 403
 with `X-Shield-Rule` and `X-Shield-Layer: prepend` for the cost of a file
-read. A request carrying a WordPress login cookie is left to `plugins_loaded`,
-which knows the user: an editor is never refused by a layer that cannot tell
-them from a bot, and the alarm's signed-in signal keeps working. An observe
+read. A request carrying a WordPress login cookie to a file WordPress runs
+through — `index.php`, `wp-login.php`, `xmlrpc.php`, `wp-cron.php`,
+`wp-comments-post.php`, wp-admin's own pages but `load-scripts.php` and
+`load-styles.php` — is left to `plugins_loaded`, which knows the user: an
+editor is never refused by a layer that cannot tell them from a bot, and the
+alarm's signed-in signal keeps working. Anywhere else (a direct hit on a
+plugin's PHP file) no adapter will ever run and the cookie's name proves
+nothing, so this layer judges it like any other request (1.0.3). The queued
+reports' URLs are scrubbed before they are written. Behind a proxy or CDN the
+*Trusted proxy* settings make this layer, the adapter and every report name
+the visitor instead of the edge; the header is read only when the connecting
+address is in the trusted ranges. Deactivating the plugin rewrites the consent
+with every box off, so the layer stops on the next request; on a multisite
+network the store is one for every site, and only the main site — set by a
+super admin — drives it. An observe
 verdict is handed to the plugin to report with the request's full context
 (one verdict, one count, one report per request); a block's report — and an
 observe verdict on a request WordPress never loads for, such as a direct hit
@@ -424,8 +441,13 @@ the ones that matter: a success after five or more failures or from a known
 attacker's address, a theme install through the admin (the forced install that
 opens the Click2Shell chain on WordPress before 7.1.1), a file-editor save and
 a newly minted application password — those reach whoever the project's alert
-policy names. Reports are capped at 60 per minute — a credential-stuffing run
-cannot turn the reporter into the flood it surfaces.
+policy names. Each kind has its own per-minute budget — 30 for the
+refusals, 60 for `shield_observe`, 120 for `shield_block` — so a
+credential-stuffing run cannot turn the reporter into the flood it surfaces,
+nor silence the privilege grant or the block that follows it. Sensitive admin
+changes (`privileged_action`) and executed files are never held back; what goes
+over a budget is counted and sent as one summary event of its kind (`summary`,
+`suppressed`) when the minute closes.
 
 Enable it under Settings → ovos codesafe → *Security events*, or lock it in
 `wp-config.php`:
@@ -451,7 +473,15 @@ again on its side as a backstop, but the first cut happens here:
   **CSRF nonce** (`_wpnonce`, `_ajax_nonce`, every field with `nonce` at a word
   start). A nonce is short-lived, but it is a per-user, per-action token, and
   it had no business travelling. Names that merely contain the letters
-  (`announce`) are untouched.
+  (`announce`) are untouched. Payment fields go the same way in every
+  gateway's spelling — card number, security code (`cvv`, `cvc`, `csc`),
+  expiry — with `rp_key`, account numbers and IBANs (1.0.3).
+- **Query-only credentials** — `key`, `code`, `auth`, `sig`, `signature`,
+  `otp`, `pin`, `hash`, by exact name — are dropped from the URL and, since
+  1.0.3, from the request's query and post bags too: the password-reset link's
+  `key` used to leave in the bag while the URL beside it said `[redacted]`.
+  On `wp-login.php` and `xmlrpc.php` the login name (`log`, `user_login`)
+  leaves masked.
 - **The request body is a document, not text**: `structure`, the
   default, parses it — form, JSON, XML-RPC — walks the keys the way the
   variables are walked (so `opts[api_key]` is caught, and a percent-encoded

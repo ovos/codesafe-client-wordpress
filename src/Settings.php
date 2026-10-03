@@ -10,6 +10,7 @@ use function is_array;
 use function max;
 use function mb_substr;
 use function min;
+use function preg_match;
 use function sprintf;
 use function str_starts_with;
 use function strtoupper;
@@ -54,6 +55,31 @@ class Settings
 		add_action('admin_post_ovos_codesafe_test', [$this, 'handleTest']);
 		add_filter('plugin_action_links_' . plugin_basename($this->file),
 			[$this, 'actionLinks']);
+		add_filter('plugin_row_meta', [$this, 'rowMeta'], 10, 2);
+	}
+	
+	/**
+	 * The plugins screen, while PHP prepends the stub: deactivating switches
+	 * the layer off and uninstalling leaves the stub doing nothing, but the
+	 * line in PHP's configuration is the operator's to remove (security audit
+	 * 2026-10-03 M16) — said where the Delete link is about to appear
+	 */
+	public function rowMeta(
+		array $meta,
+		string $file,
+	): array
+	{
+		if($file !== plugin_basename($this->file))
+		{
+			return $meta;
+		}
+		$state = Shield\Adapter::prependStatus()['state'];
+		if($state === 'active' || $state === 'legacy')
+		{
+			$meta[] = '<strong>' . esc_html__('PHP prepends this plugin\'s stub (auto_prepend_file): before deleting the plugin, remove that line from your PHP configuration.', 'ovos-codesafe') . '</strong>';
+		}
+		
+		return $meta;
 	}
 	
 	public function actionLinks(
@@ -126,6 +152,10 @@ class Settings
 			'snapshot' => $this->truthy($input['snapshot'] ?? ''),
 			'snapshot_styles' => $this->truthy($input['snapshot_styles'] ?? ''),
 			'js_admin' => $this->truthy($input['js_admin'] ?? ''),
+			'trusted_proxy_header' => preg_match('~^[A-Za-z0-9-]{0,64}$~', trim((string)($input['trusted_proxy_header'] ?? ''))) === 1
+				? trim((string)($input['trusted_proxy_header'] ?? ''))
+				: '',
+			'trusted_proxies' => mb_substr(sanitize_text_field((string)($input['trusted_proxies'] ?? '')), 0, 2000),
 		];
 		
 		// write-only: a blank key keeps the stored one
@@ -134,10 +164,12 @@ class Settings
 			$clean['api_key'] = (string)($stored['api_key'] ?? '');
 		}
 		
-		// constants win — never let the form overwrite a locked value
+		// constants win — never let the form overwrite a locked value; on a
+		// multisite network the Shield's keys are the main site's super admin's
+		// alone (Config::NETWORK_KEYS, security audit 2026-10-03 M14)
 		foreach(array_keys($clean) as $key)
 		{
-			if($this->config->isConstant($key))
+			if($this->config->isConstant($key) || $this->networkLocked($key))
 			{
 				$clean[$key] = $stored[$key] ?? Config::DEFAULTS[$key];
 			}
@@ -152,6 +184,17 @@ class Settings
 	 * sanitizes the sanitized array a second time (trac #21989) — a strict
 	 * '1' comparison would wipe every checked box back to false.
 	 */
+	/**
+	 * Whether a NETWORK_KEYS field is out of this user's reach: on a multisite
+	 * network, anywhere but the main site or for anyone but a super admin
+	 */
+	protected function networkLocked(
+		string $key,
+	): bool
+	{
+		return in_array($key, Config::NETWORK_KEYS, true) && $this->config->mayChangeNetworkKeys() === false;
+	}
+	
 	protected function truthy(
 		mixed $value,
 	): bool
@@ -197,7 +240,7 @@ class Settings
 			__('Send anonymous per-minute traffic counters (request totals split by status, method, resolved page type and logged-in state — never URLs or visitor data), so the console can read error and probe counts as rates. Requires the APCu PHP extension and the project\'s rollups switch in the console; without APCu nothing is collected or sent.', 'ovos-codesafe'));
 		$this->checkboxField('security_events',
 			__('Security events', 'ovos-codesafe'),
-			__('Report refused actions as security events, apart from errors: failed logins (any door — form, XML-RPC, application passwords, with the username masked), a login succeeding after recent failures (the credential-stuffing success; clean logins are never reported), rejected nonce checks, forbidden REST calls, and sensitive admin changes (user creation and role grants, plugin installs and activations, signup/site-URL/admin-e-mail option changes, file-editor saves, admin application passwords). Informational by default in the console — they feed its attack detection without raising alerts. Rate-limited to 60 per minute.', 'ovos-codesafe'));
+			__('Report refused actions as security events, apart from errors: failed logins (any door — form, XML-RPC, application passwords, with the username masked), a login succeeding after recent failures (the credential-stuffing success; clean logins are never reported), rejected nonce checks, forbidden REST calls, and sensitive admin changes (user creation and role grants, plugin installs and activations, signup/site-URL/admin-e-mail option changes, file-editor saves, admin application passwords). Informational by default in the console — they feed its attack detection without raising alerts. Each kind has its own per-minute budget, so a flood of failed logins never silences a privilege grant or a Shield block; what goes over a budget is counted and sent as one summary event, and sensitive admin changes are never held back.', 'ovos-codesafe'));
 		$this->checkboxField('inventory',
 			__('Software inventory', 'ovos-codesafe'),
 			__('Report the installed plugin/theme list with versions (plus WordPress core and PHP versions) once a day and after installs, updates or (de)activations, so the console can match it against a public vulnerability feed (CVE findings on its SECURITY view). Exactly what is sent per entry: type, directory slug, version, display name, active flag — never paths, options or user data. Inert until the project\'s CVE switch is also enabled in the console.', 'ovos-codesafe'));
@@ -206,12 +249,13 @@ class Settings
 			__('When the console\'s vulnerability matching says an installed plugin is vulnerable AND the console has seen requests probing for it, switch on WordPress\' own automatic update for exactly that plugin — the one virtual patch WordPress supports natively. Needs the software inventory above and the project\'s Auto-update switch in the console; every switch-on is reported as a security event. Nothing is downgraded, deactivated or deleted, and WordPress updates from wordpress.org on its own schedule.', 'ovos-codesafe'));
 		$this->checkboxField('shield_detect',
 			__('Exploit detection', 'ovos-codesafe'),
-			__('Pull this site\'s exploit rules from the console every five minutes — the request shapes of the CVEs the software inventory matched, drafted from each fix and reviewed by a person — and match every request against them before WordPress runs. A match is REPORTED as a security event (kind shield_observe: the rule, the CVE, the matched fragment capped at 200 bytes, the address) and NOTHING is blocked. What is read: the request path and query, the user agent, the address, and the body only while a body rule is live (form fields as name=value lines, other bodies capped at 64 KB) — nothing of it is stored or sent but the match. Needs the software inventory above and the project\'s CVE switch in the console; the rules are cached in APCu and in wp-content/ovos-codesafe/shield.json (the file alone on a host without APCu), and a console that goes silent for a day lifts them. Fails open: a rule the engine cannot run, a console that does not answer, an error of any kind — the request is served as if this were off.', 'ovos-codesafe'));
+			__('Pull this site\'s exploit rules from the console every five minutes — the request shapes of the CVEs the software inventory matched, drafted from each fix and reviewed by a person — and match every request against them before WordPress runs. A match is REPORTED as a security event (kind shield_observe: the rule, the CVE, the matched fragment capped at 200 bytes, the address) and NOTHING is blocked. What is read: the request path and query, the user agent, the address, and the body only while a body rule is live (form fields as name=value lines, other bodies capped at 64 KB) — nothing of it is stored or sent but the match. Needs the software inventory above and the project\'s CVE switch in the console; the rules are cached in APCu and in a file under wp-content/ovos-codesafe/ with a name drawn at random (the file alone on a host without APCu; CODESAFE_STORE_DIR moves it outside the document root), and a console that goes silent for a day lifts them. Fails open: a rule the engine cannot run, a console that does not answer, an error of any kind — the request is served as if this were off.', 'ovos-codesafe'));
 		$this->checkboxField('shield_enforce',
 			__('Block detected exploits', 'ovos-codesafe'),
 			__('Answer 403 to a request a PROVEN rule matches — a rule a person promoted in the console after seeing what it matched on live traffic; an observe rule never blocks, whatever this box says. Inert without Exploit detection. A rule can be wrong: a pattern wider than the fix blocks an editor\'s save, a user-agent fragment shared with a partner blocks a webhook. Every block is reported (kind shield_block), the console alarms when a rule starts blocking logged-in users or addresses in good standing, and unticking this box stops blocking on the very next request — it is read per request, never cached. The CODESAFE_SHIELD_KILL constant switches the whole shield off and calls no one.', 'ovos-codesafe'));
 		$this->shieldStatusRow();
 		$this->prependStatusRow();
+		$this->storeStatusRow();
 		$this->entryWatchFields();
 		$this->scanFields();
 		$this->inputField('release',
@@ -223,6 +267,12 @@ class Settings
 		$this->inputField('tags',
 			__('Tags', 'ovos-codesafe'), 'text', '',
 			__('Optional tags on every report (PHP and browser), comma-separated — a tenant, a region, a team: shop, eu, tenant:acme. Lowercase letters, digits and _ . : - only, up to 10; the console shows them in its TAGS column, one filter per tag. The CODESAFE_TAGS constant overrides this field.', 'ovos-codesafe'));
+		$this->inputField('trusted_proxy_header',
+			__('Trusted proxy header', 'ovos-codesafe'), 'text', 'CF-Connecting-IP',
+			__('Only behind a proxy or CDN (Cloudflare, a load balancer): the header it names the visitor\'s address in — CF-Connecting-IP, X-Forwarded-For, X-Real-IP. Read ONLY when the request comes from one of the ranges below; otherwise, and when this is blank, the connecting address (REMOTE_ADDR) is the visitor, as before. Behind a proxy without this, every report, rate rule and offender score names the proxy instead of the visitor. CODESAFE_TRUSTED_PROXY_HEADER overrides this field.', 'ovos-codesafe'));
+		$this->inputField('trusted_proxies',
+			__('Trusted proxy ranges', 'ovos-codesafe'), 'text', 'cloudflare',
+			__('The addresses of your proxies, comma-separated — CIDR ranges or single addresses (10.0.0.0/8, 2001:db8::/32), or the word cloudflare for Cloudflare\'s published ranges (bundled, never fetched). A header from anywhere else is ignored: any client can send one. CODESAFE_TRUSTED_PROXIES overrides this field.', 'ovos-codesafe'));
 			
 		echo '</table>';
 		
@@ -341,7 +391,7 @@ class Settings
 		string $description = '',
 	): void
 	{
-		$locked = $this->config->isConstant($key);
+		$locked = $this->config->isConstant($key) || $this->networkLocked($key);
 		$value = $type === 'password' ? '' : (string)$this->config->get($key);
 		
 		if($type === 'password' && $this->config->get($key) !== '')
@@ -371,7 +421,7 @@ class Settings
 		string $description,
 	): void
 	{
-		$locked = $this->config->isConstant($key);
+		$locked = $this->config->isConstant($key) || $this->networkLocked($key);
 		
 		echo '<tr><th scope="row">' . esc_html($label) . '</th><td><label>';
 		
@@ -420,6 +470,42 @@ class Settings
 	{
 		echo '<tr><th scope="row">' . esc_html__('Shield status', 'ovos-codesafe') . '</th><td>'
 			. '<p class="description" style="margin: 0;">' . esc_html((new Shield\Adapter($this->config, $this->sender))->status()) . '</p>'
+			. '</td></tr>';
+	}
+	
+	/**
+	 * Where the store keeps the visitors' addresses, the queued reports and
+	 * the ruleset — and, on a server that ignores its .htaccess (nginx, IIS),
+	 * what protects them there (security audit 2026-10-03 M13). Shown while
+	 * anything writes to the store
+	 */
+	protected function storeStatusRow(): void
+	{
+		$shield = $this->config->shieldDetect() && $this->config->shieldKill() === false;
+		if($shield === false && $this->config->entryWatch() === false)
+		{
+			return;
+		}
+		$dir = Shield\Adapter::storeDir();
+		if($dir === '')
+		{
+			return;
+		}
+		$outside = $dir !== Shield\Adapter::stubDir();
+		$line = match(true)
+		{
+			$outside => sprintf(
+				/* translators: %s: the store directory */
+				__('%s (CODESAFE_STORE_DIR) — keep it outside the document root.', 'ovos-codesafe'), $dir),
+			Shield\Adapter::readsHtaccess() => sprintf(
+				/* translators: %s: the store directory */
+				__('%s — this server reads the directory\'s deny .htaccess.', 'ovos-codesafe'), $dir),
+			default => sprintf(
+				/* translators: %s: the store directory */
+				__('%s — WARNING: this server does not read .htaccess (nginx, IIS), so the directory is not denied to the web. Each file in it begins with a PHP exit and the ruleset\'s name is drawn at random, so nothing in it is served — but the safest place is outside the document root: define CODESAFE_STORE_DIR in wp-config.php as an absolute path the web server cannot reach, or deny the directory in the server\'s own configuration.', 'ovos-codesafe'), $dir),
+		};
+		echo '<tr><th scope="row">' . esc_html__('Store', 'ovos-codesafe') . '</th><td>'
+			. '<p class="description" style="margin: 0;">' . esc_html($line) . '</p>'
 			. '</td></tr>';
 	}
 	
@@ -552,7 +638,11 @@ class Settings
 			echo '<p class="description">' . esc_html($description) . '</p>';
 		}
 		
-		if($locked)
+		if($locked && $this->config->isConstant($key) === false)
+		{
+			echo '<p class="description">' . esc_html__('On a multisite network the Shield, the executed-file watch and the trusted proxy are one for every site — they share one store, and the layer before WordPress cannot tell the sites apart. A super admin sets them on the main site.', 'ovos-codesafe') . '</p>';
+		}
+		elseif($locked)
 		{
 			$constant = $this->config->constantName($key);
 			

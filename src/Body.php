@@ -229,7 +229,7 @@ final class Body
 		
 		if(is_array($decoded) === true)
 		{
-			return self::encode(self::scrubStrings(Redactor::scrub($decoded, identities: false)));
+			return self::encode(self::scrubStrings(Redactor::scrub($decoded, identities: false, request: true)));
 		}
 		
 		// a bare JSON scalar: a string can hide a credential, a number cannot
@@ -257,7 +257,7 @@ final class Body
 		}
 		
 		return self::shrink(
-			self::scrubStrings(Redactor::scrub($fields, identities: false)),
+			self::scrubStrings(Redactor::scrub($fields, identities: false, request: true)),
 			static fn(array $data): string => http_build_query($data),
 		);
 	}

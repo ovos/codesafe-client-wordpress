@@ -21,6 +21,7 @@ use function add_action;
 use function array_filter;
 use function ceil;
 use function class_exists;
+use function constant;
 use function count;
 use function defined;
 use function dirname;
@@ -39,6 +40,7 @@ use function is_file;
 use function is_int;
 use function is_user_logged_in;
 use function is_wp_error;
+use function is_writable;
 use function max;
 use function md5;
 use function mkdir;
@@ -94,9 +96,11 @@ if(class_exists(Kernel::class, false) === false)
  *
  * Hooked at `plugins_loaded`, priority 0 — every plugin has loaded, nothing
  * of the application has run (an mu-plugin fires earlier but a normal plugin
- * is not loaded yet when it does). The store is APCu plus
- * `WP_CONTENT_DIR/ovos-codesafe/shield.json` behind a deny .htaccess and an
- * index.php; a host without APCu runs on the file alone. The pull rides a
+ * is not loaded yet when it does). The store is APCu plus a ruleset file
+ * under `WP_CONTENT_DIR/ovos-codesafe/` (or CODESAFE_STORE_DIR) whose name the
+ * consent draws, beside files that each begin with a PHP exit, behind a deny
+ * .htaccess and an index.php; a host without APCu runs on the file alone. On
+ * a multisite network the main site alone drives it. The pull rides a
  * shutdown function: one cache read per request, a conditional GET only
  * when the kernel's five-minute interval is due.
  *
@@ -130,6 +134,9 @@ final class Adapter
 	protected ?Kernel $kernel = null;
 	
 	protected ?string $prefix = null;
+	
+	/** @var array<string, true> the store directories this request has made sure of */
+	protected static array $made = [];
 	
 	public function __construct(
 		protected Config $config,
@@ -202,6 +209,7 @@ final class Adapter
 				$_POST,
 				static fn(): string => (string)file_get_contents('php://input'),
 				$signedIn,
+				ip: $this->sender->clientIp(),
 				user: self::userOf($signedIn),
 			);
 			$verdict = $this->kernel()->handle($facts, $this->consent());
@@ -338,32 +346,95 @@ final class Adapter
 	}
 	
 	/**
-	 * The durable tier: wp-content/ovos-codesafe/shield.json, the directory
-	 * made once with a deny .htaccess and an index.php beside it — JSON that
-	 * is never served and never included. '' when wp-content is not there
-	 * or cannot be written: the kernel runs on APCu alone, or fails open
+	 * The durable tier: the ruleset in the store directory under the name the
+	 * consent drew (Prepend::rules) — JSON that is never included, and that no
+	 * one can ask a web server for by name. '' when there is no store or no
+	 * consent yet: the kernel runs on APCu alone, or fails open
 	 */
 	public function file(): string
 	{
 		$dir = self::storeDir();
 		
-		return $dir === '' ? '' : $dir . DIRECTORY_SEPARATOR . self::FILE;
+		return $dir === '' ? '' : Prepend::rules($dir);
 	}
 	
 	/**
-	 * The store directory, made once with its deny .htaccess and index.php;
-	 * '' when wp-content is not there or cannot be written
+	 * Where the store's DATA lives — the consent, the ruleset, the queued
+	 * reports and the executed-file lists: the directory CODESAFE_STORE_DIR
+	 * names when it is set and can be written (an absolute path OUTSIDE the
+	 * document root is what it is for — security audit 2026-10-03 M13), else
+	 * the stub's own directory under wp-content. '' when neither can be
+	 * written
 	 */
 	public static function storeDir(): string
+	{
+		$named = defined('CODESAFE_STORE_DIR') ? trim((string)constant('CODESAFE_STORE_DIR')) : '';
+		if($named !== '')
+		{
+			$dir = self::made(rtrim($named, '/\\'));
+			if($dir !== '')
+			{
+				return $dir;
+			}
+		}
+		
+		return self::stubDir();
+	}
+	
+	/**
+	 * wp-content/ovos-codesafe/, made once with its deny .htaccess and
+	 * index.php: where the prepend stub lives whatever CODESAFE_STORE_DIR says
+	 * — the path an operator pasted into PHP's configuration never moves —
+	 * and the data with it unless the constant moves that. '' when
+	 * wp-content is not there or cannot be written
+	 */
+	public static function stubDir(): string
 	{
 		if(defined('WP_CONTENT_DIR') === false)
 		{
 			return '';
 		}
-		$dir = rtrim((string)WP_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . self::DIR;
+		
+		return self::made(rtrim((string)WP_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . self::DIR);
+	}
+	
+	/**
+	 * Whether the store's data is out of the web's reach by its PLACE — the
+	 * CODESAFE_STORE_DIR directory, or a server that reads the deny .htaccess
+	 * (Apache, LiteSpeed). Elsewhere the files' GUARD and the ruleset's drawn
+	 * name are what protect them, and the settings page says so
+	 */
+	public static function storeIsShielded(): bool
+	{
+		$data = self::storeDir();
+		
+		return ($data !== '' && $data !== self::stubDir()) || self::readsHtaccess();
+	}
+	
+	/** WordPress's own answer to "does this server read .htaccess" — Apache and LiteSpeed */
+	public static function readsHtaccess(): bool
+	{
+		return ($GLOBALS['is_apache'] ?? false) === true;
+	}
+	
+	/** a store directory, made with its deny .htaccess and index.php when it is not there; '' when it cannot be */
+	protected static function made(
+		string $dir,
+	): string
+	{
+		// asked several times a request (the sync, the drain, the store, the
+		// watch): the stats are paid once
+		if(isset(self::$made[$dir]))
+		{
+			return $dir;
+		}
 		try
 		{
 			if(is_dir($dir) === false && @mkdir($dir, 0755, true) === false)
+			{
+				return '';
+			}
+			if(is_writable($dir) === false)
 			{
 				return '';
 			}
@@ -380,6 +451,7 @@ final class Adapter
 		{
 			return '';
 		}
+		self::$made[$dir] = true;
 		
 		return $dir;
 	}
@@ -398,12 +470,15 @@ final class Adapter
 	{
 		try
 		{
-			if(PHP_SAPI === 'cli')
+			// on a multisite network the store is ONE for every site and the
+			// layer cannot tell them apart: the main site's word alone (M14)
+			if(PHP_SAPI === 'cli' || $config->ownsSharedStore() === false)
 			{
 				return;
 			}
 			$dir = self::storeDir();
-			if($dir === '')
+			$stubDir = self::stubDir();
+			if($dir === '' || $stubDir === '')
 			{
 				return;
 			}
@@ -416,13 +491,24 @@ final class Adapter
 				// the executed-file watch (Entries) rides the same layer with its own switch
 				'root' => Entries::root(),
 				'entries' => $config->entryWatch() && $connected,
+				// the visitor's address behind a proxy the site trusts (M5)
+				'proxy_header' => $config->trustedProxyHeader(),
+				'proxies' => $config->trustedProxies(),
 			]);
-			Prepend::ensureStub($dir);
+			// 1.0.2's plain-JSON files, or a store CODESAFE_STORE_DIR has moved since
+			if(is_file($stubDir . DIRECTORY_SEPARATOR . 'shield-consent.json')
+				|| ($dir !== $stubDir && is_file($stubDir . DIRECTORY_SEPARATOR . Prepend::CONSENT)))
+			{
+				Prepend::migrate($stubDir, $dir);
+			}
+			// the stub stays where the operator's configuration names it; it judges
+			// against the data wherever that lives
+			Prepend::ensureStub($dir, $dir === $stubDir ? null : $stubDir . DIRECTORY_SEPARATOR . Prepend::STUB);
 			// a site that ran ovos-console may still point PHP at its stub: that
 			// stub is rewritten to run this plugin, never deleted — PHP fails every
 			// request whose prepend file is gone
 			$legacy = self::legacyStub();
-			if($legacy !== '' && Prepend::status($dir, null, $legacy)['state'] === 'legacy' && is_dir(dirname($legacy)))
+			if($legacy !== '' && Prepend::status($stubDir, null, $legacy)['state'] === 'legacy' && is_dir(dirname($legacy)))
 			{
 				Prepend::ensureStub($dir, $legacy);
 			}
@@ -436,7 +522,7 @@ final class Adapter
 	/** what the settings page says about the prepend layer: its state, PHP's ini value, the stub and the two lines to paste */
 	public static function prependStatus(): array
 	{
-		$dir = self::storeDir();
+		$dir = self::stubDir();
 		if($dir === '')
 		{
 			return ['state' => 'unavailable', 'ini' => '', 'stub' => '', 'lines' => ['ini' => '', 'htaccess' => '']];
@@ -538,6 +624,8 @@ final class Adapter
 			'ua' => $text('ua'),
 			'referer' => Redactor::scrubUrl($text('referer')),
 			'host' => $text('host'),
+			// rebuilt from the uri scrubUrl() answered above: the query names are
+			// [redacted] and a login name masked before the bag is parsed
 			'request' => $get !== [] ? ['get' => Redactor::scrub($get, identities: false)] : [],
 		];
 		foreach(['status', 'at'] as $number)

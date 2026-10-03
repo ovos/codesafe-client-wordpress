@@ -460,10 +460,9 @@ class Security
 		return 'ovos_codesafe_authfail_' . $scope . '_' . md5(strtolower($subject));
 	}
 	
+	/** the visitor's address by the Sender's one rule — a trusted proxy's header only when the site named one */
 	protected function clientIp(): string
 	{
-		return isset($_SERVER['REMOTE_ADDR'])
-			? sanitize_text_field(wp_unslash((string)$_SERVER['REMOTE_ADDR']))
-			: '';
+		return $this->sender->clientIp();
 	}
 }

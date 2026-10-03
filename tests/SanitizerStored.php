@@ -52,7 +52,8 @@ class SanitizerStored extends Test
 		'billing_first_name' => 'A***',
 		'billing_last_name' => 'B***e*',
 		'billing_phone' => '+99 999 9999999',
-		'sepa_iban' => 'DE99 9999 9999 9999 9999 99',
+		// an IBAN never leaves the site since 1.0.3 (security audit 2026-10-03 H3)
+		'sepa_iban' => '[redacted]',
 		'billing_email' => 'a***.***g**@example.com',
 		'quantity' => '0',
 		'sku' => 'SKU-9912',

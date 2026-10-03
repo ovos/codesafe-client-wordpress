@@ -62,7 +62,19 @@ final class Redactor
 		// (the G3 sanitizer test, 2026-09-23): no letter before it, or wp
 		// before it — never unanchored, announce and pronounce contain it.
 		// The console's list carries the same rule (Scrubber::NAMES)
-		. '|(?<![a-z])nonce|wpnonce';
+		. '|(?<![a-z])nonce|wpnonce'
+		// the payment and reset fields (security audit 2026-10-03 H3): wp-login's
+		// rp_key beside the `key` of its link; the card number in every gateway's
+		// spelling — card_number, ccnum, cc-number, wc-gateway-card-number,
+		// x_card_num — with its code (x_card_code), expiry and the three names of
+		// the security code; an account number and an IBAN. cvv, cvc, csc and
+		// iban only as a WORD of the name (no letter beside them): Caribbean holds
+		// no iban, but a bare substring rule is how the next one would
+		. '|rp[-_]?key'
+		. '|card[-_]?(?:num(?:ber)?|no(?![a-z])|code|cvc|cvv|exp(?:iry|iration|(?![a-z])))'
+		. '|cc[-_]?(?:num(?:ber)?|no(?![a-z]))'
+		. '|(?<![a-z])(?:cvv2?|cvc2?|csc|ccv)(?![a-z])|security[-_]?code'
+		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])';
 	
 	/** the names above, matched against a field name */
 	protected const REDACT_PATTERN = '/' . self::SECRET_NAMES . '/i';
@@ -158,7 +170,13 @@ final class Redactor
 	// matches a WHOLE name. As field names they would over-redact — `hash`
 	// eats content_hash and filehash, `pin` eats shipping and pinned — so
 	// they are credentials as a query parameter only.
-	protected const QUERY_NAMES = ['key', 'auth', 'code', 'sig', 'signature',
+	//
+	// Since 1.0.3 the same exact names drop the value of a REQUEST field too
+	// (scrub(), request: true — get, post and the parsed body): the reset link's
+	// `key` reached request.get whole while the uri beside it said [redacted]
+	// (security audit 2026-10-03 H3). Exact names only, so content_hash, pinned
+	// and coupon_code stay readable.
+	public const QUERY_NAMES = ['key', 'auth', 'code', 'sig', 'signature',
 		'otp', 'pin', 'hash'];
 	
 	/**
@@ -203,12 +221,17 @@ final class Redactor
 	 * addresses and username fields masked — unless $identities is false,
 	 * which is how the REQUEST data (get, post, the body) is scrubbed: the
 	 * console masks those on arrival and keeps the original encrypted for an
-	 * audited reveal and a replay (console docs/plans/reveal-everything.md)
+	 * audited reveal and a replay (console docs/plans/reveal-everything.md).
+	 *
+	 * $request marks a bag of REQUEST fields (get, post, a parsed body): the
+	 * QUERY_NAMES drop there too, by exact name — the reset link's `key` and
+	 * an OAuth `code` are the same credential in $_GET as in the uri
 	 */
 	public static function scrub(
 		array $values,
 		int $depth = 0,
 		bool $identities = true,
+		bool $request = false,
 	): array
 	{
 		if($depth >= self::MAX_DEPTH)
@@ -222,7 +245,8 @@ final class Redactor
 		{
 			// secret fields are dropped wholesale — before recursing, so a
 			// secret key whose value is an array cannot leak through its children
-			if(preg_match(self::REDACT_PATTERN, (string)$key) === 1)
+			if(preg_match(self::REDACT_PATTERN, (string)$key) === 1
+				|| ($request && self::isQueryName((string)$key)))
 			{
 				$clean[$key] = '[redacted]';
 				
@@ -231,7 +255,7 @@ final class Redactor
 			
 			if(is_array($value))
 			{
-				$clean[$key] = self::scrub($value, $depth + 1, $identities);
+				$clean[$key] = self::scrub($value, $depth + 1, $identities, $request);
 				
 				continue;
 			}
@@ -300,7 +324,7 @@ final class Redactor
 				{
 					$name = rawurldecode($match[2]);
 					if(preg_match(self::REDACT_PATTERN, $name) === 1
-						|| in_array(strtolower(trim($name)), self::QUERY_NAMES, true))
+						|| self::isQueryName($name))
 					{
 						return $match[1] . $match[2] . '=[redacted]';
 					}
@@ -555,6 +579,18 @@ final class Redactor
 	): bool
 	{
 		return preg_match(self::REDACT_PATTERN, $name) === 1;
+	}
+	
+	/**
+	 * Whether a NAME is one of the QUERY_NAMES — exact, case and surrounding
+	 * space aside: a credential as a query parameter or a request field, an
+	 * ordinary word anywhere else
+	 */
+	public static function isQueryName(
+		string $name,
+	): bool
+	{
+		return in_array(strtolower(trim($name)), self::QUERY_NAMES, true);
 	}
 	
 	/**

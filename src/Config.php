@@ -3,14 +3,25 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use function array_push;
 use function array_slice;
+use function array_unique;
+use function array_values;
 use function constant;
 use function defined;
+use function function_exists;
+use function get_blog_option;
+use function get_main_site_id;
+use function is_main_site;
+use function is_multisite;
+use function is_super_admin;
 use function max;
 use function mb_substr;
 use function min;
+use function preg_match;
 use function preg_split;
 use function rtrim;
+use function strtolower;
 use function strtoupper;
 use function trim;
 
@@ -52,7 +63,30 @@ class Config
 		'snapshot' => false,
 		'snapshot_styles' => false,
 		'js_admin' => false,
+		'trusted_proxy_header' => '',
+		'trusted_proxies' => '',
 	];
+	
+	/**
+	 * The keys whose effect reaches past this site on a multisite network: the
+	 * Shield's two boxes and the executed-file watch drive ONE store under
+	 * WP_CONTENT_DIR, and the prepend layer that reads it runs before
+	 * WordPress knows which site a request is for. So on a network only the
+	 * main site's word counts, and only a super admin may give it (security
+	 * audit 2026-10-03 M14); the trusted proxy rides the same consent file
+	 */
+	public const NETWORK_KEYS = ['shield_detect', 'shield_enforce', 'entry_watch', 'trusted_proxy_header', 'trusted_proxies'];
+	
+	/**
+	 * The CIDR ranges `cloudflare` stands for in trusted_proxies — Cloudflare's
+	 * published edge list (cloudflare.com/ips), bundled: the plugin never
+	 * fetches it
+	 */
+	public const CLOUDFLARE = ['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+		'141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
+		'198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+		'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
+		'2a06:98c0::/29', '2c0f:f248::/32'];
 	
 	protected ?array $settings = null;
 	
@@ -169,7 +203,7 @@ class Config
 	 */
 	public function shieldDetect(): bool
 	{
-		return (bool)$this->get('shield_detect');
+		return (bool)$this->get('shield_detect') && $this->ownsSharedStore();
 	}
 	
 	/**
@@ -178,7 +212,100 @@ class Config
 	 */
 	public function shieldEnforce(): bool
 	{
-		return (bool)$this->get('shield_enforce');
+		return (bool)$this->get('shield_enforce') && $this->ownsSharedStore();
+	}
+	
+	/**
+	 * Whether this site drives the store the Shield and the executed-file
+	 * watch keep under WP_CONTENT_DIR (NETWORK_KEYS): a single site always; on
+	 * a multisite network the main site alone — a subsite's boxes would
+	 * otherwise pull its own console's rules into the file every site of the
+	 * network is judged by. The network's Shield is the main site's
+	 */
+	public function ownsSharedStore(): bool
+	{
+		return function_exists('is_multisite') === false
+			|| is_multisite() === false
+			|| (function_exists('is_main_site') && is_main_site());
+	}
+	
+	/**
+	 * Whether this request's user may change the NETWORK_KEYS: anyone who may
+	 * open the settings page on a single site; on a network a super admin, on
+	 * the main site
+	 */
+	public function mayChangeNetworkKeys(): bool
+	{
+		if(function_exists('is_multisite') === false || is_multisite() === false)
+		{
+			return true;
+		}
+		
+		return $this->ownsSharedStore() && is_super_admin();
+	}
+	
+	/**
+	 * The header a trusted proxy names the visitor's address in
+	 * (CF-Connecting-IP, X-Forwarded-For, X-Real-IP …), '' for none — then
+	 * REMOTE_ADDR is the visitor, which is the default and the only safe
+	 * answer without a proxy (security audit 2026-10-03 M5). A server's
+	 * property, so on a network the main site's
+	 */
+	public function trustedProxyHeader(): string
+	{
+		$header = trim((string)$this->networkValue('trusted_proxy_header'));
+		
+		return preg_match('~^[A-Za-z0-9-]{1,64}$~', $header) === 1 ? $header : '';
+	}
+	
+	/**
+	 * The ranges whose REMOTE_ADDR is a proxy the header above may be taken
+	 * from: CIDRs or bare addresses, split on commas and whitespace, and the
+	 * word `cloudflare` for Cloudflare's published edge list (CLOUDFLARE).
+	 * Empty means the header is never read — a header any client can send is
+	 * worth only the proxy that set it
+	 *
+	 * @return list<string>
+	 */
+	public function trustedProxies(): array
+	{
+		$tokens = preg_split('~[,;\s]+~', trim((string)$this->networkValue('trusted_proxies')), -1, PREG_SPLIT_NO_EMPTY);
+		$ranges = [];
+		
+		foreach($tokens === false ? [] : $tokens as $token)
+		{
+			if(strtolower($token) === 'cloudflare')
+			{
+				array_push($ranges, ...self::CLOUDFLARE);
+				
+				continue;
+			}
+			
+			if(preg_match('~^[0-9A-Fa-f:.]+(?:/\d{1,3})?$~', $token) === 1)
+			{
+				$ranges[] = $token;
+			}
+		}
+		
+		return array_values(array_unique(array_slice($ranges, 0, 256)));
+	}
+	
+	/**
+	 * A NETWORK_KEYS value: the constant, else on a network's subsite the main
+	 * site's stored value, else this site's
+	 */
+	protected function networkValue(
+		string $key,
+	): mixed
+	{
+		if($this->isConstant($key) || $this->ownsSharedStore() || function_exists('get_blog_option') === false)
+		{
+			return $this->get($key);
+		}
+		
+		$main = (array)get_blog_option((int)get_main_site_id(), self::OPTION, []);
+		
+		return $main[$key] ?? self::DEFAULTS[$key] ?? null;
 	}
 	
 	/**
@@ -216,7 +343,7 @@ class Config
 	 */
 	public function entryWatch(): bool
 	{
-		return (bool)$this->get('entry_watch');
+		return (bool)$this->get('entry_watch') && $this->ownsSharedStore();
 	}
 	
 	public function release(): string
