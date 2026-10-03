@@ -480,8 +480,9 @@ again on its side as a backstop, but the first cut happens here:
   `otp`, `pin`, `hash`, by exact name — are dropped from the URL and, since
   1.0.3, from the request's query and post bags too: the password-reset link's
   `key` used to leave in the bag while the URL beside it said `[redacted]`.
-  On `wp-login.php` and `xmlrpc.php` the login name (`log`, `user_login`)
-  leaves masked.
+  The login name beside them (`log`, `user_login`) still travels as typed:
+  codesafe masks it on arrival and keeps the original encrypted for an
+  audited REVEAL — masked here, it could never be revealed.
 - **The request body is a document, not text**: `structure`, the
   default, parses it — form, JSON, XML-RPC — walks the keys the way the
   variables are walked (so `opts[api_key]` is caught, and a percent-encoded

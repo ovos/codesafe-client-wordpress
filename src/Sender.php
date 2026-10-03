@@ -819,16 +819,15 @@ class Sender
 		// A CREDENTIAL route is the exception (security audit 2026-10-03 H3):
 		// wp-login.php's `log` and `user_login`, XML-RPC's username — the name
 		// beside the password a scanner tried — leave masked, never whole
-		$credential = Body::isCredentialRoute($this->server('REQUEST_URI'));
 		
 		if(!empty($_GET))
 		{
-			$request['get'] = Redactor::scrub(wp_unslash((array)$_GET), identities: $credential, request: true);
+			$request['get'] = Redactor::scrub(wp_unslash((array)$_GET), identities: false, request: true);
 		}
 		
 		if(!empty($_POST))
 		{
-			$request['post'] = Redactor::scrub(wp_unslash((array)$_POST), identities: $credential, request: true);
+			$request['post'] = Redactor::scrub(wp_unslash((array)$_POST), identities: false, request: true);
 		}
 		// phpcs:enable WordPress.Security.NonceVerification, WordPress.Security.ValidatedSanitizedInput
 		

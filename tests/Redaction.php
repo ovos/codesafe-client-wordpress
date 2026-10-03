@@ -105,10 +105,13 @@ class Redaction extends Test
 	
 	/**
 	 * The reset form, as wp-login.php receives it: the key in the query and
-	 * rp_key in the post leave nowhere in the JSON, and the login name — the
-	 * other half of the takeover — leaves masked in get and post alike
+	 * rp_key in the post leave nowhere in the JSON. The login name in the
+	 * bags travels as typed: codesafe masks it on arrival and keeps the
+	 * original in its identity vault for an audited REVEAL (codesafe
+	 * reveal-everything §2) — masked here, it could never be revealed.
+	 * Without the key it is no takeover
 	 */
-	public function theResetRequestCarriesNoKeyAndAMaskedLogin(): bool
+	public function theResetRequestCarriesNoKeyAndTheLoginForTheVault(): bool
 	{
 		$wire = $this->wire('/wp-login.php?action=rp&key=' . self::RESET_KEY . '&login=marcin',
 			['action' => 'rp', 'key' => self::RESET_KEY, 'login' => 'marcin'],
@@ -117,18 +120,18 @@ class Redaction extends Test
 		
 		return str_contains($wire, self::RESET_KEY) === false
 			&& str_contains($wire, self::RP_KEY) === false
-			&& str_contains($wire, 'marcin') === false
 			&& ($request['get']['key'] ?? '') === '[redacted]'
-			&& ($request['get']['login'] ?? '') === 'm***i*'
+			&& ($request['get']['login'] ?? '') === 'marcin'
 			&& ($request['post']['rp_key'] ?? '') === '[redacted]'
-			&& ($request['post']['log'] ?? '') === 'm*'
-			&& ($request['post']['user_login'] ?? '') === 'm***i*'
+			&& ($request['post']['pass1'] ?? '') === '[redacted]'
+			&& ($request['post']['log'] ?? '') === 'mg'
+			&& ($request['post']['user_login'] ?? '') === 'marcin'
 			&& ($request['post']['wp-submit'] ?? '') === 'Save';
 	}
 	
 	/**
-	 * Off a credential route the request keeps its people for the console to
-	 * mask and keep (reveal-everything) — only the credential routes mask here
+	 * Off a credential route the request keeps its people for codesafe to
+	 * mask and keep (reveal-everything), exactly as on one
 	 */
 	public function offACredentialRouteTheNamesTravelForTheConsoleToMask(): bool
 	{
