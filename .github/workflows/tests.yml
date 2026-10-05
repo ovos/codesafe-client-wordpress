@@ -1,0 +1,82 @@
+name: "Tests"
+
+# The plugin's tests run on php-library's harness, the way the console's do:
+# ci/ is a test-only application that installs ovos/php-library and
+# ovos/php-module-system (both public - no deploy keys, so a fork's pull
+# request runs too) and `php cli.php tests run` runs tests/. Nothing in ci/
+# ships: the zip is `git archive`, and ci is export-ignored.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: ./ci
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Requires PHP: 8.3 - and the plugin runs on hosts we do not control
+        php-version: ['8.3', '8.4', '8.5']
+    
+    name: PHP ${{ matrix.php-version }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      
+      - name: Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          tools: composer:v2
+          coverage: none
+          ini-values: apc.enabled=on, apc.enable_cli=on, zend.assertions=1
+          extensions: :xdebug, apcu, yaml, intl, mbstring, ctype, curl, dom, fileinfo, openssl, pdo, sodium, opcache
+      
+      # the release lints too, but only at tag time - a parse error in the
+      # prepend layer would reach every request of a site that switched it on
+      - name: Lint every plugin PHP file
+        working-directory: .
+        run: |
+          set -euo pipefail
+          find . -name '*.php' -not -path './.git/*' -not -path './ci/vendor/*' -print0 | xargs -0 -n1 php -l > /dev/null
+      
+      - name: Copy .env
+        run: php -r "file_exists('.env') || copy('.env.tests', '.env');"
+      
+      - name: Install dependencies
+        run: composer install --no-dev --no-interaction --classmap-authoritative
+      
+      # Tests\SanitizerStored (needs the private console) and
+      # Tests\WordPressLive (needs a real WordPress) skip themselves here
+      - name: Run tests
+        run: php cli.php tests run
+  
+  # the shape release.yml ships: one version everywhere, and a zip that
+  # carries none of the repository's own files
+  release-shape:
+    runs-on: ubuntu-latest
+    name: Release shape
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      
+      - name: Version and zip contents
+        run: |
+          set -euo pipefail
+          version="$(grep -oE '^ \* Version: [0-9.]+$' ovos-codesafe.php | grep -oE '[0-9.]+$')"
+          grep -q "^Stable tag: ${version}\$" readme.txt || { echo "::error::readme.txt Stable tag is not ${version}"; exit 1; }
+          git archive --format=zip --prefix=ovos-codesafe/ -o ovos-codesafe.zip HEAD
+          if unzip -Z1 ovos-codesafe.zip | grep -E '^ovos-codesafe/(tests|docs|ci|\.github)/'; then
+            echo "::error::the release zip carries repository files"
+            exit 1
+          fi

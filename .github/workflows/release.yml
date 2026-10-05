@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # the signing key lives in this environment and nowhere else. Its
+    # deployment policy admits v* tags only, so a pull request, a leaked
+    # token or a workflow on any other ref cannot reach the key
+    # (docs/plans/signed-updates.md in the console repository).
+    environment: release
+    steps:
+      - uses: actions/checkout@v5
+
+      # the tag must match the plugin header and the wp.org stable tag —
+      # fail the release instead of shipping a zip that lies about its version
+      - name: Verify version matches tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -q "^ \* Version: ${version}\$" ovos-codesafe.php
+          grep -q "^Stable tag: ${version}\$" readme.txt
+
+      # a parse error in a prepend file is the one thing try/catch cannot catch,
+      # and the prepend runs on EVERY request of a site that switched it on —
+      # so no release ships a PHP file the interpreter refuses
+      - name: Lint every PHP file
+        run: |
+          set -euo pipefail
+          find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l > /dev/null
+
+      - name: Build plugin zip
+        run: git archive --format=zip --prefix=ovos-codesafe/ -o ovos-codesafe.zip "${GITHUB_REF_NAME}"
+
+      # Ed25519 over the whole zip, with the PEM from the environment. Pure
+      # EdDSA is one-shot, hence -rawin and no digest. The .sig is TEXT —
+      # base64 of the 64 raw signature bytes — because a binary asset in a
+      # JSON API answer is a quoting bug waiting to happen.
+      - name: Sign the zip
+        env:
+          SIGNING_KEY: ${{ secrets.OVOS_CONSOLE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > signing-key.pem
+          openssl pkeyutl -sign -rawin -inkey signing-key.pem -in ovos-codesafe.zip -out ovos-codesafe.zip.sig.bin
+          base64 -w0 ovos-codesafe.zip.sig.bin > ovos-codesafe.zip.sig
+          echo >> ovos-codesafe.zip.sig
+
+      # The release must not go out signed with a key the plugin does not
+      # hold. Derive the public key from the secret, compare its raw 32 bytes
+      # with Updater::PUBLIC_KEY in THIS checkout, then verify the signature
+      # we just made. Any mismatch here is a bricked auto-update for every
+      # site — so it fails the job, before anything is published.
+      - name: Verify the signature against the key in the source
+        run: |
+          set -euo pipefail
+          openssl pkey -in signing-key.pem -pubout -out signing-key.pub.pem
+          runner_key="$(openssl pkey -pubin -in signing-key.pub.pem -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          source_key="$(grep -oE "PUBLIC_KEY = '[0-9a-f]{64}'" src/Updater.php | grep -oE '[0-9a-f]{64}')"
+          echo "runner key: ${runner_key}"
+          echo "source key: ${source_key}"
+          test "${runner_key}" = "${source_key}" || { echo "::error::the signing key in the environment is not the key the plugin verifies with"; exit 1; }
+          openssl pkeyutl -verify -pubin -inkey signing-key.pub.pem -rawin -in ovos-codesafe.zip -sigfile ovos-codesafe.zip.sig.bin
+          rm -f signing-key.pem signing-key.pub.pem ovos-codesafe.zip.sig.bin
+
+      # the product's name is ovos codesafe; the asset keeps its identifier —
+      # ovos-codesafe.zip is what the updater and every install URL name, and
+      # the zip's ovos-codesafe/ prefix is the plugin's directory on every site
+      - name: Create GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" ovos-codesafe.zip ovos-codesafe.zip.sig --title "ovos codesafe ${GITHUB_REF_NAME#v}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

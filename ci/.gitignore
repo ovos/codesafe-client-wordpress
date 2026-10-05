@@ -1,0 +1,4 @@
+/vendor/
+/application/
+composer.lock
+.env
