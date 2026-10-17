@@ -7,6 +7,7 @@ use Ovos\Codesafe\Shield\Consent;
 use Ovos\Codesafe\Shield\Facts;
 use Ovos\Codesafe\Shield\Kernel;
 use Ovos\Codesafe\Shield\Store;
+use Ovos\Codesafe\Shield\Wordpress;
 use stdClass;
 use Throwable;
 
@@ -75,6 +76,12 @@ use const DIRECTORY_SEPARATOR;
 if(class_exists(Kernel::class, false) === false)
 {
 	require_once __DIR__ . DIRECTORY_SEPARATOR . 'Kernel.php';
+}
+// WordPress's kernel module, right after the kernel and by path: it implements the
+// kernel's Platform, which no autoloader finds, and the stubs include this file with none
+if(class_exists(Wordpress::class, false) === false)
+{
+	require_once __DIR__ . DIRECTORY_SEPARATOR . 'Wordpress.php';
 }
 
 /**
@@ -383,7 +390,7 @@ final class Prepend
 			static function(string $kind, string $message, array $extra) use (&$report): void
 			{
 				$report = [$kind, $message, $extra];
-			});
+			}, platforms: self::platforms());
 		// who WordPress will run it as is told only later for an XML-RPC call (inside each method) and a
 		// REST request with a token another plugin reads; the adapter cannot name that caller either, so
 		// the rules for anyone are judged here and what depends on who waits for the adapter
@@ -392,7 +399,8 @@ final class Prepend
 		// virtual patch that needs one only observes
 		$facts = Facts::fromServer($server, $post, static fn(): string => (string)file_get_contents('php://input'), false,
 			ip: self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])),
-			user: self::loginName($server, $post), get: $get, cookies: $cookies, files: $files, restPrefix: $restPrefix, callerKnown: $known);
+			user: self::loginName($server, $post), get: $get, cookies: $cookies, files: $files, callerKnown: $known, platforms: $kernel->platforms(),
+			options: [Wordpress::OPTION_REST_PREFIX => $restPrefix]);
 		$verdict = $kernel->judge($facts, new Consent(true, $consent['enforce'], false), $now);
 		// a blocking vpatch this layer could not answer (a nonce it cannot check): where
 		// WordPress loads, the adapter judges it with wp_verify_nonce — left to it, counted
@@ -520,6 +528,18 @@ final class Prepend
 		$prefix = is_string($prefix) ? trim($prefix, '/') : '';
 		
 		return $prefix === '' ? self::REST_PREFIX : $prefix;
+	}
+	
+	/**
+	 * The kernel modules a WordPress site's kernel reads: WordPress's own, always —
+	 * its REST routes and batches, its shortcode and block attributes. This layer
+	 * and the adapter hand them to the kernel and to Facts alike
+	 *
+	 * @return list<Platform>
+	 */
+	public static function platforms(): array
+	{
+		return [new Wordpress()];
 	}
 	
 	/**

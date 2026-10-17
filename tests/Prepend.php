@@ -193,12 +193,13 @@ class Prepend extends Test
 	{
 		$rules = [['id' => 14, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
 			'who' => 'anyone', 'conditions' => [['target' => 'rest', 'test' => 'prefix', 'value' => '/fx/v1/settings']]]];
+		// kept as the site's pull keeps it, with WordPress's module
 		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
 			'contract' => 1,
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord());
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root, 'rest_prefix' => 'api'] + self::ENFORCE);
 		$moved = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/api/fx/v1/settings', $root . '/index.php'));
@@ -222,12 +223,13 @@ class Prepend extends Test
 			'mode' => 'proven', 'expires_at' => null, 'who' => $who, 'conditions' => [$condition]];
 		$write = function(array ...$rules): void
 		{
+			// kept as the site's pull keeps them, with WordPress's module
 			(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
 				'contract' => 1,
 				'dialect' => 're2-2026',
 				'project' => 'harness',
 				'rules' => $rules,
-			], time())->toRecord());
+			], time(), platforms: BasePrepend::platforms())->toRecord());
 		};
 		$root = $this->site();
 		file_put_contents($root . '/xmlrpc.php', "<?php\n");

@@ -5,16 +5,19 @@ declare(strict_types=1);
  * ovos/codesafe Shield kernel — zero dependencies, vendor this file.
  *
  *   require_once __DIR__ . '/Shield.php';
- *   use Ovos\Codesafe\Shield\{Kernel, Store, Facts, Consent, Verdict};
+ *   require_once __DIR__ . '/Shield/Wordpress.php';     // a WordPress host only, always after this file
+ *   use Ovos\Codesafe\Shield\{Kernel, Store, Facts, Consent, Verdict, Wordpress};
  *
  *   $kernel = new Kernel(
  *       'https://codesafe.example',                 // codesafe instance base URL
  *       $apiKey,                                   // the project api_key the sender already holds (secret!)
  *       new Store('/var/cache/app/shield.json', 'myapp:shield'),   // file tier + APCu prefix
  *       report: fn(string $kind, string $message, array $extra) => $sender->reportRefusal($kind, $message, $extra),
+ *       platforms: [new Wordpress()],              // the platform modules loaded; none on a host that is no WordPress
  *   );
  *   $consent = new Consent(detect: $config['shield_detect'], enforce: $config['shield_enforce'], kill: $config['shield_kill']);
- *   $verdict = $kernel->handle(Facts::fromServer($_SERVER, $_POST, fn() => file_get_contents('php://input')), $consent);
+ *   $verdict = $kernel->handle(Facts::fromServer($_SERVER, $_POST, fn() => file_get_contents('php://input'),
+ *       platforms: $kernel->platforms()), $consent);
  *   if($verdict->isBlock())
  *   {
  *       // the adapter's own 403 — the kernel never emits a response
@@ -74,7 +77,7 @@ declare(strict_types=1);
  * anonymous or lacks:<capability>, and a nonce test asks the platform: a
  * blocking vpatch whose who or nonce the adapter cannot answer, or that
  * reads what the kernel could not (an upload, a JSON body past
- * Facts::JSON_CAP, a batch not read in full), is held with the reason `unanswered`
+ * Facts::JSON_CAP, a WordPress batch not read in full), is held with the reason `unanswered`
  * (Verdict::REASON_UNANSWERED), never blocked.
  * Every vpatch a request reaches is counted per minute beside the hits,
  * whether or not it decided the verdict: `entry` (its selecting entries
@@ -93,6 +96,15 @@ declare(strict_types=1);
  * blocks, else observed — counted as hits of the reserved rule 0, never
  * reported as an event, so a refusal never feeds the score that listed it.
  *
+ * Platform modules (Platform): what one platform's app makes of a request —
+ * WordPress's REST routes and batches, its shortcode and block attributes,
+ * the JSON types it reads — lives in a module of its own (Shield/Wordpress.php),
+ * which the adapter loads after this file and hands the kernel and Facts.
+ * A kernel drops a rule naming a module's words it was not given at the
+ * pull, as it drops a kind it does not know, and Facts read none of them:
+ * nothing is guessed. The pull names the modules in X-Shield-Platforms,
+ * `core` always first.
+ *
  * Fast pickup: the door says the project's ruleset version (X-Shield-Version,
  * one value whatever kinds a kernel reads) on every 200 and 304, and the
  * kernel stores it beside the rules. codesafe's ingest answers carry the
@@ -104,7 +116,9 @@ declare(strict_types=1);
  * holds the vendored copies to it); consumers keep it byte-identical
  * (sha1-compare after sync) and load
  * it with require_once — like any PHP class file, a second include is a
- * fatal error (the classes bind at compile time, so no guard can help).
+ * fatal error (the classes bind at compile time, so no guard can help). A
+ * module is loaded the same way and after this file: it implements the
+ * Platform interface declared here, which is no file a PSR-4 autoloader finds.
  *
  * @author Marcin Gil <mg@ovos.at>
  */
@@ -127,6 +141,7 @@ use function array_filter;
 use function array_is_list;
 use function array_key_exists;
 use function array_keys;
+use function array_map;
 use function array_slice;
 use function array_values;
 use function base64_decode;
@@ -186,14 +201,12 @@ use function str_starts_with;
 use function strcasecmp;
 use function stream_context_create;
 use function stream_get_contents;
-use function stripcslashes;
 use function stripos;
 use function strlen;
 use function strncasecmp;
 use function strpbrk;
 use function strpos;
 use function strrpos;
-use function strspn;
 use function strtolower;
 use function strtoupper;
 use function substr;
@@ -214,7 +227,74 @@ use const CURLOPT_USERAGENT;
 use const JSON_UNESCAPED_SLASHES;
 use const JSON_UNESCAPED_UNICODE;
 use const LOCK_EX;
-use const PREG_SET_ORDER;
+
+/**
+ * A platform's kernel module: the vocabulary only its app gives a request a
+ * meaning in — frame targets, decode steps, the requests a request carries
+ * inside it, the JSON types it reads. Given to Kernel and Facts (their
+ * `platforms`), it is asked where the core's own reading ends; a kernel
+ * without it drops its rules at the pull and reads none of its words
+ */
+interface Platform
+{
+	/** the word X-Shield-Platforms names it by */
+	public function name(): string;
+	
+	/**
+	 * Its frame targets (`rest`): named, no prefix; each selects the handler a
+	 * request reaches whatever its test, and stands in as the frame value
+	 *
+	 * @return list<string>
+	 */
+	public function targets(): array;
+	
+	/**
+	 * One of its targets' values over the request; [] when the request has none
+	 *
+	 * @return list<string>
+	 */
+	public function values(
+		string $target,
+		Facts $facts,
+	): array;
+	
+	/** whether a decode step is one of its own and well formed */
+	public function decodes(
+		mixed $step,
+	): bool;
+	
+	/**
+	 * One of its steps over one value: the values it yields — none when it
+	 * cannot read the value — and whether it read only part of it
+	 *
+	 * @return array{list<string>, bool}
+	 */
+	public function decode(
+		string $step,
+		string $value,
+	): array;
+	
+	/**
+	 * The requests inside this one that reach handlers of their own (a
+	 * batch), and whether some of them could not be read
+	 *
+	 * @return array{list<Facts>, bool}
+	 */
+	public function subRequests(
+		Facts $facts,
+	): array;
+	
+	/** whether requests inside this one that could not be read (subRequests()) may have reached a vpatch */
+	public function reaches(
+		array $rule,
+		Facts $facts,
+	): bool;
+	
+	/** whether its app reads a body of this content type as JSON where the core does not */
+	public function jsonType(
+		string $contentType,
+	): bool;
+}
 
 /**
  * What the adapter tells the kernel about the request. The kernel never
@@ -260,11 +340,11 @@ final class Facts
 	/** @var array<string, ?bool> the host's answers, by question: a rule judged twice asks once */
 	protected array $answers = [];
 	
-	/** the batch request a sub-request came in, whose superglobals its handler reads too (subRequest()) */
+	/** the request a sub-request came in, whose superglobals its handler reads too (derived()) */
 	protected ?Facts $outer = null;
 	
-	/** the REST API's path prefix without slashes — WordPress's rest_get_url_prefix() */
-	public readonly string $restPrefix;
+	/** @var list<Platform> the platform modules the request is read with */
+	public readonly array $platforms;
 	
 	/**
 	 * @param array<string, mixed> $query the query as the platform parsed it ($_GET)
@@ -274,13 +354,14 @@ final class Facts
 	 * @param ?Closure(): mixed $jsonReader a JSON body, decoded; it throws a LengthException for a body too large to read
 	 * @param ?Closure(string): ?bool $can whether the signed-in user has a capability; null when the host cannot say
 	 * @param ?Closure(string, string): ?bool $nonce whether a nonce is valid for an action; null when the host cannot say
-	 * @param string $restPrefix the REST API's path prefix (restPrefixOf())
 	 * @param bool $callerKnown whether the host could tell who the caller is: false leaves `authed` a guess,
 	 *     and what depends on it — a vpatch's anonymous or lacks:, a threat address — only observes
 	 * @param ?Closure(string): ?bool $kses whether the host's HTML filter would change a value (WordPress:
 	 *     wp_kses_post()); null when the host cannot say
 	 * @param array<string, mixed> $uploads field => the upload's temp path (or paths), nested as $files nests the names
 	 * @param ?Closure(string): ?string $fileReader an upload's bytes by its temp path; null when the host cannot read it
+	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms()); anything else is ignored
+	 * @param array<string, scalar> $options what a platform module reads of the host, by the module's own key (WordPress's REST prefix)
 	 */
 	public function __construct(
 		public readonly string $method,
@@ -298,51 +379,45 @@ final class Facts
 		protected ?Closure $jsonReader = null,
 		protected ?Closure $can = null,
 		protected ?Closure $nonce = null,
-		string $restPrefix = 'wp-json',
 		public readonly bool $callerKnown = true,
 		protected ?Closure $kses = null,
 		public readonly array $uploads = [],
 		protected ?Closure $fileReader = null,
+		array $platforms = [],
+		public readonly array $options = [],
 	)
 	{
-		$this->restPrefix = self::restPrefixOf($restPrefix);
+		$this->platforms = array_values(array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform));
 	}
 	
 	/**
-	 * A WordPress batch's sub-request as its route's handler sees it: its
-	 * method, its path under this site's REST prefix with its query, its body
-	 * as the form and the JSON, its headers — and this request's caller, whom
-	 * WordPress runs every sub-request as. Its handler also reads the
-	 * superglobals, which stay this request's: its cookies, uploads, query,
-	 * form and headers count beside the sub-request's own (Kernel::values()),
-	 * and its host is this request's
+	 * A request inside this one as the handler it reaches sees it — a
+	 * platform module shapes it (a WordPress batch's sub-request): its method,
+	 * URI, query, form, JSON body and headers, and this request's caller,
+	 * host answers, platforms and options, whom the platform runs it as. Its
+	 * handler also reads the superglobals, which stay this request's: its
+	 * cookies, uploads, query, form and headers count beside the
+	 * sub-request's own (Kernel::values()), and its host is this request's
 	 *
-	 * @param array<string, mixed> $headers
+	 * @param array<string, string> $headers lowercase names
 	 */
-	public function subRequest(
+	public function derived(
 		string $method,
-		string $path,
-		mixed $body,
+		string $uri,
+		array $query,
+		array $form,
+		mixed $json,
 		array $headers,
 	): self
 	{
-		parse_str(explode('?', $path, 2)[1] ?? '', $query);
-		$names = [];
-		foreach($headers as $name => $value)
-		{
-			// WordPress keeps a header's values as a list: the first is the one read
-			$names[strtolower((string)$name)] = is_array($value) ? (string)(array_values($value)[0] ?? '') : (is_scalar($value) ? (string)$value : '');
-		}
-		
-		$sub = new self(strtoupper($method), self::decodeOnce('/' . $this->restPrefix . $path), $this->ua, $this->ip, $this->authed, null, $this->user, $query,
-			is_array($body) ? $body : [], [], $names, [], static fn(): mixed => $body, $this->can, $this->nonce, $this->restPrefix, $this->callerKnown,
-			$this->kses);
+		$sub = new self($method, $uri, $this->ua, $this->ip, $this->authed, null, $this->user, $query, $form, [], $headers, [], static fn(): mixed => $json,
+			$this->can, $this->nonce, $this->callerKnown, $this->kses, platforms: $this->platforms, options: $this->options);
 		$sub->outer = $this;
 		
 		return $sub;
 	}
 	
-	/** the batch request this sub-request came in; null for a request of its own */
+	/** the request this sub-request came in; null for a request of its own */
 	public function outer(): ?Facts
 	{
 		return $this->outer;
@@ -370,16 +445,6 @@ final class Facts
 		return rtrim(strtolower($host), '.');
 	}
 	
-	/** a REST prefix without its slashes; none is WordPress's default, wp-json */
-	public static function restPrefixOf(
-		string $prefix,
-	): string
-	{
-		$prefix = trim($prefix, '/');
-		
-		return $prefix === '' ? 'wp-json' : $prefix;
-	}
-	
 	/**
 	 * @param array<string, mixed> $server the request's server parameters ($_SERVER or a PSR-7 equivalent)
 	 * @param array<string, mixed> $post the parsed form fields ($_POST) — files never
@@ -390,10 +455,11 @@ final class Facts
 	 * @param array<string, mixed> $files the uploads ($_FILES): their names, and their temp files for a file-content condition
 	 * @param ?callable(string): ?bool $can whether the signed-in user has a capability (a vpatch's `lacks:`)
 	 * @param ?callable(string, string): ?bool $nonce whether a nonce is valid for an action (a vpatch's nonce test)
-	 * @param string $restPrefix the REST API's path prefix — WordPress's rest_get_url_prefix(), wp-json elsewhere
 	 * @param bool $callerKnown whether the host could tell who the caller is (Facts::$callerKnown)
 	 * @param ?callable(string): ?bool $kses whether the host's HTML filter would change a value (a vpatch's unsafe_html)
 	 * @param ?callable(string): ?string $fileReader an upload's bytes by its temp path; null reads PHP's own (uploadReader())
+	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms())
+	 * @param array<string, scalar> $options what a platform module reads of the host (Facts::$options)
 	 */
 	public static function fromServer(
 		array $server,
@@ -407,10 +473,11 @@ final class Facts
 		array $files = [],
 		?callable $can = null,
 		?callable $nonce = null,
-		string $restPrefix = 'wp-json',
 		bool $callerKnown = true,
 		?callable $kses = null,
 		?callable $fileReader = null,
+		array $platforms = [],
+		array $options = [],
 	): self
 	{
 		$uri = is_string($server['REQUEST_URI'] ?? null) ? $server['REQUEST_URI'] : '/';
@@ -434,14 +501,15 @@ final class Facts
 			$cookies,
 			self::headersOf($server),
 			self::fileNames($files),
-			self::jsonReader($contentType, $input),
+			self::jsonReader($contentType, $input, platforms: $platforms),
 			$can === null ? null : Closure::fromCallable($can),
 			$nonce === null ? null : Closure::fromCallable($nonce),
-			$restPrefix,
 			$callerKnown,
 			$kses === null ? null : Closure::fromCallable($kses),
 			self::uploadPaths($files),
 			$fileReader === null ? self::uploadReader() : Closure::fromCallable($fileReader),
+			$platforms,
+			$options,
 		);
 	}
 	
@@ -545,14 +613,20 @@ final class Facts
 		return $bytes === false ? null : $bytes;
 	}
 	
-	/** a JSON body, decoded — read only when a json: target asks; past the cap it throws, and json() says the body went unread */
+	/**
+	 * A JSON body, decoded — read only when a json: target asks; past the cap
+	 * it throws, and json() says the body went unread
+	 *
+	 * @param list<Platform> $platforms the modules whose JSON types count too (jsonType())
+	 */
 	public static function jsonReader(
 		string $contentType,
 		?callable $input,
 		int $cap = self::JSON_CAP,
+		array $platforms = [],
 	): ?Closure
 	{
-		if($input === null || self::jsonType($contentType) === false)
+		if($input === null || self::jsonType($contentType, $platforms) === false)
 		{
 			return null;
 		}
@@ -571,30 +645,31 @@ final class Facts
 		};
 	}
 	
-	/** whether a body of this content type is JSON to a rule: `application/json`, a `+json` type, or one WordPress reads as JSON */
+	/**
+	 * Whether a body of this content type is JSON to a rule: `application/json`,
+	 * a `+json` type, or one a platform module given reads as JSON (Platform::jsonType())
+	 *
+	 * @param list<Platform> $platforms
+	 */
 	public static function jsonType(
 		string $contentType,
+		array $platforms = [],
 	): bool
 	{
 		$type = strtolower(trim(explode(';', $contentType, 2)[0]));
+		if($type === 'application/json' || str_ends_with($type, '+json'))
+		{
+			return true;
+		}
+		foreach($platforms as $platform)
+		{
+			if($platform instanceof Platform && $platform->jsonType($contentType))
+			{
+				return true;
+			}
+		}
 		
-		return $type === 'application/json' || str_ends_with($type, '+json') || self::wordpressJson($contentType);
-	}
-	
-	/**
-	 * Whether WordPress reads a body of this content type as JSON:
-	 * WP_REST_Request::get_content_type()'s value — cut at a `;` past the
-	 * first byte, lower case, holding a `/`, trimmed — through
-	 * wp_is_json_media_type()'s pattern
-	 */
-	public static function wordpressJson(
-		string $contentType,
-	): bool
-	{
-		// WordPress tests strpos() for truth: a `;` as the first byte cuts nothing
-		$value = strtolower(strpos($contentType, ';') ? explode(';', $contentType, 2)[0] : $contentType);
-		
-		return str_contains($value, '/') && preg_match('/(^|\s|,)application\/([\w!#\$&-\^\.\+]+\+)?json(\+oembed)?($|\s|;|,)/i', trim($value)) === 1;
+		return false;
 	}
 	
 	/**
@@ -999,26 +1074,17 @@ final class Ruleset
 	
 	public const KINDS = [self::KIND_MATCH, self::KIND_RATE, self::KIND_VPATCH];
 	
-	/** a vpatch's targets without a name — `rest` is the REST route in either spelling — and the prefixes that take one (`query:file`) */
-	public const TARGETS = ['method', 'path', 'rest'];
+	/** a vpatch's frame targets, without a name — a platform module names its own (Platform::targets()) — and the prefixes that take one (`query:file`) */
+	public const TARGETS = ['method', 'path'];
 	
 	/** `request:` is $_REQUEST's reading: the query's values and the body's; `file:` an upload's name, `file-content:` its bytes */
 	public const TARGET_PREFIXES = ['query', 'body', 'request', 'json', 'cookie', 'header', 'file', 'file-content', 'query-keys', 'body-keys'];
 	
-	/** the decode steps; `json:<dot.path>` is json walked to a path, as the json: target walks a body */
+	/** the decode steps; `json:<dot.path>` is json walked to a path, as the json: target walks a body; a platform module decodes its own (Platform::decodes()) */
 	public const DECODES = ['url', 'base64', 'json'];
 	
 	/** the values a condition's decode steps yield that are read at most: past them the condition holds unanswered */
 	public const DECODED_MAX = 256;
-	
-	/** the shortcodes or blocks one decode step reads in a value at most: past them the value is not read in full and the condition holds unanswered */
-	public const OCCURRENCES_MAX = 256;
-	
-	/** a shortcode tag as add_shortcode() takes one, in printable ASCII: never `<>&/[]=` or a space */
-	public const SHORTCODE_TAG = '~^[^<>&/\[\]\x00-\x20=\x7f-\xff]{1,100}$~D';
-	
-	/** a block's `namespace/name` as WordPress's block parser reads one */
-	public const BLOCK_NAME = '~^[a-z][a-z0-9_-]*/[a-z][a-z0-9_-]*$~D';
 	
 	public const TESTS = ['equals', 'in', 'not_in', 'prefix', 'suffix', 'contains', 'regex', 'not_prefix', 'not_suffix', 'not_contains',
 		'not_regex', 'numeric', 'not_numeric', 'exists', 'longer_than', 'greater_than', 'less_than', 'offsite', 'has_quote', 'has_markup',
@@ -1106,13 +1172,17 @@ final class Ruleset
 	 * The digest is the door's (X-Shield-Sha256) or, absent, the sha256 of
 	 * the rules as received — the same bytes the door hashes. The version is
 	 * the door's X-Shield-Version, '' when it said none. The threat section is
-	 * kept only whole — a mode, pass paths, addresses PHP can read (threats())
+	 * kept only whole — a mode, pass paths, addresses PHP can read (threats()).
+	 * A rule in the words of a platform module not given is left out too
+	 *
+	 * @param list<Platform> $platforms the modules whose words a rule may use
 	 */
 	public static function fromPayload(
 		array $payload,
 		int $fetchedAt,
 		string $digest = '',
 		string $version = '',
+		array $platforms = [],
 	): self
 	{
 		$usable = ($payload['contract'] ?? null) === self::CONTRACT
@@ -1123,7 +1193,7 @@ final class Ruleset
 		{
 			foreach($payload['rules'] as $rule)
 			{
-				if(self::wellFormed($rule))
+				if(self::wellFormed($rule, $platforms))
 				{
 					$rules[] = $rule;
 				}
@@ -1266,13 +1336,15 @@ final class Ruleset
 		return $this->fetchedAt + $ceiling <= $now;
 	}
 	
+	/** @param list<Platform> $platforms the modules whose words a vpatch may use */
 	public static function wellFormed(
 		mixed $rule,
+		array $platforms = [],
 	): bool
 	{
 		if(is_array($rule) && self::isVpatch($rule))
 		{
-			return self::vpatchWellFormed($rule);
+			return self::vpatchWellFormed($rule, $platforms);
 		}
 		
 		return is_array($rule)
@@ -1295,20 +1367,23 @@ final class Ruleset
 	
 	/**
 	 * Whether a vpatch entry selects the handler a request reaches — its
-	 * entry point: a route, or an ENTRY_TESTS test on a value as sent (no
-	 * decode steps) of any target but an upload's contents; a group when
-	 * every member does. A negation, a payload test, a nonce or exists says
-	 * what the exploit carries
+	 * entry point: a platform module's target (a route), or an ENTRY_TESTS
+	 * test on a value as sent (no decode steps) of any target but an
+	 * upload's contents; a group when every member does. A negation, a
+	 * payload test, a nonce or exists says what the exploit carries
+	 *
+	 * @param list<Platform> $platforms
 	 */
 	public static function selects(
 		array $entry,
+		array $platforms = [],
 	): bool
 	{
 		if(isset($entry[self::GROUP_ANY]))
 		{
 			foreach((array)$entry[self::GROUP_ANY] as $member)
 			{
-				if(self::selects((array)$member) === false)
+				if(self::selects((array)$member, $platforms) === false)
 				{
 					return false;
 				}
@@ -1318,8 +1393,66 @@ final class Ruleset
 		}
 		$target = (string)($entry['target'] ?? '');
 		
-		return $target === 'rest' || (in_array($entry['test'] ?? null, self::ENTRY_TESTS, true) && ($entry['decode'] ?? []) === []
+		return self::targetOf($target, $platforms) !== null || (in_array($entry['test'] ?? null, self::ENTRY_TESTS, true) && ($entry['decode'] ?? []) === []
 			&& str_starts_with($target, 'file-content:') === false);
+	}
+	
+	/**
+	 * The module among $platforms whose targets() names a target; null when
+	 * none does — a target no module given names is never read
+	 *
+	 * @param list<Platform> $platforms
+	 */
+	public static function targetOf(
+		string $target,
+		array $platforms,
+	): ?Platform
+	{
+		foreach($platforms as $platform)
+		{
+			if($platform instanceof Platform && in_array($target, $platform->targets(), true))
+			{
+				return $platform;
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * The module among $platforms whose decodes() takes a step; null when
+	 * none does — a step no module given decodes yields nothing
+	 *
+	 * @param list<Platform> $platforms
+	 */
+	public static function decoderOf(
+		mixed $step,
+		array $platforms,
+	): ?Platform
+	{
+		foreach($platforms as $platform)
+		{
+			if($platform instanceof Platform && $platform->decodes($step))
+			{
+				return $platform;
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * Whether a target is a frame target — one of TARGETS or a module's:
+	 * it names no parameter, so its value stands in only when no parameter's matched
+	 *
+	 * @param list<Platform> $platforms
+	 */
+	public static function isFrame(
+		string $target,
+		array $platforms,
+	): bool
+	{
+		return in_array($target, self::TARGETS, true) || self::targetOf($target, $platforms) !== null;
 	}
 	
 	/**
@@ -1334,9 +1467,15 @@ final class Ruleset
 		return $mode === self::MODE_BLOCK || $mode === self::MODE_PROVEN;
 	}
 	
-	/** a vpatch: an int id, a mode, a `who` off the vocabulary, 1 to CONDITIONS_MAX entries each well formed */
+	/**
+	 * A vpatch: an int id, a mode, a `who` off the vocabulary, 1 to
+	 * CONDITIONS_MAX entries each well formed
+	 *
+	 * @param list<Platform> $platforms the modules whose words it may use
+	 */
 	public static function vpatchWellFormed(
 		array $rule,
+		array $platforms = [],
 	): bool
 	{
 		$conditions = $rule['conditions'] ?? null;
@@ -1349,7 +1488,7 @@ final class Ruleset
 		}
 		foreach($conditions as $condition)
 		{
-			if(self::entryWellFormed($condition) === false)
+			if(self::entryWellFormed($condition, $platforms) === false)
 			{
 				return false;
 			}
@@ -1358,9 +1497,15 @@ final class Ruleset
 		return true;
 	}
 	
-	/** a vpatch's entry: a plain condition, or a group of GROUP_MIN to GROUP_MAX plain conditions under `any` and nothing else */
+	/**
+	 * A vpatch's entry: a plain condition, or a group of GROUP_MIN to
+	 * GROUP_MAX plain conditions under `any` and nothing else
+	 *
+	 * @param list<Platform> $platforms
+	 */
 	public static function entryWellFormed(
 		mixed $entry,
+		array $platforms = [],
 	): bool
 	{
 		if(is_array($entry) && array_key_exists(self::GROUP_ANY, $entry))
@@ -1377,7 +1522,7 @@ final class Ruleset
 				if(is_array($member) === false || array_key_exists(self::GROUP_ANY, $member)
 					|| in_array($member['test'] ?? null, self::HOST_TESTS, true)
 					|| (is_string($member['target'] ?? null) && str_starts_with($member['target'], 'file-content:'))
-					|| self::conditionWellFormed($member) === false)
+					|| self::conditionWellFormed($member, $platforms) === false)
 				{
 					return false;
 				}
@@ -1386,7 +1531,7 @@ final class Ruleset
 			return true;
 		}
 		
-		return self::conditionWellFormed($entry);
+		return self::conditionWellFormed($entry, $platforms);
 	}
 	
 	public static function whoWellFormed(
@@ -1397,12 +1542,18 @@ final class Ruleset
 			|| (is_string($who) && preg_match('~^lacks:[a-z0-9_]{1,64}$~D', $who) === 1);
 	}
 	
-	/** a target off the vocabulary; a decode list off its own; a value the test can read — a list, a count, or a bounded string */
+	/**
+	 * A target off the vocabulary; a decode list off its own; a value the
+	 * test can read — a list, a count, or a bounded string
+	 *
+	 * @param list<Platform> $platforms the modules whose targets and steps count too
+	 */
 	public static function conditionWellFormed(
 		mixed $condition,
+		array $platforms = [],
 	): bool
 	{
-		if(is_array($condition) === false || self::targetWellFormed($condition['target'] ?? null) === false
+		if(is_array($condition) === false || self::targetWellFormed($condition['target'] ?? null, $platforms) === false
 			|| in_array($condition['test'] ?? null, self::TESTS, true) === false
 			|| (isset($condition['ci']) && is_bool($condition['ci']) === false))
 		{
@@ -1415,7 +1566,7 @@ final class Ruleset
 		}
 		foreach($decode as $step)
 		{
-			if(self::decodeWellFormed($step) === false)
+			if(self::decodeWellFormed($step, $platforms) === false)
 			{
 				return false;
 			}
@@ -1454,73 +1605,38 @@ final class Ruleset
 		return is_string($value) && trim($value) !== '' && strlen($value) <= self::VALUE_MAX;
 	}
 	
-	/** a decode step: one of DECODES, or `json:` and a path the json: target would take */
+	/**
+	 * A decode step: one of DECODES, `json:` and a path the json: target
+	 * would take, or one of a module's own (Platform::decodes())
+	 *
+	 * @param list<Platform> $platforms
+	 */
 	public static function decodeWellFormed(
 		mixed $step,
+		array $platforms = [],
 	): bool
 	{
 		return in_array($step, self::DECODES, true)
 			|| (is_string($step) && str_starts_with($step, 'json:') && $step !== 'json:' && self::targetWellFormed($step))
-			|| self::shortcodeStep($step) !== null || self::blockStep($step) !== null;
+			|| self::decoderOf($step, $platforms) !== null;
 	}
 	
 	/**
-	 * `shortcode:<tag>.<attribute>` as [tag, attribute]: split at the last
-	 * `.`, as an attribute name holds none; the attribute lower-cased as
-	 * WordPress lower-cases names — a name, a position (`0`, `1`, …) or `*`
-	 * for every one. Null when the step is not one
+	 * `method`, `path`, a module's own (`rest`), or a prefix and a name
+	 * (`query:file`); the keys targets may name the top level ('')
 	 *
-	 * @return ?array{string, string}
+	 * @param list<Platform> $platforms
 	 */
-	public static function shortcodeStep(
-		mixed $step,
-	): ?array
-	{
-		if(is_string($step) === false || str_starts_with($step, 'shortcode:') === false || strlen($step) > 200)
-		{
-			return null;
-		}
-		$rest = substr($step, strlen('shortcode:'));
-		$at = strrpos($rest, '.');
-		if($at === false)
-		{
-			return null;
-		}
-		$tag = substr($rest, 0, $at);
-		$attribute = strtolower(substr($rest, $at + 1));
-		
-		return preg_match(self::SHORTCODE_TAG, $tag) === 1 && preg_match('~^(?:[a-z0-9_-]{1,100}|\*)$~D', $attribute) === 1 ? [$tag, $attribute] : null;
-	}
-	
-	/**
-	 * `block:<namespace/name>.<dot.path>` as [name, path], the path as the
-	 * json: target walks one. Null when the step is not one
-	 *
-	 * @return ?array{string, string}
-	 */
-	public static function blockStep(
-		mixed $step,
-	): ?array
-	{
-		if(is_string($step) === false || str_starts_with($step, 'block:') === false || strlen($step) > 200)
-		{
-			return null;
-		}
-		[$name, $path] = explode('.', substr($step, strlen('block:')), 2) + [1 => ''];
-		
-		return preg_match(self::BLOCK_NAME, $name) === 1 && $path !== '' ? [$name, $path] : null;
-	}
-	
-	/** `method`, `path`, `rest`, or a prefix and a name (`query:file`); the keys targets may name the top level ('') */
 	public static function targetWellFormed(
 		mixed $target,
+		array $platforms = [],
 	): bool
 	{
 		if(is_string($target) === false || strlen($target) > 200)
 		{
 			return false;
 		}
-		if(in_array($target, self::TARGETS, true))
+		if(self::isFrame($target, $platforms))
 		{
 			return true;
 		}
@@ -1855,23 +1971,17 @@ final class Kernel
 	
 	public const KINDS = 'match,rate,threat,vpatch,mode-block';
 	
-	/** WordPress's batch route: each request it lists reaches its own route's handler */
-	public const BATCH_ROUTE = '/batch/v1';
+	/**
+	 * the platform modules this kernel reads — the door serves a rule in a
+	 * module's words only to a pull that names the module; `core` always
+	 * comes first, since a header with an empty value is dropped by libcurl
+	 */
+	public const HEADER_PLATFORMS = 'X-Shield-Platforms';
 	
-	/** the batch's sub-requests judged at most — WordPress takes 25 unless a site raises it; past this the batch holds unanswered */
-	public const BATCH_MAX = 1000;
+	public const PLATFORM_CORE = 'core';
 
 	/** the rule the counting's heartbeat is an `entry` of, once per request it ran on: rule 0, the threat addresses', whose evidence nothing else counts */
 	public const HEARTBEAT = Ruleset::THREAT_RULE;
-	
-	/** WordPress's shortcode_parse_atts() pattern (get_shortcode_atts_regex()), as it is */
-	public const SHORTCODE_ATTRIBUTES = '/([\w-]+)\s*=\s*"([^"]*)"(?:\s|$)|([\w-]+)\s*=\s*\'([^\']*)\'(?:\s|$)|([\w-]+)\s*=\s*([^\s\'"]+)(?:\s|$)|"([^"]*)"(?:\s|$)|\'([^\']*)\'(?:\s|$)|(\S+)(?:\s|$)/';
-	
-	/** the bytes PCRE's `\w` and a hyphen are: what may not follow a shortcode's tag */
-	public const WORD_BYTES = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
-	
-	/** the bytes PCRE's `\s` is */
-	public const SPACE_BYTES = " \t\n\x0B\f\r";
 	
 	/** the schemes whose slashes a browser reads loosely and whose authority names a host (`offsite`) */
 	public const SPECIAL_SCHEMES = ['http', 'https', 'ftp', 'ws', 'wss'];
@@ -1931,6 +2041,7 @@ final class Kernel
 	 * @param ?callable(string $url, array<string> $headers, int $timeoutMs): array{status: int, headers: array<string, string>, body: string} $http the transport; null = curl or streams
 	 * @param ?callable(string $kind, string $message, array<string, mixed> $extra): mixed $report the host's sender
 	 * @param ?callable(string $line): mixed $log the host's log
+	 * @param list<Platform> $platforms the platform modules loaded: the rules in their words are kept at the pull; anything else is ignored
 	 */
 	public function __construct(
 		protected string $url,
@@ -1942,17 +2053,30 @@ final class Kernel
 		protected int $interval = self::INTERVAL,
 		protected int $ceiling = self::CEILING,
 		protected int $timeoutMs = self::TIMEOUT_MS,
+		protected array $platforms = [],
 	)
 	{
 		$this->url = rtrim($url, '/');
 		$this->http = $http === null ? null : Closure::fromCallable($http);
 		$this->report = $report === null ? null : Closure::fromCallable($report);
 		$this->log = $log === null ? null : Closure::fromCallable($log);
+		$this->platforms = array_values(array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform));
 	}
 	
 	public function store(): Store
 	{
 		return $this->store;
+	}
+	
+	/**
+	 * The platform modules this kernel reads — what the adapter hands Facts
+	 * too, so that a request is read in the words its rules were kept in
+	 *
+	 * @return list<Platform>
+	 */
+	public function platforms(): array
+	{
+		return $this->platforms;
 	}
 	
 	/** the cached ruleset, read once per request; null = no store (ignorance) */
@@ -2036,8 +2160,7 @@ final class Kernel
 				$held = new Verdict(Verdict::OBSERVE, $threat, $facts->ip, Verdict::REASON_UNANSWERED);
 			}
 			$rates = [];
-			$subs = self::batched($facts);
-			$unreadBatch = self::batchUnread($facts);
+			[$subs, $unread] = self::subRequests($facts);
 			foreach($ruleset->rules as $rule)
 			{
 				// rate rules count only a request no match rule decided: judged after this loop
@@ -2052,15 +2175,15 @@ final class Kernel
 					$hit = self::patched($rule, $facts);
 					foreach($subs as $sub)
 					{
-						// a batch's sub-request reaches its route's handler as a request of its own; an answered hit wins
+						// a sub-request (a batch's) reaches its route's handler as a request of its own; an answered hit wins
 						$subHit = $hit !== null && $hit['resolved'] ? null : self::patched($rule, $sub);
 						if($subHit !== null && ($hit === null || $subHit['resolved']))
 						{
 							$hit = $subHit;
 						}
 					}
-					// a batch the kernel could not read may have reached it: held, never blocked, never passed in silence
-					if($hit === null && $unreadBatch && self::batchReaches($rule, $facts))
+					// sub-requests the kernel could not read may have reached it: held, never blocked, never passed in silence
+					if($hit === null && self::reaches($rule, $facts, $unread))
 					{
 						$hit = ['matched' => '', 'resolved' => false];
 					}
@@ -2310,8 +2433,9 @@ final class Kernel
 	 * never for a rule with none), match (the rule held, who included,
 	 * answered or not) and authed (a match by a caller signed in or one the
 	 * host cannot tell, who may be) — for the rules it reached or matched. A
-	 * batch counts once with its sub-requests; one the kernel could not read
-	 * matches what it may have reached (batchReaches()), never as an entry
+	 * request counts once with its sub-requests (a batch's); sub-requests the
+	 * kernel could not read match what they may have reached (reaches()),
+	 * never as an entry
 	 *
 	 * @return array<int, array{entry: bool, match: bool, authed: bool}>
 	 */
@@ -2321,15 +2445,15 @@ final class Kernel
 	): array
 	{
 		$tally = [];
-		$requests = [$facts, ...self::batched($facts)];
-		$unreadBatch = self::batchUnread($facts);
+		[$subs, $unread] = self::subRequests($facts);
+		$requests = [$facts, ...$subs];
 		foreach($rules as $rule)
 		{
 			if(Ruleset::isVpatch($rule) === false)
 			{
 				continue;
 			}
-			$selecting = array_filter((array)($rule['conditions'] ?? []), static fn(mixed $entry): bool => Ruleset::selects((array)$entry));
+			$selecting = array_filter((array)($rule['conditions'] ?? []), static fn(mixed $entry): bool => Ruleset::selects((array)$entry, $facts->platforms));
 			$entry = false;
 			$matched = null;
 			foreach($requests as $request)
@@ -2346,7 +2470,7 @@ final class Kernel
 				$matched ??= self::patched($rule, $request) === null ? null : $request;
 			}
 			// held as judge() holds it: whose request it is says whether it was signed in
-			if($matched === null && $unreadBatch && self::batchReaches($rule, $facts))
+			if($matched === null && self::reaches($rule, $facts, $unread))
 			{
 				$matched = $facts;
 			}
@@ -2358,6 +2482,55 @@ final class Kernel
 		}
 		
 		return $tally;
+	}
+	
+	/**
+	 * The requests inside this one that reach handlers of their own, as
+	 * every platform module given reads them (a WordPress batch's), and the
+	 * modules that could not read all of theirs
+	 *
+	 * @return array{list<Facts>, list<Platform>}
+	 */
+	public static function subRequests(
+		Facts $facts,
+	): array
+	{
+		$subs = [];
+		$unread = [];
+		foreach($facts->platforms as $platform)
+		{
+			[$found, $cut] = $platform->subRequests($facts);
+			$subs = [...$subs, ...$found];
+			if($cut)
+			{
+				$unread[] = $platform;
+			}
+		}
+		
+		return [$subs, $unread];
+	}
+	
+	/**
+	 * Whether sub-requests a module could not read (subRequests()) may have
+	 * reached a vpatch — its own word, the one module that knows its handlers
+	 *
+	 * @param list<Platform> $unread
+	 */
+	public static function reaches(
+		array $rule,
+		Facts $facts,
+		array $unread,
+	): bool
+	{
+		foreach($unread as $platform)
+		{
+			if($platform->reaches($rule, $facts))
+			{
+				return true;
+			}
+		}
+		
+		return false;
 	}
 	
 	/** the match through the adapter's sender as a security event; never throws */
@@ -2546,8 +2719,9 @@ final class Kernel
 	{
 		// both names of the key header: an instance older than the rename to
 		// codesafe reads only X-Console-Key
+		$platforms = implode(',', [self::PLATFORM_CORE, ...array_map(static fn(Platform $platform): string => $platform->name(), $this->platforms)]);
 		$headers = ['X-Codesafe-Key: ' . $this->key, 'X-Console-Key: ' . $this->key, 'Accept: application/json',
-			self::HEADER_KINDS . ': ' . self::KINDS];
+			self::HEADER_KINDS . ': ' . self::KINDS, self::HEADER_PLATFORMS . ': ' . $platforms];
 		// the digest as the ETag: an unchanged ruleset answers 304
 		if($current !== null && $current->digest !== '')
 		{
@@ -2577,7 +2751,7 @@ final class Kernel
 			return self::PULL_FAILED;
 		}
 		$ruleset = Ruleset::fromPayload($payload, $now, self::header($response, 'X-Shield-Sha256'),
-			self::header($response, self::HEADER_VERSION));
+			self::header($response, self::HEADER_VERSION), $this->platforms);
 		// stored even when unusable, so an unknown contract is not fetched again on every tick
 		$this->store->write($ruleset->toRecord());
 		$this->rulesetRead = false;
@@ -2700,7 +2874,7 @@ final class Kernel
 			$hit = self::condition((array)$member, $facts);
 			if($hit !== null)
 			{
-				$hit['frame'] = in_array((string)($member['target'] ?? ''), Ruleset::TARGETS, true);
+				$hit['frame'] = Ruleset::isFrame((string)($member['target'] ?? ''), $facts->platforms);
 				// an unread branch never answers for one that holds answered
 				if($hit['resolved'])
 				{
@@ -2774,7 +2948,7 @@ final class Kernel
 			$pending = null;
 			foreach($values as $value)
 			{
-				[$decodedValues, $cut] = self::decoded($value, (array)($condition['decode'] ?? []));
+				[$decodedValues, $cut] = self::decoded($value, (array)($condition['decode'] ?? []), $facts->platforms);
 				// what a decode step left unread may hold
 				$unread = $unread || $cut;
 				foreach($decodedValues as $decoded)
@@ -2797,7 +2971,7 @@ final class Kernel
 		}
 		foreach($values as $value)
 		{
-			[$decodedValues, $cut] = self::decoded($value, (array)($condition['decode'] ?? []));
+			[$decodedValues, $cut] = self::decoded($value, (array)($condition['decode'] ?? []), $facts->platforms);
 			// what a decode step left unread may hold
 			$unread = $unread || $cut;
 			foreach($decodedValues as $decoded)
@@ -2818,10 +2992,11 @@ final class Kernel
 	}
 	
 	/**
-	 * A target's values over the request; over a batch's sub-request its
+	 * A target's values over the request; over a sub-request (a batch's) its
 	 * own, then its batch's: the handler reads the superglobals too, which
 	 * stay the batch's — never the batch's JSON, which is the batch itself,
-	 * and an upload's bytes contents() reads both of
+	 * and an upload's bytes contents() reads both of. A module's target is
+	 * the module's to read, and none for a target no module given names
 	 *
 	 * @return list<string>
 	 */
@@ -2838,9 +3013,10 @@ final class Kernel
 		{
 			return [$facts->path()];
 		}
-		if($target === 'rest')
+		$platform = Ruleset::targetOf($target, $facts->platforms);
+		if($platform !== null)
 		{
-			return self::routes($facts);
+			return $platform->values($target, $facts);
 		}
 		[$prefix, $name] = explode(':', $target, 2) + [1 => ''];
 		// Facts::$headers is keyed by lowercase name
@@ -2906,227 +3082,6 @@ final class Kernel
 		[$outers, $outerUnread] = self::contents($outer, $name);
 		
 		return [[...$contents, ...$outers], $unread || $outerUnread];
-	}
-	
-	/**
-	 * The REST routes a request addresses, as WordPress finds them: the
-	 * path's spelling decoded once and, when that differs, twice (WordPress
-	 * matches a percent-encoded prefix on the decoded path and decodes the
-	 * capture again), then `rest_route` from the query and the body; each
-	 * ending in one newline also without it, since WordPress matches a route
-	 * as `@^route$@i`, whose `$` ends before a final newline
-	 *
-	 * @return list<string>
-	 */
-	public static function routes(
-		Facts $facts,
-	): array
-	{
-		$routes = [];
-		$path = $facts->path();
-		foreach([$path, rawurldecode($path)] as $spelling)
-		{
-			$route = self::routeIn($spelling, $facts->restPrefix);
-			if($route !== null && in_array($route, $routes, true) === false)
-			{
-				$routes[] = $route;
-			}
-		}
-		foreach([...self::pick($facts->query, 'rest_route'), ...self::pick($facts->form, 'rest_route')] as $value)
-		{
-			// WordPress's empty(): '' and '0' address no route, and an untrailed '0' is the index
-			if($value !== '' && $value !== '0')
-			{
-				$route = self::untrailed($value);
-				$routes[] = $route === '0' ? '/' : $route;
-			}
-		}
-		foreach($routes as $route)
-		{
-			// not untrailed again: WordPress untrails before the newline, never after
-			$bare = str_ends_with($route, "\n") ? substr($route, 0, -1) : null;
-			if($bare !== null && in_array($bare, $routes, true) === false)
-			{
-				$routes[] = $bare;
-			}
-		}
-		
-		return $routes;
-	}
-	
-	/**
-	 * The sub-requests of a WordPress batch — a request to `/batch/v1` whose
-	 * `requests` list them (batchList()) — each as its route's handler sees
-	 * it (Facts::subRequest: POST when it names no method); none for any
-	 * other request, and none past BATCH_MAX (batchUnread())
-	 *
-	 * @return list<Facts>
-	 */
-	public static function batched(
-		Facts $facts,
-	): array
-	{
-		$list = self::batchList($facts);
-		// a list WordPress's own validation refuses runs nothing
-		if(is_array($list) === false)
-		{
-			return [];
-		}
-		$subs = [];
-		foreach(array_slice(array_values($list), 0, self::BATCH_MAX) as $request)
-		{
-			if(is_array($request) && is_string($request['path'] ?? null))
-			{
-				$subs[] = $facts->subRequest(is_string($request['method'] ?? null) ? $request['method'] : 'POST', $request['path'], $request['body'] ?? null,
-					is_array($request['headers'] ?? null) ? $request['headers'] : []);
-			}
-		}
-		
-		return $subs;
-	}
-	
-	/** whether a request addresses WordPress's batch route */
-	public static function isBatch(
-		Facts $facts,
-	): bool
-	{
-		return array_filter(self::routes($facts), static fn(string $route): bool => strcasecmp($route, self::BATCH_ROUTE) === 0) !== [];
-	}
-	
-	/**
-	 * A batch's `requests` where WordPress's WP_REST_Request::get_param()
-	 * finds them: the JSON body when WordPress reads it as JSON, then the
-	 * form, then the query — the first that sets it (isset(): null is not
-	 * set), taken whatever it holds, as WordPress takes it. Null off the
-	 * batch route, when none sets it, and when the JSON body that comes
-	 * first went unread (batchUnread())
-	 */
-	protected static function batchList(
-		Facts $facts,
-	): mixed
-	{
-		// the route first: the body is read only for a batch
-		if(self::isBatch($facts) === false)
-		{
-			return null;
-		}
-		$sources = [];
-		if(self::jsonFirst($facts))
-		{
-			if($facts->jsonUnread())
-			{
-				return null;
-			}
-			$sources[] = $facts->json();
-		}
-		foreach([...$sources, $facts->form, $facts->query] as $source)
-		{
-			if(is_array($source) && isset($source['requests']))
-			{
-				return $source['requests'];
-			}
-		}
-		
-		return null;
-	}
-	
-	/**
-	 * Whether WordPress reads a batch's JSON body before its form: when its
-	 * content type is one WordPress reads as JSON (Facts::wordpressJson()),
-	 * else whenever the adapter named no content type and handed a JSON body
-	 */
-	protected static function jsonFirst(
-		Facts $facts,
-	): bool
-	{
-		$type = $facts->headers['content-type'] ?? null;
-		
-		return is_string($type) === false || Facts::wordpressJson($type);
-	}
-	
-	/**
-	 * Whether a request is a batch whose sub-requests the kernel did not
-	 * read in full: the JSON body that comes first past JSON_CAP
-	 * (Facts::jsonUnread()), or a list past BATCH_MAX
-	 */
-	public static function batchUnread(
-		Facts $facts,
-	): bool
-	{
-		// the route first: the body is read only for a batch
-		if(self::isBatch($facts) === false)
-		{
-			return false;
-		}
-		if(self::jsonFirst($facts) && $facts->jsonUnread())
-		{
-			return true;
-		}
-		$list = self::batchList($facts);
-		
-		return is_array($list) && count($list) > self::BATCH_MAX;
-	}
-	
-	/**
-	 * Whether a batch the kernel could not read may have reached a vpatch: a
-	 * sub-request runs a REST route's handler, which a vpatch names with a
-	 * `rest` condition (in a group too), and runs it as this request's
-	 * caller, so `who` must take this caller in. Nothing else rules a vpatch
-	 * out: the handler reads this request's cookies and uploads, and the
-	 * sub-request's method, path, query, body and headers are the sender's
-	 */
-	public static function batchReaches(
-		array $rule,
-		Facts $facts,
-	): bool
-	{
-		$routed = false;
-		foreach((array)($rule['conditions'] ?? []) as $entry)
-		{
-			$entry = (array)$entry;
-			foreach(isset($entry[Ruleset::GROUP_ANY]) ? (array)$entry[Ruleset::GROUP_ANY] : [$entry] as $member)
-			{
-				$routed = $routed || (((array)$member)['target'] ?? '') === 'rest';
-			}
-		}
-		
-		// who alone, as patched() judges it for this caller
-		return $routed && self::patched(['who' => $rule['who'] ?? '', 'conditions' => []], $facts) !== null;
-	}
-	
-	/**
-	 * The route after the first `/<prefix>` followed by a slash or the end,
-	 * as WordPress's rewrite reads it, with case; null for none
-	 */
-	public static function routeIn(
-		string $path,
-		string $prefix,
-	): ?string
-	{
-		$needle = '/' . $prefix;
-		$at = strpos($path, $needle);
-		while($at !== false)
-		{
-			$rest = substr($path, $at + strlen($needle));
-			// `/wp-jsonx` is not the prefix: look further
-			if($rest === '' || $rest[0] === '/')
-			{
-				return self::untrailed($rest);
-			}
-			$at = strpos($path, $needle, $at + 1);
-		}
-		
-		return null;
-	}
-	
-	/** a route as WordPress's untrailingslashit() leaves it; none is the index route */
-	public static function untrailed(
-		string $route,
-	): string
-	{
-		$route = rtrim($route, '/\\');
-		
-		return $route === '' ? '/' : $route;
 	}
 	
 	/**
@@ -3285,21 +3240,26 @@ final class Kernel
 	 * base64 yield one or none; a step's values past DECODED_MAX are not
 	 * carried on — one past it is, so the condition still sees there were more
 	 *
+	 * @param list<Platform> $platforms the modules whose steps are read
 	 * @return array{list<string>, bool}
 	 */
 	public static function decoded(
 		string $value,
 		array $steps,
+		array $platforms = [],
 	): array
 	{
 		$values = [$value];
 		$cut = false;
 		foreach($steps as $step)
 		{
+			$step = (string)$step;
+			// the module that reads the step, found once for every value
+			$platform = Ruleset::decoderOf($step, $platforms);
 			$next = [];
 			foreach($values as $one)
 			{
-				[$out, $short] = self::step((string)$step, $one);
+				[$out, $short] = self::step($step, $one, $platform);
 				$cut = $cut || $short;
 				foreach($out as $decoded)
 				{
@@ -3319,14 +3279,16 @@ final class Kernel
 	
 	/**
 	 * One decode step over one value: the values it yields — none when it
-	 * cannot read the value — and whether it read only part of it (shortcodes
-	 * and blocks past OCCURRENCES_MAX or JSON_CAP)
+	 * cannot read the value — and whether it read only part of it (a
+	 * module's step past its own bounds). A step none of the core's is the
+	 * module's that decodes it; one no module given reads yields nothing
 	 *
 	 * @return array{list<string>, bool}
 	 */
 	protected static function step(
 		string $step,
 		string $value,
+		?Platform $platform = null,
 	): array
 	{
 		if($step === 'url')
@@ -3358,334 +3320,8 @@ final class Kernel
 			
 			return [self::pickJson($json, substr($step, strlen('json:'))), false];
 		}
-		$shortcode = Ruleset::shortcodeStep($step);
-		if($shortcode !== null)
-		{
-			[$found, $cut] = self::shortcodes($value, $shortcode[0]);
-			$values = [];
-			foreach($found as $attributes)
-			{
-				foreach($attributes as $name => $one)
-				{
-					// a positional attribute's name is its place
-					if($shortcode[1] === '*' || (string)$name === $shortcode[1])
-					{
-						$values[] = $one;
-					}
-				}
-			}
-			
-			return [$values, $cut];
-		}
-		$block = Ruleset::blockStep($step);
-		if($block !== null)
-		{
-			[$found, $cut] = self::blocks($value, $block[0]);
-			$values = [];
-			foreach($found as $attributes)
-			{
-				foreach(self::pickJson($attributes, $block[1]) as $one)
-				{
-					$values[] = $one;
-				}
-			}
-			
-			return [$values, $cut];
-		}
 		
-		return [[], false];
-	}
-	
-	/**
-	 * Every `[<tag>` in a value with its attributes as WordPress reads them
-	 * (shortcodeAttributes()): an occurrence not followed by a word character
-	 * or a hyphen, its attribute text up to the first `]` less a
-	 * self-closing `/` — get_shortcode_regex()'s third group — read in
-	 * do_shortcode()'s view of the value (shortcodeView()) and, where it holds
-	 * markup, in the value as written too: a shortcode inside an element's
-	 * attribute runs there. Every occurrence, an escaped `[[tag]]` too: a
-	 * nested do_shortcode() sees only its content and may run one the whole
-	 * value shows escaped. An attribute text that spans a tag WordPress
-	 * rewrites first is not read in full; so is the rest past OCCURRENCES_MAX
-	 * occurrences or JSON_CAP bytes of attribute text — the second value says so
-	 *
-	 * @return array{list<array<int|string, string>>, bool}
-	 */
-	public static function shortcodes(
-		string $value,
-		string $tag,
-	): array
-	{
-		$found = [];
-		$cut = false;
-		$budget = Facts::JSON_CAP;
-		$open = '[' . $tag;
-		[$shown, $rewritten] = self::shortcodeView($value);
-		foreach(str_contains($value, '<') ? [[$shown, $rewritten], [$value, []]] : [[$shown, $rewritten]] as [$view, $spans])
-		{
-			$length = strlen($view);
-			for($at = strpos($view, $open); $at !== false; $at = strpos($view, $open, $at + 1))
-			{
-				$after = $at + strlen($open);
-				// `[tagx` and `[tag-x` are other tags
-				if($after < $length && strspn($view, self::WORD_BYTES, $after, 1) === 1)
-				{
-					continue;
-				}
-				$close = strpos($view, ']', $after);
-				// no `]` after this one: none after a later one either
-				if($close === false)
-				{
-					break;
-				}
-				$budget -= $close - $after;
-				if(count($found) === Ruleset::OCCURRENCES_MAX || $budget < 0)
-				{
-					return [$found, true];
-				}
-				foreach($spans as [$from, $to])
-				{
-					// a tag WordPress rewrites before it reads this text: what it reads there is not known
-					$cut = $cut || ($from < $close && $to > $after);
-				}
-				$end = $close > $after && $view[$close - 1] === '/' ? $close - 1 : $close;
-				$found[] = self::shortcodeAttributes(substr($view, $after, $end - $after));
-			}
-		}
-		
-		return [$found, $cut];
-	}
-	
-	/**
-	 * A value as WordPress's do_shortcode() matches shortcodes in it, after
-	 * do_shortcodes_in_html_tags(): `&#91;` and `&#93;` written `&#091;` and
-	 * `&#093;`, and the brackets inside every HTML element escaped — an
-	 * element as wp_html_split() cuts one: a comment to its `-->`, a CDATA
-	 * section to its `]]>`, anything else to its `>`, each to the end when
-	 * unclosed. So a shortcode's attribute text runs on past a `]` inside an
-	 * element, as WordPress reads it. With the view, the spans of the tags
-	 * WordPress rewrites before it reads it — a tag holding both brackets,
-	 * whose attributes' shortcodes run first and are filtered through kses —
-	 * as [start, end) offsets in the view
-	 *
-	 * @return array{string, list<array{int, int}>}
-	 */
-	public static function shortcodeView(
-		string $value,
-	): array
-	{
-		$value = strtr($value, ['&#91;' => '&#091;', '&#93;' => '&#093;']);
-		$view = '';
-		$rewritten = [];
-		$at = 0;
-		for($open = strpos($value, '<'); $open !== false; $open = strpos($value, '<', $at))
-		{
-			$escaped = substr($value, $open + 1, 3) === '!--' || substr($value, $open + 1, 8) === '![CDATA[';
-			$close = match(true)
-			{
-				substr($value, $open + 1, 3) === '!--' => self::through($value, '-->', $open + 2),
-				substr($value, $open + 1, 8) === '![CDATA[' => self::through($value, ']]>', $open + 9),
-				default => self::through($value, '>', $open + 1),
-			};
-			$element = substr($value, $open, $close - $open);
-			$view .= substr($value, $at, $open - $at);
-			$start = strlen($view);
-			$view .= strtr($element, ['[' => '&#91;', ']' => '&#93;']);
-			if($escaped === false && str_contains($element, '[') && str_contains($element, ']'))
-			{
-				$rewritten[] = [$start, strlen($view)];
-			}
-			$at = $close;
-			if($at >= strlen($value))
-			{
-				break;
-			}
-		}
-		
-		return [$view . substr($value, $at), $rewritten];
-	}
-	
-	/** the offset just past the first `$end` at or after `$from`, or the value's end */
-	protected static function through(
-		string $value,
-		string $end,
-		int $from,
-	): int
-	{
-		$at = $from <= strlen($value) ? strpos($value, $end, $from) : false;
-		
-		return $at === false ? strlen($value) : $at + strlen($end);
-	}
-	
-	/**
-	 * A shortcode's attribute text as WordPress's shortcode_parse_atts()
-	 * reads it, its own steps in its order: no-break and zero-width spaces
-	 * as one space (not UTF-8: no attributes), its pattern's six forms, names
-	 * lower-cased with a later one winning and a name empty() drops dropped,
-	 * a positional value appended, stripcslashes() on every value, and a
-	 * value with an unclosed element blanked
-	 *
-	 * @return array<int|string, string>
-	 */
-	public static function shortcodeAttributes(
-		string $text,
-	): array
-	{
-		$atts = [];
-		$text = preg_replace('/[\x{00a0}\x{200b}]+/u', ' ', $text);
-		if(is_string($text) === false || preg_match_all(self::SHORTCODE_ATTRIBUTES, $text, $matches, PREG_SET_ORDER) < 1)
-		{
-			return $atts;
-		}
-		foreach($matches as $m)
-		{
-			if(empty($m[1]) === false)
-			{
-				$atts[strtolower($m[1])] = stripcslashes($m[2]);
-			}
-			else if(empty($m[3]) === false)
-			{
-				$atts[strtolower($m[3])] = stripcslashes($m[4]);
-			}
-			else if(empty($m[5]) === false)
-			{
-				$atts[strtolower($m[5])] = stripcslashes($m[6]);
-			}
-			else if(isset($m[7]) && strlen($m[7]) > 0)
-			{
-				$atts[] = stripcslashes($m[7]);
-			}
-			else if(isset($m[8]) && strlen($m[8]) > 0)
-			{
-				$atts[] = stripcslashes($m[8]);
-			}
-			else if(isset($m[9]))
-			{
-				$atts[] = stripcslashes($m[9]);
-			}
-		}
-		foreach($atts as $name => $one)
-		{
-			// a `<` no `>` closes after it
-			if(str_contains($one, '<') && preg_match('/^[^<]*+(?:<[^>]*+>[^<]*+)*+$/', $one) !== 1)
-			{
-				$atts[$name] = '';
-			}
-		}
-		
-		return $atts;
-	}
-	
-	/**
-	 * The attributes of every `<!-- wp:<namespace/name> … -->` opener or void
-	 * block in a value, as WordPress's block parser reads a comment: each
-	 * `<!--` on its own (a superset of the tokens WordPress reads one after
-	 * another), a bare `wp:x` being `core/x`, the attributes `{` up to the
-	 * first `}` that whitespace, an optional `/` and `-->` follow, decoded
-	 * as json_decode() does; invalid JSON is none. At most OCCURRENCES_MAX
-	 * of them and JSON_CAP bytes of attributes; past either the rest is not
-	 * read, and the second value says so
-	 *
-	 * @return array{list<array>, bool}
-	 */
-	public static function blocks(
-		string $value,
-		string $name,
-	): array
-	{
-		$found = [];
-		$budget = Facts::JSON_CAP;
-		$count = 0;
-		$length = strlen($value);
-		// the closing braces, found once: a brace that whitespace, an optional `/` and `-->` follow
-		$braces = [];
-		for($at = strpos($value, '}'); $at !== false; $at = strpos($value, '}', $at + 1))
-		{
-			$space = strspn($value, self::SPACE_BYTES, $at + 1);
-			$after = $at + 1 + $space;
-			if($space > 0 && substr($value, ($value[$after] ?? '') === '/' ? $after + 1 : $after, 3) === '-->')
-			{
-				$braces[] = $at;
-			}
-		}
-		$brace = 0;
-		for($at = strpos($value, '<!--'); $at !== false; $at = strpos($value, '<!--', $at + 1))
-		{
-			$i = $at + 4;
-			$space = strspn($value, self::SPACE_BYTES, $i);
-			// a closer (`<!-- /wp:`) carries no attributes
-			if($space === 0 || substr($value, $i + $space, 3) !== 'wp:')
-			{
-				continue;
-			}
-			$i += $space + 3;
-			$word = self::blockWord($value, $i);
-			$read = 'core/' . substr($value, $i, $word);
-			$i += $word;
-			if($word > 0 && $i < $length && $value[$i] === '/')
-			{
-				$second = self::blockWord($value, $i + 1);
-				$read = substr($value, $i - $word, $word) . '/' . substr($value, $i + 1, $second);
-				$i += 1 + $second;
-				$word = $second;
-			}
-			$space = strspn($value, self::SPACE_BYTES, $i);
-			if($word === 0 || $space === 0 || $read !== $name)
-			{
-				continue;
-			}
-			$i += $space;
-			$attrs = null;
-			if($i < $length && $value[$i] === '{')
-			{
-				while($brace < count($braces) && $braces[$brace] <= $i)
-				{
-					$brace++;
-				}
-				// no closing brace: not a block comment
-				if($brace === count($braces))
-				{
-					continue;
-				}
-				$attrs = substr($value, $i, $braces[$brace] - $i + 1);
-				$i = $braces[$brace] + 1;
-				$i += strspn($value, self::SPACE_BYTES, $i);
-			}
-			if($i < $length && $value[$i] === '/')
-			{
-				$i++;
-			}
-			if(substr($value, $i, 3) !== '-->')
-			{
-				continue;
-			}
-			$budget -= strlen((string)$attrs);
-			if(++$count > Ruleset::OCCURRENCES_MAX || $budget < 0)
-			{
-				return [$found, true];
-			}
-			$json = $attrs === null ? [] : json_decode($attrs, true, Facts::JSON_DEPTH);
-			if(is_array($json))
-			{
-				$found[] = $json;
-			}
-		}
-		
-		return [$found, false];
-	}
-	
-	/** the length of a block name's part at an offset — `[a-z][a-z0-9_-]*` — 0 for none */
-	protected static function blockWord(
-		string $value,
-		int $at,
-	): int
-	{
-		if($at >= strlen($value) || strspn($value, 'abcdefghijklmnopqrstuvwxyz', $at, 1) === 0)
-		{
-			return 0;
-		}
-		
-		return 1 + strspn($value, 'abcdefghijklmnopqrstuvwxyz0123456789_-', $at + 1);
+		return $platform === null ? [[], false] : $platform->decode($step, $value);
 	}
 	
 	/** one value under one test — the literal ops fold ASCII, as a match rule's do */

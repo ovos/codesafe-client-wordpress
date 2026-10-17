@@ -14,6 +14,7 @@ use Ovos\Codesafe\Shield\Kernel;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
 use Ovos\Codesafe\Shield\Verdict;
+use Ovos\Codesafe\Shield\Wordpress;
 use Throwable;
 use WP_Application_Passwords;
 use WP_User;
@@ -95,6 +96,12 @@ use const WP_CONTENT_DIR;
 if(class_exists(Kernel::class, false) === false)
 {
 	require_once __DIR__ . DIRECTORY_SEPARATOR . 'Kernel.php';
+}
+// WordPress's kernel module (Wordpress.php, byte-identical as client-php/Shield/Wordpress.php),
+// right after the kernel and by path: autoloaded first, it would not find the kernel's Platform
+if(class_exists(Wordpress::class, false) === false)
+{
+	require_once __DIR__ . DIRECTORY_SEPARATOR . 'Wordpress.php';
 }
 
 /**
@@ -556,6 +563,8 @@ final class Adapter
 			new Store($this->file(), $this->prefix()),
 			[$this, 'transport'],
 			fn(string $kind, string $message, array $extra) => $this->sender->reportRefusal($kind, $message, $extra),
+			// WordPress's module: without it the pull would leave every REST, shortcode and block rule out
+			platforms: Prepend::platforms(),
 		);
 	}
 	
@@ -893,8 +902,9 @@ final class Adapter
 	 * virtual patch's conditions read, and who the caller is (caller()) —
 	 * whether signed in, and WordPress's two answers for them: whether they
 	 * have a capability, whether a nonce is valid. Either answer is null
-	 * where it cannot be given: the rule then only observes; and the REST
-	 * prefix a `rest` condition finds the route after
+	 * where it cannot be given: the rule then only observes; and, read by
+	 * WordPress's kernel module (Prepend::platforms()), the REST prefix a
+	 * `rest` condition finds the route after
 	 *
 	 * @param array<string, mixed> $server
 	 * @param array<string, mixed> $get
@@ -926,9 +936,10 @@ final class Adapter
 			files: $files,
 			can: $caller['can'],
 			nonce: $caller['nonce'],
-			restPrefix: $restPrefix,
 			callerKnown: $caller['known'] ?? true,
 			kses: function_exists('wp_kses_post') ? self::htmlUnsafe(...) : null,
+			platforms: Prepend::platforms(),
+			options: [Wordpress::OPTION_REST_PREFIX => $restPrefix],
 		);
 	}
 	
@@ -1064,7 +1075,7 @@ final class Adapter
 	 * The REST prefix this site's requests are told by: the one the init hook
 	 * stored for the early layers (syncRestPrefix()), every plugin's and the
 	 * theme's filter applied, else WordPress's answer at this point. The
-	 * kernel's Facts take it as their restPrefix
+	 * kernel's Facts carry it for WordPress's module (Wordpress::OPTION_REST_PREFIX)
 	 */
 	public static function restPrefix(): string
 	{

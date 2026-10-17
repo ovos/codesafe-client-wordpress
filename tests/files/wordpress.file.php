@@ -22,6 +22,8 @@ function wp_shim_reset(): void
 	$GLOBALS['wp'] = [
 		// the Updater's GitHub API answer, and the transient it caches it in
 		'api' => null,
+		// wp_remote_get(): every [url, args] asked for
+		'got' => [],
 		'transient' => null,
 		// every transient by name, beside the one above (the Updater's tests read that)
 		'transients' => [],
@@ -245,7 +247,16 @@ function wp_remote_get(
 			: ['code' => 404, 'body' => 'Not Found'];
 	}
 	
+	$GLOBALS['wp']['got'][] = [$url, $args];
+	
 	return ['code' => 200, 'body' => json_encode($GLOBALS['wp']['api'])];
+}
+
+function wp_remote_retrieve_headers(
+	array $response,
+): array
+{
+	return $response['headers'] ?? [];
 }
 
 function download_url(
