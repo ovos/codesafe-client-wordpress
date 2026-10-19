@@ -1,0 +1,35 @@
+# the test application only: no database, no cache, no web - the plugin is
+# dependency-free and its tests must stay so; php-library is the harness
+production: &production
+  system: &system
+    path: # CLI application
+    domain: # CLI application
+    protocol: # CLI application
+    debug: no
+    profilers:
+      enabled: no
+    
+    modules:
+      system:
+        path: vendor/ovos/php-module-system/application
+        controllers: true
+        views: true
+    
+    # the plugin's tests, beside this directory
+    tests:
+      - ../tests
+    
+    services:
+      container: Services
+      cli:
+        - Events # handles errors and exceptions
+        - Benchmark # measures request speed
+  
+  cli:
+    executable: php
+
+development: &development
+  <<: *production
+  system:
+    <<: *system
+    debug: yes # the failing test's trace, not "Oops"
