@@ -1,0 +1,35 @@
+{
+	"name": "ovos/codesafe-client-wordpress-ci",
+	"description": "Test application for the plugin: runs tests/ on php-library's harness, never shipped",
+	"type": "project",
+	"license": "GPL-2.0-or-later",
+	"repositories": [
+		{
+			"type": "git",
+			"url": "https://github.com/ovos/php-library.git"
+		},
+		{
+			"type": "git",
+			"url": "https://github.com/ovos/php-module-system.git"
+		}
+	],
+	"require": {
+		"php": ">=8.3",
+		"ext-openssl": "*",
+		"ext-sodium": "*",
+		"ovos/php-library": "dev-release/8.5",
+		"ovos/php-module-system": "dev-release/8.5"
+	},
+	"autoload": {
+		"exclude-from-classmap": [
+			"vendor/ovos/php-library/src/Codesafe/Shield/",
+			"vendor/ovos/php-library/tests/",
+			"vendor/ovos/php-library/benchmarks/"
+		]
+	},
+	"minimum-stability": "dev",
+	"prefer-stable": true,
+	"config": {
+		"classmap-authoritative": true
+	}
+}
