@@ -214,6 +214,9 @@ final class Prepend
 	/** the stub's marker — a newer plugin rewrites an older stub */
 	public const STUB_VERSION = 1;
 	
+	/** the words every stub this plugin wrote carries before its version */
+	public const STUB_MARKER = 'ovos codesafe shield prepend';
+	
 	/** WordPress's login cookie prefix — a request carrying one is the adapter's to judge */
 	public const LOGIN_COOKIE = 'wordpress_logged_in_';
 	
@@ -983,8 +986,8 @@ final class Prepend
 	): string
 	{
 		$path = $at ?? $dir . DIRECTORY_SEPARATOR . self::STUB;
-		$source = str_replace('\\', '/', __FILE__);
-		$marker = sprintf('ovos codesafe shield prepend v%d', self::STUB_VERSION);
+		$source = self::source();
+		$marker = sprintf('%s v%d', self::STUB_MARKER, self::STUB_VERSION);
 		$store = $at === null ? '__DIR__' : var_export($dir, true);
 		if(is_file($path))
 		{
@@ -994,8 +997,29 @@ final class Prepend
 				return $path;
 			}
 		}
-		$stub = "<?php\n"
-			. "// " . $marker . " — the Shield before WordPress (auto_prepend_file). Written by the\n"
+		
+		return @file_put_contents($path, self::stubText($source, $store), LOCK_EX) === false ? '' : $path;
+	}
+	
+	/** this file as the stub and the mu-plugin name it, with forward slashes on every OS */
+	public static function source(): string
+	{
+		return str_replace('\\', '/', __FILE__);
+	}
+	
+	/**
+	 * The stub's exact text: what ensureStub() writes, and what the integrity
+	 * scan holds a stub against byte for byte
+	 *
+	 * @param string $store the PHP expression run() is given: `__DIR__`, or an exported path
+	 */
+	public static function stubText(
+		string $source,
+		string $store,
+	): string
+	{
+		return "<?php\n"
+			. "// " . sprintf('%s v%d', self::STUB_MARKER, self::STUB_VERSION) . " — the Shield before WordPress (auto_prepend_file). Written by the\n"
 			. "// ovos codesafe plugin; safe to delete: PHP's prepend then points at nothing and the\n"
 			. "// plugin writes it again on its next request. Judges the request against the cached\n"
 			. "// ruleset only if the plugin's Prepend.php is still where it was; fails open otherwise.\n"
@@ -1009,8 +1033,6 @@ final class Prepend
 			. "\t}\n"
 			. "}\n"
 			. "unset(\$ovosCodesafePrepend);\n";
-		
-		return @file_put_contents($path, $stub, LOCK_EX) === false ? '' : $path;
 	}
 	
 	/**
@@ -1029,7 +1051,7 @@ final class Prepend
 	): string
 	{
 		$path = rtrim($muDir, '/\\') . DIRECTORY_SEPARATOR . self::MU_PLUGIN;
-		$source = str_replace('\\', '/', __FILE__);
+		$source = self::source();
 		$marker = sprintf('%s v%d', self::MU_MARKER, self::MU_VERSION);
 		$store = var_export($dir, true);
 		if(is_file($path))
@@ -1048,12 +1070,27 @@ final class Prepend
 		{
 			return '';
 		}
-		$stub = "<?php\n"
+		
+		return @file_put_contents($path, self::muPluginText($source, $store), LOCK_EX) === false ? '' : $path;
+	}
+	
+	/**
+	 * The mu-plugin's exact text: what ensureMuPlugin() writes, and what the
+	 * integrity scan holds the file against byte for byte
+	 *
+	 * @param string $store the exported store path run() is given
+	 */
+	public static function muPluginText(
+		string $source,
+		string $store,
+	): string
+	{
+		return "<?php\n"
 			. "/*\n"
 			. " * Plugin Name: ovos codesafe Shield, early stage\n"
 			. " * Description: Judges anonymous requests against the Shield's rules before the other plugins load. Kept by the ovos codesafe plugin while its Shield is on.\n"
 			. " */\n"
-			. "// " . $marker . " — safe to delete: the plugin writes it again while its Shield is on.\n"
+			. "// " . sprintf('%s v%d', self::MU_MARKER, self::MU_VERSION) . " — safe to delete: the plugin writes it again while its Shield is on.\n"
 			. "// Does nothing once the plugin's Prepend.php is gone or the PHP is older than the plugin's.\n"
 			. "\$ovosCodesafeShield = '" . str_replace("'", "\\'", $source) . "';\n"
 			. "if(PHP_VERSION_ID >= 80300 && is_file(\$ovosCodesafeShield))\n"
@@ -1065,8 +1102,6 @@ final class Prepend
 			. "\t}\n"
 			. "}\n"
 			. "unset(\$ovosCodesafeShield);\n";
-		
-		return @file_put_contents($path, $stub, LOCK_EX) === false ? '' : $path;
 	}
 	
 	/** the mu-plugin taken away — only one this plugin wrote, never another file by that name */
