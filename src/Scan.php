@@ -77,12 +77,21 @@ use const PHP_URL_HOST;
 use const PHP_VERSION;
 use const PREG_OFFSET_CAPTURE;
 use const SCANDIR_SORT_NONE;
+use const T_ARRAY;
 use const T_BAD_CHARACTER;
 use const T_CLOSE_TAG;
 use const T_COMMENT;
+use const T_CONSTANT_ENCAPSED_STRING;
+use const T_DNUMBER;
 use const T_DOC_COMMENT;
+use const T_DOUBLE_ARROW;
+use const T_EXIT;
+use const T_HALT_COMPILER;
 use const T_INLINE_HTML;
+use const T_LNUMBER;
 use const T_OPEN_TAG;
+use const T_STRING;
+use const T_VARIABLE;
 use const T_WHITESPACE;
 
 /**
@@ -115,8 +124,10 @@ use const T_WHITESPACE;
  * PRECISION FIRST: a scanner that names something innocent gets switched
  * off, which is worse than one that is late. Every heuristic here carries
  * its known false positive and how it is held down (the `index.php` stubs
- * plugins write into uploads, Wordfence's prepend file, managed hosts'
- * drop-ins). The tier on a finding is a PROPOSAL; the console decides.
+ * plugins write into uploads, Wordfence's and AIOS's root files, managed
+ * hosts' drop-ins, the data files plugins keep under PHP names, this
+ * plugin's own store). The tier on a finding is a PROPOSAL; the console
+ * decides.
  */
 class Scan
 {
@@ -157,6 +168,9 @@ class Scan
 	
 	/** the plugin's own store files are read whole up to this: the queue and the seen list are capped well below it */
 	protected const STORE_BYTES = 1048576;
+	
+	/** a PHP-named data file is read whole up to this to judge it; a larger one is not judged data */
+	protected const DATA_BYTES = 262144;
 	
 	protected const DIRECTIVE_BYTES = 65536;
 	
@@ -278,11 +292,25 @@ class Scan
 	];
 	
 	/**
+	 * Uploads directories a plugin fills with PHP-named data it includes
+	 * later: Ultimate Addons' (and ConvertPlug's) icon sets as charmap.php.
+	 * Walked like the rest of uploads: a file there that is data only, with an
+	 * owner installed, is listed; anything else is URGENT like any PHP under
+	 * uploads. Owners match whatever the directory's casing
+	 */
+	protected const UPLOAD_WRITERS = [
+		'smile_fonts' => ['Ultimate_VC_Addons', 'convertplug'],
+	];
+	
+	/**
 	 * PHP files a plugin legitimately puts in the document ROOT (the
-	 * executed-file watch, Entries, asks the same question)
+	 * executed-file watch, Entries, asks the same question): Wordfence's
+	 * firewall prepend, and the bootstrap AIOS writes for its firewall and
+	 * leaves behind, stripped, when the firewall is turned off
 	 */
 	public const ROOT_OWNERS = [
 		'wordfence-waf.php' => ['wordfence'],
+		'aios-bootstrap.php' => ['all-in-one-wp-security-and-firewall'],
 	];
 	
 	/**
@@ -318,6 +346,9 @@ class Scan
 	
 	/** @var array{store: string, stub: string, legacy: string}|null */
 	protected ?array $store = null;
+	
+	/** @var array<string, array<string, string>> installedSlugs() by root */
+	protected array $slugs = [];
 	
 	/** the core list for this request, loaded once; false = unavailable this pass */
 	protected array|false|null $coreList = null;
@@ -874,7 +905,7 @@ class Scan
 			case 'uploads':
 				if($this->isStub($path, $size) === false)
 				{
-					$this->finding($state, $area, $path, 'uploads_php', self::TIER_URGENT, '', $meta);
+					$this->inspectUploadsPhp($state, $path, $size, $meta);
 				}
 				
 				return;
@@ -969,7 +1000,7 @@ class Scan
 			
 			if($translation === false && $this->isStub($path, $size) === false)
 			{
-				$this->finding($state, 'content', $path, 'content_php', self::TIER_HIGH, '', $meta);
+				$this->stranger($state, 'content', $path, $size, 'content_php', self::TIER_HIGH, $meta);
 			}
 			
 			return;
@@ -1011,11 +1042,62 @@ class Scan
 			$this->finding($state, 'content', $path, 'dropin',
 				$name === 'install.php' ? self::TIER_HIGH : self::TIER_INFO,
 				$name === 'install.php' ? 'install drop-in on a live site' : '', $meta);
+				
+			return;
+		}
+		
+		$this->stranger($state, 'content', $path, $size, 'content_php', self::TIER_HIGH, $meta);
+	}
+	
+	/**
+	 * PHP under uploads that is no stub: listed when it stops before any code
+	 * runs or when it is a known writer's data file with its owner installed,
+	 * URGENT otherwise
+	 */
+	protected function inspectUploadsPhp(
+		array &$state,
+		string $path,
+		int $size,
+		array $meta,
+	): void
+	{
+		$top = explode('/', $this->relative($path, $this->roots['uploads']), 2)[0];
+		$owner = isset(self::UPLOAD_WRITERS[$top]) ? $this->installedOwner(self::UPLOAD_WRITERS[$top]) : null;
+		
+		if($owner !== null && $size <= self::DATA_BYTES && self::dataOnly((string)$this->head($path, self::DATA_BYTES)))
+		{
+			$this->finding($state, 'uploads', $path, 'uploads_php_owned', self::TIER_INFO,
+				'owned by ' . $owner . ', data only', $meta);
+				
+			return;
+		}
+		
+		$this->stranger($state, 'uploads', $path, $size, 'uploads_php', self::TIER_URGENT, $meta);
+	}
+	
+	/**
+	 * PHP where none belongs: the stranger's finding, or inert_php INFO when the
+	 * file stops before any code runs — the data files W3 Total Cache and AIOS
+	 * keep under PHP names behind an exit or __halt_compiler()
+	 */
+	protected function stranger(
+		array &$state,
+		string $area,
+		string $path,
+		int $size,
+		string $detector,
+		string $tier,
+		array $meta,
+	): void
+	{
+		if($size <= self::DATA_BYTES && self::inert((string)$this->head($path, self::DATA_BYTES)))
+		{
+			$this->finding($state, $area, $path, 'inert_php', self::TIER_INFO, 'stops before any code runs', $meta);
 			
 			return;
 		}
 		
-		$this->finding($state, 'content', $path, 'content_php', self::TIER_HIGH, '', $meta);
+		$this->finding($state, $area, $path, $detector, $tier, '', $meta);
 	}
 	
 	/**
@@ -1915,14 +1997,175 @@ class Scan
 		{
 			[$type, $slug] = str_contains($owner, ':') ? explode(':', $owner, 2) : ['plugin', $owner];
 			$root = $type === 'theme' ? $this->roots['themes'] : $this->roots['plugins'];
+			$installed = $this->installedSlugs($root)[strtolower($slug)] ?? null;
 			
-			if($slug !== '' && is_dir($root . '/' . $slug))
+			if($slug !== '' && $installed !== null)
 			{
-				return $owner;
+				// named as the directory is named
+				return $type === 'theme' ? 'theme:' . $installed : $installed;
 			}
 		}
 		
 		return null;
+	}
+	
+	/**
+	 * The directories under a plugins or themes root by their lowercase name,
+	 * read once per request: an owner table names a plugin in one casing
+	 * (Ultimate_VC_Addons) and the site's file system may be case-sensitive
+	 *
+	 * @return array<string, string> lowercase name → the directory's own name
+	 */
+	protected function installedSlugs(
+		string $root,
+	): array
+	{
+		if(isset($this->slugs[$root]))
+		{
+			return $this->slugs[$root];
+		}
+		
+		$slugs = [];
+		
+		foreach(@scandir($root, SCANDIR_SORT_NONE) ?: [] as $entry)
+		{
+			if($entry !== '.' && $entry !== '..' && is_dir($root . '/' . $entry))
+			{
+				$slugs[strtolower($entry)] = $entry;
+			}
+		}
+		
+		return $this->slugs[$root] = $slugs;
+	}
+	
+	/**
+	 * Whether PHP stops before any code in $source runs: after the opener the
+	 * first statement is __halt_compiler(), or an exit or die whose argument
+	 * is a literal or nothing (an expression there runs before the exit).
+	 * Without the tokenizer nothing is judged inert
+	 */
+	public static function inert(
+		string $source,
+	): bool
+	{
+		if(function_exists('token_get_all') === false)
+		{
+			return false;
+		}
+		
+		$opened = false;
+		$statement = [];
+		
+		foreach(token_get_all($source) as $token)
+		{
+			$id = is_array($token) ? $token[0] : $token;
+			
+			if(in_array($id, [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)
+				|| ($opened === false && $id === T_INLINE_HTML && trim($token[1]) === ''))
+			{
+				continue;
+			}
+			
+			if($opened === false)
+			{
+				if($id !== T_OPEN_TAG)
+				{
+					return false;
+				}
+				
+				$opened = true;
+				
+				continue;
+			}
+			
+			$statement[] = $id;
+			
+			if(count($statement) === 5)
+			{
+				break;
+			}
+		}
+		
+		[$first, $second, $third, $fourth, $fifth] = $statement + [null, null, null, null, null];
+		$end = [';', T_CLOSE_TAG];
+		
+		return $first === T_HALT_COMPILER
+			|| ($first === T_EXIT && (in_array($second, $end, true)
+				|| ($second === '(' && $third === ')' && in_array($fourth, $end, true))
+				|| ($second === '(' && in_array($third, [T_LNUMBER, T_CONSTANT_ENCAPSED_STRING], true)
+					&& $fourth === ')' && in_array($fifth, $end, true))));
+	}
+	
+	/**
+	 * Whether $source only assigns literal data: variables, strings, numbers,
+	 * true, false, null and arrays, nothing that can call or include code — a
+	 * `(` is allowed only right after `array`, so `$f('x')` is refused. What
+	 * Ultimate Addons writes into its icon sets' charmap.php. Without the
+	 * tokenizer nothing is judged data
+	 */
+	public static function dataOnly(
+		string $source,
+	): bool
+	{
+		if(function_exists('token_get_all') === false)
+		{
+			return false;
+		}
+		
+		// 0 before the opener, 1 inside PHP, 2 after the closer
+		$phase = 0;
+		$previous = null;
+		
+		foreach(token_get_all($source) as $token)
+		{
+			$id = is_array($token) ? $token[0] : $token;
+			
+			if($phase !== 1 && $id === T_INLINE_HTML && trim($token[1]) === '')
+			{
+				continue;
+			}
+			
+			if($phase !== 1)
+			{
+				if($phase === 2 || $id !== T_OPEN_TAG)
+				{
+					return false;
+				}
+				
+				$phase = 1;
+				
+				continue;
+			}
+			
+			if(in_array($id, [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true))
+			{
+				continue;
+			}
+			
+			if($id === T_CLOSE_TAG)
+			{
+				$phase = 2;
+				
+				continue;
+			}
+			
+			$allowed = match(true)
+			{
+				$id === '(' => $previous === T_ARRAY,
+				$id === T_STRING => in_array(strtolower($token[1]), ['true', 'false', 'null'], true),
+				default => in_array($id, [T_VARIABLE, T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER, T_ARRAY,
+					T_DOUBLE_ARROW, '=', ';', '[', ']', ',', ')', '-', '.'], true),
+			};
+			
+			if($allowed === false)
+			{
+				return false;
+			}
+			
+			$previous = $id;
+		}
+		
+		return $phase !== 0;
 	}
 	
 	/**

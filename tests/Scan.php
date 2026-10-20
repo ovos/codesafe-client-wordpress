@@ -14,6 +14,7 @@ use function array_values;
 use function dirname;
 use function file_get_contents;
 use function file_put_contents;
+use function in_array;
 use function is_dir;
 use function mkdir;
 use function realpath;
@@ -97,13 +98,15 @@ class Scan extends Test
 	}
 	
 	/**
-	 * The two wp-content phases of a fresh pass over the temp tree, nothing
-	 * that fetches a checksum list, with the store where $store says
+	 * The phases of $areas from a fresh pass over the temp tree, with the
+	 * store where $store says and no core list, so nothing is fetched
 	 *
 	 * @param array{store: string, stub: string, legacy: string} $store
+	 * @param list<string> $areas
 	 */
 	protected function walk(
 		array $store,
+		array $areas = ['content'],
 	): array
 	{
 		$scan = new class(new Config, $this->roots, $store) extends PluginScan
@@ -134,9 +137,16 @@ class Scan extends Test
 		};
 		
 		$state = $scan->start('manual');
-		$state['phases'] = array_values(array_filter($state['phases'], static fn(array $phase): bool => $phase[0] === 'content'));
+		$state['phases'] = array_values(array_filter($state['phases'], static fn(array $phase): bool => in_array($phase[0], $areas, true)));
+		$state['checksums']['core'] = 'unavailable';
 		
 		return $scan->advance($state, 10_000);
+	}
+	
+	/** a store nowhere in the tree, for the walks that do not look at it */
+	protected function noStore(): array
+	{
+		return ['store' => $this->root . '/elsewhere', 'stub' => $this->root . '/elsewhere', 'legacy' => $this->root . '/elsewhere'];
 	}
 	
 	/**
@@ -153,6 +163,23 @@ class Scan extends Test
 			if($finding['path'] === $path)
 			{
 				return $finding['detector'] . ' ' . $finding['tier'];
+			}
+		}
+		
+		return '';
+	}
+	
+	/** the detail of the walk's finding for a path, '' when there is none */
+	protected function detail(
+		array $state,
+		string $path,
+	): string
+	{
+		foreach($state['findings'] as $finding)
+		{
+			if($finding['path'] === $path)
+			{
+				return $finding['detail'] ?? '';
 			}
 		}
 		
@@ -313,5 +340,84 @@ class Scan extends Test
 			&& PluginScan::opensPhp('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>') === false
 			&& PluginScan::opensPhp('<?phpinfo') === false
 			&& PluginScan::opensPhp("\x89PNG\r\n\x1a\nIDAT\x00\x01") === false;
+	}
+	
+	/**
+	 * RULE: an icon set's charmap.php under uploads/smile_fonts is listed as
+	 * the owner's data while Ultimate Addons is installed, whatever the
+	 * directory's casing; the same file is URGENT with no owner, and so is a
+	 * charmap that calls anything. Falsify: allow `(` after any token (the
+	 * variable call passes as data); look the owner up case-sensitively with
+	 * the table's casing against a lower-case directory (the owner is missed).
+	 */
+	public function aWritersDataFileUnderUploadsIsListedNotUrgent(): bool
+	{
+		$uploads = $this->roots['uploads'];
+		$charmap = "<?php \$icons = array();\n\$icons['icomoon']['icn_a'] = array(\"class\"=>\"icn_a\",\"tags\"=>\"a\",\"unicode\"=>\"\\e900\");\n";
+		$this->write($uploads . '/smile_fonts/icomoon/charmap.php', $charmap);
+		$this->write($uploads . '/smile_fonts/Defaults/charmap.php', "<?php \$icons = 'system'; \$icons('id');");
+		mkdir($this->roots['plugins'] . '/ultimate_vc_addons', 0700, true);
+		
+		$owned = $this->walk($this->noStore(), ['uploads']);
+		rmdir($this->roots['plugins'] . '/ultimate_vc_addons');
+		$orphaned = $this->walk($this->noStore(), ['uploads']);
+		
+		return $this->verdict($owned, 'smile_fonts/icomoon/charmap.php') === 'uploads_php_owned info'
+			// named as the directory is named, which a case-insensitive file system alone would not tell
+			&& $this->detail($owned, 'smile_fonts/icomoon/charmap.php') === 'owned by ultimate_vc_addons, data only'
+			&& $this->verdict($owned, 'smile_fonts/Defaults/charmap.php') === 'uploads_php urgent'
+			&& $this->verdict($orphaned, 'smile_fonts/icomoon/charmap.php') === 'uploads_php urgent'
+			&& PluginScan::dataOnly("<?php \$a = ['x' => true, 'y' => -1.5, 'z' => null];")
+			&& PluginScan::dataOnly("<?php ('system')('id');") === false
+			&& PluginScan::dataOnly("<?php \$a = [\$b, 'c'](); ") === false
+			&& PluginScan::dataOnly("<?php \$a = \"{\$b()}\";") === false
+			&& PluginScan::dataOnly("<?php \$a = 1; ?>\n<script>alert(1)</script>") === false;
+	}
+	
+	/**
+	 * RULE: PHP that stops before any code runs is listed, not reported as a
+	 * stranger — AIOS's firewall settings behind __halt_compiler() under
+	 * uploads, a W3 Total Cache config behind an exit in wp-content — while an
+	 * exit that is conditional or runs an expression first stays URGENT.
+	 * Falsify: accept an exit anywhere, or with any argument (the conditional
+	 * and the exit(system()) pass as inert).
+	 */
+	public function anInertHeaderMakesAFileData(): bool
+	{
+		$uploads = $this->roots['uploads'];
+		$this->write($uploads . '/aios/firewall-rules/settings.php', "<?php __halt_compiler();// AIOS\n{\"aiowps_googlebot_ip_ranges\":[]}");
+		$this->write($this->roots['content'] . '/w3tc-config-old/master.php', "<?php exit; ?>\n{\"version\":\"2.1\"}");
+		$this->write($uploads . '/x/conditional.php', "<?php if(0) exit; system('id');");
+		$this->write($uploads . '/x/argument.php', "<?php exit(system('id'));");
+		$this->write($uploads . '/x/literal.php', "<?php\n// guard\ndie('No direct access');\nsystem('id');");
+		
+		$walked = $this->walk($this->noStore(), ['uploads', 'content']);
+		
+		return $this->verdict($walked, 'aios/firewall-rules/settings.php') === 'inert_php info'
+			&& $this->verdict($walked, 'w3tc-config-old/master.php') === 'inert_php info'
+			&& $this->verdict($walked, 'x/conditional.php') === 'uploads_php urgent'
+			&& $this->verdict($walked, 'x/argument.php') === 'uploads_php urgent'
+			&& $this->verdict($walked, 'x/literal.php') === 'inert_php info'
+			&& PluginScan::inert("<?php exit(); ?>")
+			&& PluginScan::inert("<?php echo 1; exit;") === false
+			&& PluginScan::inert("<?= 1; exit;") === false;
+	}
+	
+	/**
+	 * RULE: the bootstrap AIOS writes into the document root is its own while
+	 * AIOS is installed, and a stranger once it is not. Falsify: drop the
+	 * ROOT_OWNERS entry — the root file is URGENT on every AIOS site.
+	 */
+	public function aRootFileAiosWritesIsOwned(): bool
+	{
+		$this->write($this->root . '/aios-bootstrap.php', "<?php\n// Begin AIOWPSEC Firewall\n\$GLOBALS['aiowps_firewall_rules_path'] = '/x';\n");
+		mkdir($this->roots['plugins'] . '/all-in-one-wp-security-and-firewall', 0700, true);
+		
+		$owned = $this->walk($this->noStore(), ['root']);
+		rmdir($this->roots['plugins'] . '/all-in-one-wp-security-and-firewall');
+		$stranger = $this->walk($this->noStore(), ['root']);
+		
+		return $this->verdict($owned, 'aios-bootstrap.php') === 'root_php_owned info'
+			&& $this->verdict($stranger, 'aios-bootstrap.php') === 'root_php urgent';
 	}
 }
