@@ -57,7 +57,8 @@ use const PHP_URL_HOST;
  * body. The console correlates the `mtime` a finding carries (a user's
  * registration, a post's modification) against the project's attack waves;
  * that is where "admin #57 was created forty seconds after the wave" comes
- * from, and it needs no name to say it.
+ * from, and it needs no name to say it. A cron row carries none: its only
+ * date is the hook's next run, which is no write.
  *
  * Every read is bounded (LIMITs, caps per detector) and wrapped: a failing
  * query costs the detector, never the pass.
@@ -321,7 +322,7 @@ class Database
 					$suspicious ? Scan::TIER_HIGH : Scan::TIER_INFO, 'options/cron/' . $hook,
 					'scheduled hook no active plugin or theme listens to'
 					. ($schedule !== '' ? ', ' . $schedule : '')
-					. ', next ' . gmdate('Y-m-d H:i', (int)$timestamp), (int)$timestamp);
+					. ', next ' . gmdate('Y-m-d H:i', (int)$timestamp));
 				
 				if(count($findings) >= self::MAX_PER_DETECTOR)
 				{

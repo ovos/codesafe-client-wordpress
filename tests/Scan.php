@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Tests;
 
 use Ovos\Codesafe\Config;
+use Ovos\Codesafe\Database;
 use Ovos\Codesafe\Scan as PluginScan;
 use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Test;
@@ -23,6 +24,7 @@ use function rmdir;
 use function scandir;
 use function str_replace;
 use function sys_get_temp_dir;
+use function time;
 use function uniqid;
 use function unlink;
 
@@ -99,20 +101,17 @@ class Scan extends Test
 	}
 	
 	/**
-	 * The phases of $areas from a fresh pass over the temp tree, with the
-	 * store where $store says and no core list, so nothing is fetched
+	 * A scan of the temp tree with the store where $store says
 	 *
 	 * @param array{store: string, stub: string, legacy: string} $store
-	 * @param list<string> $areas
 	 * @param array<string, string> $versions plugin directory => version, for the checksum lists
 	 */
-	protected function walk(
+	protected function scanner(
 		array $store,
-		array $areas = ['content'],
 		array $versions = [],
-	): array
+	): PluginScan
 	{
-		$scan = new class(new Config, $this->roots, $store, $versions) extends PluginScan
+		return new class(new Config, $this->roots, $store, $versions) extends PluginScan
 		{
 			public function __construct(
 				Config $config,
@@ -139,7 +138,23 @@ class Scan extends Test
 				return $this->own;
 			}
 		};
-		
+	}
+	
+	/**
+	 * The phases of $areas from a fresh manual pass over the temp tree, with
+	 * no core list, so nothing is fetched
+	 *
+	 * @param array{store: string, stub: string, legacy: string} $store
+	 * @param list<string> $areas
+	 * @param array<string, string> $versions plugin directory => version, for the checksum lists
+	 */
+	protected function walk(
+		array $store,
+		array $areas = ['content'],
+		array $versions = [],
+	): array
+	{
+		$scan = $this->scanner($store, $versions);
 		$state = $scan->start('manual');
 		$state['phases'] = array_values(array_filter($state['phases'], static fn(array $phase): bool => in_array($phase[0], $areas, true)));
 		$state['checksums']['core'] = 'unavailable';
@@ -425,6 +440,43 @@ class Scan extends Test
 			&& $walked['areas']['plugins']['verified'] === 1
 			&& $walked['areas']['plugins']['foreign'] === 0
 			&& $walked['areas']['plugins']['modified'] === 0;
+	}
+	
+	/**
+	 * RULE: the database phase runs only on a request that reached wp_loaded —
+	 * at once on a WP-Cron, admin or manual one, on any other only after a day
+	 * of waiting for one — and a pass that waits stays where it was.
+	 * Falsify: drop the wp_loaded gate (an early-exiting request judges cron
+	 * listeners it never loaded); drop the day's fallback (a site without
+	 * cron or admin requests never finishes its pass).
+	 */
+	public function theDatabasePhaseWaitsForALoadedRequest(): bool
+	{
+		$scan = $this->scanner($this->noStore());
+		$fresh = static function(string $mode) use ($scan): array
+		{
+			$state = $scan->start($mode);
+			$state['phases'] = [[Database::AREA, '', false, []]];
+			
+			return $state;
+		};
+		
+		$early = $scan->advance($fresh('background'), 1000);
+		
+		$GLOBALS['wp']['did']['wp_loaded'] = 1;
+		$frontEnd = $scan->advance($early, 1000);
+		$frontEnd['database_deferred_since'] = time() - 86400;
+		$aDayLater = $scan->advance($frontEnd, 1000);
+		$manual = $scan->advance($fresh('manual'), 1000);
+		
+		$GLOBALS['wp']['doing_cron'] = true;
+		$cron = $scan->advance($fresh('background'), 1000);
+		
+		return $early['phase'] === 0 && $early['done'] === false && isset($early['database_deferred_since']) === false
+			&& $frontEnd['phase'] === 0 && $frontEnd['done'] === false && isset($frontEnd['database_deferred_since'])
+			&& $aDayLater['done'] === true
+			&& $manual['done'] === true
+			&& $cron['done'] === true;
 	}
 	
 	/**

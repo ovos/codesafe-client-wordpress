@@ -14,6 +14,7 @@ use function bin2hex;
 use function class_exists;
 use function count;
 use function defined;
+use function did_action;
 use function dirname;
 use function explode;
 use function fclose;
@@ -32,6 +33,7 @@ use function home_url;
 use function implode;
 use function in_array;
 use function ini_get;
+use function is_admin;
 use function is_array;
 use function is_dir;
 use function is_file;
@@ -66,6 +68,7 @@ use function time;
 use function token_get_all;
 use function trim;
 use function var_export;
+use function wp_doing_cron;
 use function wp_get_environment_type;
 use function wp_get_upload_dir;
 use function wp_parse_url;
@@ -171,6 +174,9 @@ class Scan
 	
 	/** a PHP-named data file is read whole up to this to judge it; a larger one is not judged data */
 	protected const DATA_BYTES = 262144;
+	
+	/** how long the database phase waits for a WP-Cron or admin request before any loaded one will do */
+	protected const DATABASE_WAIT = 86400;
 	
 	protected const DIRECTIVE_BYTES = 65536;
 	
@@ -498,6 +504,11 @@ class Scan
 			
 			if($area === Database::AREA)
 			{
+				if($this->databaseReady($state) === false)
+				{
+					break;
+				}
+				
 				$this->database($state);
 				$state['phase']++;
 				
@@ -1680,6 +1691,37 @@ class Scan
 	 * Database — every finding an id, an option name or a hook, never a
 	 * name or a value
 	 */
+	/**
+	 * Whether this request may run the database phase. Its cron check asks
+	 * which hooks have a listener, and a plugin adds its listeners while
+	 * WordPress loads: a request that ended early (a language redirect that
+	 * exits at setup_theme) has heard of none of them, so the phase waits for
+	 * one that reached wp_loaded. It prefers a WP-Cron, admin or manual
+	 * request, where every plugin loads its listeners (some skip anonymous
+	 * front-end visitors); a site without either for a day runs it on the
+	 * next loaded request, or the pass would never finish
+	 */
+	protected function databaseReady(
+		array &$state,
+	): bool
+	{
+		if(function_exists('did_action') && did_action('wp_loaded') === 0)
+		{
+			return false;
+		}
+		
+		if(($state['mode'] ?? '') === 'manual'
+			|| (function_exists('wp_doing_cron') && wp_doing_cron())
+			|| (function_exists('is_admin') && is_admin()))
+		{
+			return true;
+		}
+		
+		$state['database_deferred_since'] ??= time();
+		
+		return time() - (int)$state['database_deferred_since'] >= self::DATABASE_WAIT;
+	}
+	
 	protected function database(
 		array &$state,
 	): void

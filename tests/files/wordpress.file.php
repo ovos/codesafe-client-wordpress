@@ -72,6 +72,11 @@ function wp_shim_reset(): void
 		'file_mods' => true,
 		'updater_disabled' => false,
 		'vcs' => false,
+		// did_action() by hook, wp_doing_cron(), is_admin(), and _get_cron_array(): timestamp => hook => events
+		'did' => [],
+		'doing_cron' => false,
+		'admin' => false,
+		'cron' => [],
 	];
 	// WordPress's own: whether the login cookie settled the current user (rest_cookie_collect_status())
 	unset($GLOBALS['wp_rest_auth_cookie'], $GLOBALS['pagenow']);
@@ -145,6 +150,45 @@ function add_action(
 ): void
 {
 	$GLOBALS['wp']['hooked'][] = [$arguments[0] ?? '', $arguments[1] ?? null, $arguments[2] ?? 10];
+}
+
+// whether anything was hooked by that name, as add_action() recorded it
+function has_action(
+	string $hook,
+	mixed $callback = false,
+): bool
+{
+	foreach($GLOBALS['wp']['hooked'] as [$name])
+	{
+		if($name === $hook)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function did_action(
+	string $hook,
+): int
+{
+	return $GLOBALS['wp']['did'][$hook] ?? 0;
+}
+
+function wp_doing_cron(): bool
+{
+	return $GLOBALS['wp']['doing_cron'];
+}
+
+function is_admin(): bool
+{
+	return $GLOBALS['wp']['admin'];
+}
+
+function _get_cron_array(): array
+{
+	return $GLOBALS['wp']['cron'];
 }
 
 function __(
