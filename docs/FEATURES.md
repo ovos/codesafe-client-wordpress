@@ -531,18 +531,20 @@ core → themes, so an interrupted pass has already covered the urgent part):
 
 | finding | tier | what it catches |
 |---------|------|-----------------|
-| executable-shaped file under uploads (`x.php`, `shell.php.jpg`, `.phtml`, `.phar`) | urgent | the classic drop — the `index.php` listing stubs plugins write there are recognised and skipped |
-| media file whose first kilobyte carries `<?php` / `<?=` (`.ico .jpg .png .gif .webp .bmp .pdf .svg`; `.txt .log .csv` under uploads) | urgent | the `favicon_a1b2.ico` family, the image behind an `AddHandler` |
-| PHP in the document root that is not one of core's own root files | urgent | `about.php`, `wp-conflg.php`; Wordfence's `wordfence-waf.php` is recognised when Wordfence is installed |
+| executable-shaped file under uploads (`x.php`, `shell.php.jpg`, `.phtml`, `.phar`) | urgent | the classic drop — the `index.php` listing stubs plugins write there are recognised and skipped, judged by PHP's own tokenizer (a `//` comment ended by a bare CR, a `?>` inside a comment or a `#[` attribute line is code, not a stub); a known writer's data file with its plugin installed (Ultimate Addons' and ConvertPlug's `smile_fonts/*/charmap.php`, nothing in it but literal assignments) is listed as `uploads_php_owned` info |
+| media file whose first kilobyte carries a PHP opener (`<?php` in any case, `<?=`) whose code up to its closer PHP could compile (`.ico .jpg .png .gif .webp .bmp .pdf .svg`; `.txt .log .csv` under uploads) | urgent | the `favicon_a1b2.ico` family, the image behind an `AddHandler` — the `<?=` that compressed image data happens to contain, followed by a byte PHP refuses, is no opener |
+| PHP in the document root that is not one of core's own root files | urgent | `about.php`, `wp-conflg.php`; Wordfence's `wordfence-waf.php` and AIOS's `aios-bootstrap.php` are recognised when their plugin is installed |
 | `.htaccess` / `.user.ini` / `php.ini` directives: `auto_prepend_file` / `auto_append_file` to a file no installed plugin owns, `AddHandler`/`AddType` mapping PHP to another extension, `SetHandler` to PHP, `engine on` or CGI under uploads, `RewriteRule`/`Redirect`/`ErrorDocument` to another host | urgent / high | persistence, the polyglot's trigger, the redirect hack — reported as directive kind, file and line, never the line's text |
 | the live `auto_prepend_file` / `auto_append_file` of the PHP configuration | urgent | the `.user.ini` trick from the running interpreter's point of view |
 | PHP in a hidden path (`.x.php`, `.well-known/…`) | high | the hidden drop — dotfile tool configs in vendored packages are recognised |
 | PHP in `wp-content` outside any plugin, theme, mu-plugin or upload path | high | `wp-content/strange/s.php`; WordPress' own `.l10n.php` translations are recognised |
+| PHP under uploads or in `wp-content` that stops before any code runs: its first statement is `__halt_compiler()`, or an `exit` / `die` that is bare or takes a literal | info | `inert_php` — the data files plugins keep under PHP names (AIOS's firewall settings, a W3 Total Cache config); an exit after other code, a conditional one or `exit(system(…))` is no guard |
+| this plugin's own store (`wp-content/ovos-codesafe/`, the legacy `ovos-console/`, a `CODESAFE_STORE_DIR` inside `wp-content`) and its mu-plugin, held against what the plugin writes: the prepend stub and the mu-plugin byte for byte, the data files by their exit guard and JSON body | urgent / high | `store_modified` — urgent for the stub and the mu-plugin, which run on every request, high for a data file; verified files are silent and any other PHP in the store is a stranger |
 | a drop-in (`object-cache.php`, `advanced-cache.php`, `db.php`, `wp-cache-config.php`) with none of its known plugins installed and no vendor header | high | the shell disguised as a cache config — a drop-in with a vendor header or an installed owner is listed as `info` |
 | a plugin data directory (`wflogs`, `w3tc-config`, `updraft`, …) whose plugin is not installed | high | listed and never descended: the directory is the finding |
-| must-use plugins, drop-ins with an owner, `install.php` | info / high | listed for the operator; `install.php` on a live site is high |
+| must-use plugins, drop-ins with an owner, `install.php` | info / high | listed for the operator (this plugin's own mu-plugin is verified instead); `install.php` on a live site is high |
 | **checksums** — a core file that differs from wordpress.org's list for this version, or a PHP file under `wp-admin/` / `wp-includes/` the list never had | urgent | the backdoored `wp-load.php`, the `class-wp-helper.php` nobody shipped — `core_modified` / `core_foreign` |
-| **checksums** — the same two verdicts inside a wp.org plugin's directory, against the plugin's own list for its installed version | high | `plugin_modified` / `plugin_foreign`; a premium or custom plugin has no list and is not judged, themes are never judged this way |
+| **checksums** — the same two verdicts inside a wp.org plugin's directory, against the plugin's own list for its installed version | high | `plugin_modified` / `plugin_foreign`; a file the list names under several md5s matches any of them; a premium or custom plugin has no list and is not judged, themes are never judged this way |
 | **database** — administrators (registration date, sessions, last login), application passwords on admins, active plugins whose file is gone, scheduled hooks nobody listens to, uninstall callables of gone plugins, options carrying code markers, foreign scripts / iframes / obfuscation in published content and widgets (posts and pages, plus the rows a block theme keeps its markup in: Site Editor templates and template parts, global styles, the Customizer's Additional CSS — none of them files), a site URL disagreeing with its constant, registration into a role above subscriber | info – high | the attacker's other filesystem; ids, option names and hook names only — never a login, an e-mail, a value or a post body |
 | a directory under uploads or in the root that changed after its newest file | info | something was removed or renamed here recently — dated, so codesafe can hold it against the waves |
 | a file owned by another uid than its siblings; a symlink leaving the site | high | the web server writing among the deploy user's files; the symlink attack (silent on Windows and single-uid hosting) |
@@ -562,25 +564,34 @@ registration and its default role, version control in the document root,
 The checksum lists come from wordpress.org — core by version and locale
 (`api.wordpress.org/core/checksums`), every wp.org plugin by slug and installed
 version (`downloads.wordpress.org/plugin-checksums`) — fetched once per version,
-kept in a transient for a month, a 404 remembered for a week. A background
+kept in a transient for a month, a 404 remembered for a week. wordpress.org
+lists every md5 a file shipped under when it built a version more than once
+(a tag edited after it was cut, trunk shipped under the same number); any of
+them matches. A background
 chunk fetches at most one list and yields the rest to the next request; a
 *Scan now* round fetches three. Listed files missing from disk are counted per
 area, never listed: hosts strip readmes, and a missing file is not an
 intrusion. Every finding a list produced carries `md5 differs …` or `not in
 the wordpress.org list …` as its detail, so the authority behind it is visible.
 
-The database checks run once per pass, bounded (`LIMIT`s, twenty findings per
-detector), read-only, and report what can be acted on without disclosing
-anything private: `users/<id>` with the registration date as the finding's
+The database checks run once per pass, on a request that loaded every
+plugin: a WP-Cron, admin or *Scan now* request at once, any request that
+reached `wp_loaded` after a day of waiting for one. A request that exits
+early (a language redirect at `setup_theme`) has not heard of the plugins'
+cron listeners, and some plugins load none for anonymous visitors. They are
+bounded (`LIMIT`s, twenty findings per detector), read-only, and report what
+can be acted on without disclosing anything private: `users/<id>` with the registration date as the finding's
 date (codesafe holds it against the attack waves of the same hours —
 *admin #57 was registered forty seconds after 27.0.113.86 stopped probing*),
-`options/<name>` with the length and the marker, `options/cron/<hook>`,
+`options/<name>` with the length and the marker, `options/cron/<hook>` with
+its schedule and next run in the detail and no date (a next run is no write),
 `posts/<id>` with the foreign host.
 
 What it never does: write, delete, rename, quarantine or touch `.htaccess`;
 follow a symlink; descend into `.git`, `node_modules`, `wp-content/cache` or
-`wp-content/upgrade`; read more than the first kilobyte of a media file or
-64 KB of a directive file; send a file's content. Findings are paths, sizes
+`wp-content/upgrade`; read more than the first kilobyte of a media file,
+64 KB of a directive file or 256 KB of a PHP file judged as data; send a
+file's content. Findings are paths, sizes
 and dates. A finding is a place to look, not a verdict.
 
 **Scan now** — the button under Settings → ovos codesafe → Integrity scan. Each
