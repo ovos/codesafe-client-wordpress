@@ -16,6 +16,7 @@ use function file_get_contents;
 use function file_put_contents;
 use function in_array;
 use function is_dir;
+use function md5;
 use function mkdir;
 use function realpath;
 use function rmdir;
@@ -103,18 +104,21 @@ class Scan extends Test
 	 *
 	 * @param array{store: string, stub: string, legacy: string} $store
 	 * @param list<string> $areas
+	 * @param array<string, string> $versions plugin directory => version, for the checksum lists
 	 */
 	protected function walk(
 		array $store,
 		array $areas = ['content'],
+		array $versions = [],
 	): array
 	{
-		$scan = new class(new Config, $this->roots, $store) extends PluginScan
+		$scan = new class(new Config, $this->roots, $store, $versions) extends PluginScan
 		{
 			public function __construct(
 				Config $config,
 				protected array $tree,
 				protected array $own,
+				protected array $versions,
 			)
 			{
 				parent::__construct($config);
@@ -127,7 +131,7 @@ class Scan extends Test
 			
 			public function pluginVersions(): array
 			{
-				return [];
+				return $this->versions;
 			}
 			
 			protected function storePaths(): array
@@ -401,6 +405,26 @@ class Scan extends Test
 			&& PluginScan::inert("<?php exit(); ?>")
 			&& PluginScan::inert("<?php echo 1; exit;") === false
 			&& PluginScan::inert("<?= 1; exit;") === false;
+	}
+	
+	/**
+	 * RULE: a plugin file whose md5 is the second of the two its wordpress.org
+	 * list names is verified, neither foreign nor modified. Falsify: keep
+	 * only string md5s in the list (the file is foreign) or compare against
+	 * one md5 (the file is modified).
+	 */
+	public function aFileShippedUnderAnyOfItsListedHashesIsVerified(): bool
+	{
+		$source = "<?php // demo\n";
+		$this->write($this->roots['plugins'] . '/demo/demo.php', $source);
+		$GLOBALS['wp']['api'] = ['files' => ['demo.php' => ['md5' => [md5('an earlier cut'), md5($source)]]]];
+		
+		$walked = $this->walk($this->noStore(), ['plugins'], ['demo' => '1.0']);
+		
+		return $this->verdict($walked, 'demo/demo.php') === ''
+			&& $walked['areas']['plugins']['verified'] === 1
+			&& $walked['areas']['plugins']['foreign'] === 0
+			&& $walked['areas']['plugins']['modified'] === 0;
 	}
 	
 	/**

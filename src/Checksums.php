@@ -4,7 +4,9 @@ declare(strict_types=1);
 namespace Ovos\Codesafe;
 
 use function array_key_exists;
+use function count;
 use function get_transient;
+use function in_array;
 use function is_array;
 use function is_string;
 use function is_wp_error;
@@ -34,10 +36,12 @@ use function wp_remote_retrieve_response_code;
  * a listed file that is not on disk (MISSING, counted only) — and none of them
  * is a guess.
  *
- * A list is immutable per (slug, version), so it is fetched ONCE and kept in
- * a transient for a month; a 404 (a premium or custom plugin wp.org never had)
- * is remembered for a week so the scan does not ask again every pass; a
- * network failure is remembered for an hour. "Unavailable" is an honest
+ * A list is fetched ONCE per (slug, version) and kept in a transient for a
+ * month. It is not immutable: wordpress.org builds a version again when its
+ * tag is edited, or trunk ships under the same version number, and then lists
+ * every md5 a file shipped under (matches()). A 404 (a premium or custom
+ * plugin wp.org never had) is remembered for a week so the scan does not ask
+ * again every pass; a network failure is remembered for an hour. "Unavailable" is an honest
  * answer — the scan then says nothing about that root rather than guessing.
  *
  * The lists are the only network reads the scan ever makes, from
@@ -53,8 +57,11 @@ class Checksums
 	
 	protected const PLUGIN_API = 'https://downloads.wordpress.org/plugin-checksums/%s/%s.json';
 	
-	/** a list is immutable per version: a month is a cache, not a truth window */
+	/** a month is a cache, not a truth window */
 	protected const TTL = 30 * 86400;
+	
+	/** the plugin lists' shape, part of their transient key: several md5s per file */
+	protected const PLUGIN_SHAPE = 'v2';
 	
 	/** wp.org never had this plugin (or this version): a week before asking again */
 	protected const TTL_MISS = 7 * 86400;
@@ -66,7 +73,7 @@ class Checksums
 	 * Lists loaded this request, keyed by transient name — a chunk reads a
 	 * list once, not per file
 	 *
-	 * @var array<string, array<string, string>|null>
+	 * @var array<string, array<string, string|list<string>>|null>
 	 */
 	protected array $loaded = [];
 	
@@ -133,9 +140,10 @@ class Checksums
 	
 	/**
 	 * A wp.org plugin's list for a version: path relative to the plugin
-	 * directory → md5, or null when wp.org has no such plugin or version
+	 * directory → md5, or every md5 the file shipped under when wordpress.org
+	 * lists several; null when wp.org has no such plugin or version
 	 *
-	 * @return array<string, string>|null
+	 * @return array<string, string|list<string>>|null
 	 */
 	public function plugin(
 		string $slug,
@@ -150,7 +158,7 @@ class Checksums
 			return null;
 		}
 		
-		return $this->list('plugin_' . $slug . '_' . $version,
+		return $this->list(self::pluginKey($slug, $version),
 			sprintf(self::PLUGIN_API, rawurlencode($slug), rawurlencode($version)),
 			static function(array $decoded): ?array
 			{
@@ -164,10 +172,20 @@ class Checksums
 				foreach($decoded['files'] as $path => $sums)
 				{
 					$md5 = is_array($sums) ? ($sums['md5'] ?? null) : null;
+					$hashes = [];
 					
-					if(is_string($path) && is_string($md5))
+					// a version wordpress.org built more than once lists every md5 it shipped under
+					foreach(is_array($md5) ? $md5 : [$md5] as $hash)
 					{
-						$list[$path] = strtolower($md5);
+						if(is_string($hash) && preg_match('~^[0-9a-f]{32}$~i', $hash) === 1)
+						{
+							$hashes[] = strtolower($hash);
+						}
+					}
+					
+					if(is_string($path) && $hashes !== [])
+					{
+						$list[$path] = count($hashes) === 1 ? $hashes[0] : $hashes;
 					}
 				}
 				
@@ -175,19 +193,49 @@ class Checksums
 			});
 	}
 	
+	/**
+	 * Whether $md5 is what a list says for $key: its one md5, or any of the
+	 * several a plugin list may carry
+	 *
+	 * @param array<string, string|list<string>> $list
+	 */
+	public static function matches(
+		array $list,
+		string $key,
+		string $md5,
+	): bool
+	{
+		$expected = $list[$key] ?? null;
+		$md5 = strtolower($md5);
+		
+		return is_array($expected) ? in_array($md5, $expected, true) : $expected === $md5;
+	}
+	
+	/**
+	 * A plugin list's transient key; the shape suffix keeps a list cached
+	 * before several md5s per file were read from being used again
+	 */
+	protected static function pluginKey(
+		string $slug,
+		string $version,
+	): string
+	{
+		return 'plugin_' . $slug . '_' . $version . '_' . self::PLUGIN_SHAPE;
+	}
+	
 	public function pluginCached(
 		string $slug,
 		string $version,
 	): bool
 	{
-		return $this->cached('plugin_' . Inventory::slugOf($slug) . '_' . Inventory::version($version));
+		return $this->cached(self::pluginKey(Inventory::slugOf($slug), Inventory::version($version)));
 	}
 	
 	/**
 	 * The file names a list expects in one directory — the missing pass asks
 	 * this for every directory it walks and checks each name against disk
 	 *
-	 * @param array<string, string> $list the list as core() or plugin() returned it
+	 * @param array<string, string|list<string>> $list the list as core() or plugin() returned it
 	 * @param string $directory relative directory, '' for the list's root
 	 * @return list<string>
 	 */
