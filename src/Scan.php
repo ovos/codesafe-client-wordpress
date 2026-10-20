@@ -59,6 +59,7 @@ use function strrpos;
 use function strtolower;
 use function substr;
 use function time;
+use function token_get_all;
 use function trim;
 use function wp_get_environment_type;
 use function wp_get_upload_dir;
@@ -69,7 +70,15 @@ use const ABSPATH;
 use const DIRECTORY_SEPARATOR;
 use const PHP_URL_HOST;
 use const PHP_VERSION;
+use const PREG_OFFSET_CAPTURE;
 use const SCANDIR_SORT_NONE;
+use const T_BAD_CHARACTER;
+use const T_CLOSE_TAG;
+use const T_COMMENT;
+use const T_DOC_COMMENT;
+use const T_INLINE_HTML;
+use const T_OPEN_TAG;
+use const T_WHITESPACE;
 
 /**
  * Integrity scan — the static half of finding the file nobody shipped.
@@ -203,10 +212,13 @@ class Scan
 	
 	/**
 	 * A "Silence is golden." index.php — the stub WordPress and half its
-	 * plugins write into directories to stop listings: an opener, comments,
-	 * an optional closer, nothing else
+	 * plugins write into directories to stop listings — for a PHP built
+	 * without the tokenizer (stubShaped()): an opener, `//` and block comments,
+	 * a closer only at the very end. Stricter than PHP on purpose: a `//`
+	 * comment ends at CR or LF and holds no `?>`, and no `#` line passes, since
+	 * an attribute starts the same way
 	 */
-	protected const STUB = '~^\s*<\?php\s*(?:(?://|#)[^\n]*\s*)*(?:\?>)?\s*$~';
+	protected const STUB_STRICT = '~^\s*<\?php(?:\s|//(?:[^\r\n?]|\?(?!>))*+|/\*.*?\*/)*+(?:\?>\s*)?$~s';
 	
 	/**
 	 * Drop-ins and other wp-content files WordPress or a plugin writes, and
@@ -1303,7 +1315,7 @@ class Scan
 		
 		$head = $this->head($path, self::HEAD_BYTES);
 		
-		if($head !== null && (str_contains($head, '<?php') || str_contains($head, '<?=')))
+		if($head !== null && self::opensPhp($head))
 		{
 			$this->finding($state, $area, $path, 'polyglot', self::TIER_URGENT,
 				'PHP opener in a .' . $extension . ' file', $meta);
@@ -1879,7 +1891,89 @@ class Scan
 		
 		$head = $this->head($path, self::STUB_BYTES);
 		
-		return $head !== null && preg_match(self::STUB, $head) === 1;
+		return $head !== null && self::stubShaped($head);
+	}
+	
+	/**
+	 * Whether $source is a stub by what PHP would run: an opener, comments and
+	 * whitespace, an optional closer with only whitespace after it. The
+	 * tokenizer judges because a pattern cannot: PHP ends a `//` comment at a
+	 * bare CR or at `?>`, and a `#[` line is an attribute
+	 */
+	public static function stubShaped(
+		string $source,
+		?bool $tokenizer = null,
+	): bool
+	{
+		if(($tokenizer ?? function_exists('token_get_all')) === false)
+		{
+			return preg_match(self::STUB_STRICT, $source) === 1;
+		}
+		
+		// 0 before the opener, 1 inside PHP, 2 after the closer
+		$phase = 0;
+		
+		foreach(token_get_all($source) as $token)
+		{
+			$id = is_array($token) ? $token[0] : null;
+			
+			// whitespace around the PHP block is output, never code
+			if($phase !== 1 && $id === T_INLINE_HTML && trim($token[1]) === '')
+			{
+				continue;
+			}
+			
+			if($phase === 0 && $id === T_OPEN_TAG)
+			{
+				$phase = 1;
+			}
+			elseif($phase === 1 && $id === T_CLOSE_TAG)
+			{
+				$phase = 2;
+			}
+			elseif($phase !== 1 || in_array($id, [T_COMMENT, T_DOC_COMMENT, T_WHITESPACE], true) === false)
+			{
+				return false;
+			}
+		}
+		
+		return $phase !== 0;
+	}
+	
+	/**
+	 * Whether a media file's first block holds PHP that could run: an opener
+	 * (`<?php` in any case before whitespace, or `<?=`) whose code up to the
+	 * first closer has no byte PHP refuses. Such a byte fails the whole file's
+	 * compile, so the `<?=` that compressed image data happens to contain is no
+	 * shell. Without the tokenizer any opener counts
+	 */
+	public static function opensPhp(
+		string $head,
+		?bool $tokenizer = null,
+	): bool
+	{
+		if(preg_match('~<\?(?:php(?=\s|$)|=)~i', $head, $match, PREG_OFFSET_CAPTURE) !== 1)
+		{
+			return false;
+		}
+		
+		if(($tokenizer ?? function_exists('token_get_all')) === false)
+		{
+			return true;
+		}
+		
+		$code = substr($head, $match[0][1]);
+		$close = strpos($code, '?>');
+		
+		foreach(token_get_all($close === false ? $code : substr($code, 0, $close + 2)) as $token)
+		{
+			if(is_array($token) && $token[0] === T_BAD_CHARACTER)
+			{
+				return false;
+			}
+		}
+		
+		return true;
 	}
 	
 	/**
