@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use Ovos\Codesafe\Shield\Adapter;
+use Ovos\Codesafe\Shield\Prepend;
+
 use function apply_filters;
 use function array_pop;
 use function basename;
@@ -35,6 +38,7 @@ use function is_file;
 use function is_link;
 use function is_multisite;
 use function is_string;
+use function json_validate;
 use function max;
 use function md5_file;
 use function method_exists;
@@ -61,6 +65,7 @@ use function substr;
 use function time;
 use function token_get_all;
 use function trim;
+use function var_export;
 use function wp_get_environment_type;
 use function wp_get_upload_dir;
 use function wp_parse_url;
@@ -149,6 +154,9 @@ class Scan
 	protected const HEAD_BYTES = 1024;
 	
 	protected const STUB_BYTES = 256;
+	
+	/** the plugin's own store files are read whole up to this: the queue and the seen list are capped well below it */
+	protected const STORE_BYTES = 1048576;
 	
 	protected const DIRECTIVE_BYTES = 65536;
 	
@@ -307,6 +315,9 @@ class Scan
 	protected ?string $host = null;
 	
 	protected ?Checksums $sums = null;
+	
+	/** @var array{store: string, stub: string, legacy: string}|null */
+	protected ?array $store = null;
 	
 	/** the core list for this request, loaded once; false = unavailable this pass */
 	protected array|false|null $coreList = null;
@@ -931,10 +942,19 @@ class Scan
 		{
 			// only the top level of mu-plugins is loaded; deeper files are
 			// its includes and belong to the file that requires them
-			if($parent === $this->roots['mu'])
+			if($parent === $this->roots['mu'] && $this->ownMuPlugin($state, $path, $name, $size, $meta) === false)
 			{
 				$this->finding($state, 'content', $path, 'mu_plugin', self::TIER_INFO, '', $meta);
 			}
+			
+			return;
+		}
+		
+		$store = $this->storePaths();
+		
+		if(in_array($parent, [$this->normalize($store['store']), $this->normalize($store['stub']), $this->normalize($store['legacy'])], true))
+		{
+			$this->inspectStoreFile($state, $path, $name, $parent, $size, $meta);
 			
 			return;
 		}
@@ -996,6 +1016,116 @@ class Scan
 		}
 		
 		$this->finding($state, 'content', $path, 'content_php', self::TIER_HIGH, '', $meta);
+	}
+	
+	/**
+	 * The plugin's own store as Adapter::storePaths() names it, read once per
+	 * request
+	 *
+	 * @return array{store: string, stub: string, legacy: string}
+	 */
+	protected function storePaths(): array
+	{
+		return $this->store ??= Adapter::storePaths();
+	}
+	
+	/**
+	 * A PHP file in one of the plugin's store directories, judged by what the
+	 * plugin writes there: its prepend stub byte for byte (PHP may run it on
+	 * every request), the data files by their exit guard and JSON body, a
+	 * listing stub as anywhere. Any other PHP there is a stranger
+	 */
+	protected function inspectStoreFile(
+		array &$state,
+		string $path,
+		string $name,
+		string $parent,
+		int $size,
+		array $meta,
+	): void
+	{
+		$store = $this->storePaths()['store'];
+		$content = $size > self::STORE_BYTES ? null : $this->head($path, self::STORE_BYTES);
+		
+		if($name === Prepend::STUB && $content !== null)
+		{
+			// beside the data the stub runs against __DIR__; elsewhere it names the data's directory
+			$expression = $parent === $this->normalize($store) ? '__DIR__' : var_export($store, true);
+			
+			if($content === Prepend::stubText(Prepend::source(), $expression))
+			{
+				$state['areas']['content']['verified']++;
+				
+				return;
+			}
+			
+			if(str_contains($content, Prepend::STUB_MARKER))
+			{
+				$this->finding($state, 'content', $path, 'store_modified', self::TIER_URGENT,
+					'the plugin\'s prepend stub is not what it writes', $meta);
+					
+				return;
+			}
+		}
+		elseif(in_array($name, [Prepend::CONSENT, Prepend::QUEUE, Prepend::ENTRIES, Prepend::SEEN], true))
+		{
+			if($content !== null && str_starts_with($content, Prepend::GUARD) && json_validate(substr($content, strlen(Prepend::GUARD))))
+			{
+				$state['areas']['content']['verified']++;
+				
+				return;
+			}
+			
+			$this->finding($state, 'content', $path, 'store_modified', self::TIER_HIGH,
+				'the plugin\'s data file lacks its exit guard or JSON body', $meta);
+				
+			return;
+		}
+		elseif($name === 'index.php' && $this->isStub($path, $size))
+		{
+			return;
+		}
+		
+		$this->finding($state, 'content', $path, 'content_php', self::TIER_HIGH, '', $meta);
+	}
+	
+	/**
+	 * The plugin's early stage in mu-plugins: true when judged here — silent
+	 * when it is byte for byte what ensureMuPlugin() writes, URGENT when it
+	 * carries the marker and differs, since it runs on every request — false
+	 * for any other file, which is listed like every mu-plugin
+	 */
+	protected function ownMuPlugin(
+		array &$state,
+		string $path,
+		string $name,
+		int $size,
+		array $meta,
+	): bool
+	{
+		if($name !== Prepend::MU_PLUGIN || $size > self::STORE_BYTES)
+		{
+			return false;
+		}
+		
+		$content = $this->head($path, self::STORE_BYTES);
+		
+		if($content === null || str_contains($content, Prepend::MU_MARKER) === false)
+		{
+			return false;
+		}
+		
+		if($content === Prepend::muPluginText(Prepend::source(), var_export($this->storePaths()['store'], true)))
+		{
+			$state['areas']['content']['verified']++;
+			
+			return true;
+		}
+		
+		$this->finding($state, 'content', $path, 'store_modified', self::TIER_URGENT,
+			'the plugin\'s mu-plugin is not what it writes', $meta);
+			
+		return true;
 	}
 	
 	/**

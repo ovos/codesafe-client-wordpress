@@ -646,6 +646,29 @@ final class Adapter
 	}
 	
 	/**
+	 * The store's directories spelled as storeDir(), stubDir() and
+	 * legacyStub() spell them, creating nothing: the integrity scan reads the
+	 * store and may not write. The spelling matters, since the stub and the
+	 * mu-plugin carry the data directory's path as PHP source. '' for a
+	 * directory that cannot be named
+	 *
+	 * @return array{store: string, stub: string, legacy: string}
+	 */
+	public static function storePaths(): array
+	{
+		$content = defined('WP_CONTENT_DIR') ? rtrim((string)WP_CONTENT_DIR, '/\\') : '';
+		$stub = $content === '' ? '' : $content . DIRECTORY_SEPARATOR . self::DIR;
+		$named = defined('CODESAFE_STORE_DIR') ? rtrim(trim((string)constant('CODESAFE_STORE_DIR')), '/\\') : '';
+		
+		return [
+			// storeDir() falls back to the stub's directory when the named one cannot be written
+			'store' => $named !== '' && is_dir($named) && is_writable($named) ? $named : $stub,
+			'stub' => $stub,
+			'legacy' => $content === '' ? '' : $content . DIRECTORY_SEPARATOR . self::LEGACY_DIR,
+		];
+	}
+	
+	/**
 	 * Whether the store's data is out of the web's reach by its PLACE — the
 	 * CODESAFE_STORE_DIR directory, or a server that reads the deny .htaccess
 	 * (Apache, LiteSpeed). Elsewhere the files' GUARD and the ruleset's drawn
