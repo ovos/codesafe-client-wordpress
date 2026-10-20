@@ -4,7 +4,7 @@ Tags: error monitoring, error reporting, javascript errors, logging, debugging
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -90,6 +90,12 @@ Install ovos codesafe beside it and activate it. Its settings are copied, the ol
 Errors with their request context, redacted first: credentials, nonces, card and bank fields and password-reset keys dropped by field name, the request body parsed and cleaned (or off). E-mail addresses and usernames travel as written: codesafe masks them on arrival and keeps the original encrypted for an audited reveal — except a login name inside a failed-login line, which is masked here. Counters, never URLs or visitor data, for the rollups. The installed software list (versions, never paths or options) when you opt in. File paths, sizes and dates from the scan, never content. The matched fragment of a request the Shield flagged, capped at 200 bytes. Once a day, which of the plugin's own switches are on, and its version. Nothing is ever deleted or changed on the site.
 
 == Changelog ==
+
+= 1.0.1 =
+* **Security fix in the integrity scan.** Since 1.0.0 a PHP file could pass the scan as a harmless "silence is golden" stub while carrying code: PHP ends a `//` comment at a bare carriage return as well as at a newline, a `?>` inside a comment closes the PHP block and serves what follows, and a `#[` line is an attribute, not a comment. Under uploads and in wp-content subdirectories such a file was skipped without a finding. Stubs are now judged by PHP's own tokenizer. Update, then press **Scan now** under Settings → ovos codesafe: a file that slipped through before is reported on that pass.
+* **Fewer false findings.** The scan verifies the plugin's own store (`wp-content/ovos-codesafe/`) and its mu-plugin against what the plugin writes instead of reporting them; a file there that differs is `store_modified` (urgent for the prepend stub and the mu-plugin). A wp.org plugin file listed under several md5s (a version wordpress.org built more than once) matches any of them instead of being called foreign. A media file is reported for a PHP opener only where PHP could compile the code after it, so the `<?=` that compressed image data happens to contain is no longer urgent. PHP that stops before any code runs (an `exit` or `__halt_compiler()` first, as AIOS and W3 Total Cache write their data) is listed as `inert_php`, Ultimate Addons' icon-set data under uploads as `uploads_php_owned`, and AIOS's `aios-bootstrap.php` in the document root as owned while AIOS is installed.
+* **Cron checks on a loaded request.** The scan judges which scheduled hooks nobody listens to only on a request that loaded every plugin (WP-Cron, wp-admin or *Scan now*; any loaded request after a day), so a redirect that ends early no longer reports the hooks of active plugins as orphans. A cron row no longer carries its next run as a date.
+* No configuration change.
 
 = 1.0.0 =
 * First public release: PHP and JavaScript error reporting, security events, traffic rollups, the software inventory and auto-update on codesafe's word, the integrity scan, and the Shield — match, rate and virtual-patch rules and codesafe's threat addresses, judged before the other plugins load and optionally before WordPress. Every release is signed, and the plugin verifies the signature, and that the zip carries the version the release offers, before WordPress installs an update.
