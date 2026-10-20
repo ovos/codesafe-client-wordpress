@@ -589,7 +589,7 @@ class Entries
 	 * The three verdicts a list gives: not in it (foreign), in it with
 	 * another md5 (modified), in it byte for byte (shipped — learnt)
 	 *
-	 * @param array<string, string> $list
+	 * @param array<string, string|list<string>> $list
 	 * @return array{finding: ?array, learn: bool, wait: bool}
 	 */
 	protected function verify(
@@ -615,7 +615,7 @@ class Entries
 			$ran = is_string($now) ? strtolower($now) : '';
 		}
 		
-		if($ran === $list[$key])
+		if(Checksums::matches($list, $key, $ran))
 		{
 			return self::verdict(null, true);
 		}

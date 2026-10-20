@@ -1218,7 +1218,7 @@ class Scan
 	 *
 	 * @param string $key the list's own path for the file
 	 * @param string $kind core|plugin|theme — the detector family and its tier
-	 * @param array<string, string>|null $list the plugin's own list; null = core's
+	 * @param array<string, string|list<string>>|null $list the plugin's own list; null = core's
 	 */
 	protected function verify(
 		array &$state,
@@ -1262,7 +1262,7 @@ class Scan
 			return;
 		}
 		
-		if(strtolower($md5) === $list[$key])
+		if(Checksums::matches($list, $key, $md5))
 		{
 			$state['areas'][$area]['verified']++;
 			
