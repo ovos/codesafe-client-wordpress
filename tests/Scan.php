@@ -444,11 +444,15 @@ class Scan extends Test
 	
 	/**
 	 * RULE: the database phase runs only on a request that reached wp_loaded —
-	 * at once on a WP-Cron, admin or manual one, on any other only after a day
-	 * of waiting for one — and a pass that waits stays where it was.
+	 * at once on a WP-Cron or admin one, on any other only after a day of
+	 * waiting for one — and a pass that waits stays where it was. A manual
+	 * pass is judged by the request too: a visitor's request that finishes it
+	 * waits like any other, the button's own admin request runs it.
 	 * Falsify: drop the wp_loaded gate (an early-exiting request judges cron
 	 * listeners it never loaded); drop the day's fallback (a site without
-	 * cron or admin requests never finishes its pass).
+	 * cron or admin requests never finishes its pass); let a manual pass run
+	 * it anywhere (a visitor's request lists every listener an admin-only
+	 * plugin skips as an orphan).
 	 */
 	public function theDatabasePhaseWaitsForALoadedRequest(): bool
 	{
@@ -467,7 +471,11 @@ class Scan extends Test
 		$frontEnd = $scan->advance($early, 1000);
 		$frontEnd['database_deferred_since'] = time() - 86400;
 		$aDayLater = $scan->advance($frontEnd, 1000);
-		$manual = $scan->advance($fresh('manual'), 1000);
+		$visitor = $scan->advance($fresh('manual'), 1000);
+		
+		$GLOBALS['wp']['admin'] = true;
+		$button = $scan->advance($fresh('manual'), 1000);
+		$GLOBALS['wp']['admin'] = false;
 		
 		$GLOBALS['wp']['doing_cron'] = true;
 		$cron = $scan->advance($fresh('background'), 1000);
@@ -475,7 +483,8 @@ class Scan extends Test
 		return $early['phase'] === 0 && $early['done'] === false && isset($early['database_deferred_since']) === false
 			&& $frontEnd['phase'] === 0 && $frontEnd['done'] === false && isset($frontEnd['database_deferred_since'])
 			&& $aDayLater['done'] === true
-			&& $manual['done'] === true
+			&& $visitor['done'] === false && isset($visitor['database_deferred_since'])
+			&& $button['done'] === true
 			&& $cron['done'] === true;
 	}
 	
