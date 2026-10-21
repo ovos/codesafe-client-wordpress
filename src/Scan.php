@@ -1687,19 +1687,16 @@ class Scan
 	}
 	
 	/**
-	 * The database phase (WS3): the attacker's other filesystem, read by
-	 * Database — every finding an id, an option name or a hook, never a
-	 * name or a value
-	 */
-	/**
 	 * Whether this request may run the database phase. Its cron check asks
 	 * which hooks have a listener, and a plugin adds its listeners while
 	 * WordPress loads: a request that ended early (a language redirect that
 	 * exits at setup_theme) has heard of none of them, so the phase waits for
-	 * one that reached wp_loaded. It prefers a WP-Cron, admin or manual
-	 * request, where every plugin loads its listeners (some skip anonymous
-	 * front-end visitors); a site without either for a day runs it on the
-	 * next loaded request, or the pass would never finish
+	 * one that reached wp_loaded. It prefers a WP-Cron or admin request, where
+	 * every plugin loads its listeners (some skip anonymous front-end
+	 * visitors); the request is judged, never the pass: a manual pass is
+	 * finished by whatever requests come after the button's. A site without
+	 * either for a day runs it on the next loaded request, or the pass would
+	 * never finish
 	 */
 	protected function databaseReady(
 		array &$state,
@@ -1710,8 +1707,7 @@ class Scan
 			return false;
 		}
 		
-		if(($state['mode'] ?? '') === 'manual'
-			|| (function_exists('wp_doing_cron') && wp_doing_cron())
+		if((function_exists('wp_doing_cron') && wp_doing_cron())
 			|| (function_exists('is_admin') && is_admin()))
 		{
 			return true;
@@ -1722,6 +1718,11 @@ class Scan
 		return time() - (int)$state['database_deferred_since'] >= self::DATABASE_WAIT;
 	}
 	
+	/**
+	 * The database phase (WS3): the attacker's other filesystem, read by
+	 * Database — every finding an id, an option name or a hook, never a
+	 * name or a value
+	 */
 	protected function database(
 		array &$state,
 	): void
