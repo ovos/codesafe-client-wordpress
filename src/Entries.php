@@ -425,16 +425,22 @@ class Entries
 			return $this->finding('executed_hidden', Scan::TIER_URGENT, $area, $path, $record);
 		}
 		
+		// a stub runs no code: core's listing guards in wp-content/, plugins/
+		// and themes/, the ones plugins write under uploads; core and the
+		// document root keep their list and their owners
+		if(in_array($area, ['uploads', 'content', 'plugins', 'themes'], true) && $this->ranAsStub($file, $record))
+		{
+			return self::verdict(null, true);
+		}
+		
+		if(str_starts_with($relative, 'wp-content/') && $this->coreShipped($relative, $file, $record))
+		{
+			return self::verdict(null, true);
+		}
+		
 		switch($area)
 		{
 			case 'uploads':
-				$size = is_int($record['size'] ?? null) ? $record['size'] : (int)@filesize($file);
-				
-				if($this->scan()->isStub($file, $size))
-				{
-					return self::verdict(null, true);
-				}
-				
 				return $this->finding('executed_uploads', Scan::TIER_URGENT, $area, $path, $record);
 				
 			case 'plugins':
@@ -607,6 +613,23 @@ class Entries
 			return $this->finding('executed_' . $kind . '_foreign', Scan::TIER_URGENT, $area, $path, $record, 'not in the wordpress.org list for this version');
 		}
 		
+		if(Checksums::matches($list, $key, $this->ranMd5($file, $record)))
+		{
+			return self::verdict(null, true);
+		}
+		
+		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record, 'md5 as it ran differs from the wordpress.org list for this version');
+	}
+	
+	/**
+	 * The md5 of the bytes that ran: the layer's, taken as the file ran, or
+	 * the file's on disk when the layer took none; '' when neither is at hand
+	 */
+	protected function ranMd5(
+		string $file,
+		array $record,
+	): string
+	{
 		$ran = strtolower((string)($record['md5'] ?? ''));
 		
 		if($ran === '')
@@ -615,12 +638,56 @@ class Entries
 			$ran = is_string($now) ? strtolower($now) : '';
 		}
 		
-		if(Checksums::matches($list, $key, $ran))
+		return $ran;
+	}
+	
+	/**
+	 * Whether the file is a stub — an opener, comments, an optional closer —
+	 * and was one when it ran: a shell swapped for a stub after use has
+	 * another md5 than the one the layer took, and stays the shell
+	 */
+	protected function ranAsStub(
+		string $file,
+		array $record,
+	): bool
+	{
+		$size = @filesize($file);
+		
+		if(is_int($size) === false || $this->scan()->isStub($file, $size) === false)
 		{
-			return self::verdict(null, true);
+			return false;
 		}
 		
-		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record, 'md5 as it ran differs from the wordpress.org list for this version');
+		$now = @md5_file($file);
+		
+		return is_string($now) && strtolower($now) === $this->ranMd5($file, $record);
+	}
+	
+	/**
+	 * Whether core's own list names a wp-content file with the md5 it ran
+	 * with: the release package ships the listing guards, Hello Dolly,
+	 * Akismet and the default themes. Read only from a cached list, so a
+	 * drain never spends its one fetch here — the export needs the same list
+	 * before the watch records anything. A file the list names with another
+	 * md5 is no verdict: a bundled plugin or theme updates on its own
+	 */
+	protected function coreShipped(
+		string $relative,
+		string $file,
+		array $record,
+	): bool
+	{
+		$version = $this->coreVersion();
+		$locale = function_exists('get_locale') ? (string)get_locale() : 'en_US';
+		
+		if($this->sums()->coreCached($version, $locale) === false)
+		{
+			return false;
+		}
+		
+		$list = $this->sums()->core($version, $locale);
+		
+		return $list !== null && isset($list[$relative]) && Checksums::matches($list, $relative, $this->ranMd5($file, $record));
 	}
 	
 	/**
