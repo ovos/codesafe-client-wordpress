@@ -47,6 +47,12 @@ class Entries extends Test
 {
 	protected const string IP = '203.0.113.9';
 	
+	/** core's listing guard, byte for byte: wp-content/index.php, plugins/index.php, themes/index.php */
+	protected const string GOLDEN = "<?php\n// Silence is golden.\n";
+	
+	/** what a shell looked like as it ran, before a stub took its place */
+	protected const string SHELL = '<?php system($_GET[1]);';
+	
 	protected string $root;
 	
 	protected string $dir;
@@ -77,16 +83,22 @@ class Entries extends Test
 			'wp-admin/admin-ajax.php' => '<?php // core entry',
 			'wp-admin/evil.php' => '<?php // not in the core list',
 			'wp-includes/version.php' => 'v',
-			'wp-content/x.php' => '<?php // loose in wp-content',
+			// code, every one: a file of an opener and a comment is a stub, and runs nothing
+			'wp-content/x.php' => '<?php echo 1; // loose in wp-content',
 			'wp-content/.hidden/s.php' => '<?php // hidden',
 			'wp-content/uploads/2026/09/x.php' => 'x',
-			'wp-content/uploads/2026/index.php' => "<?php\n// Silence is golden.\n",
+			'wp-content/uploads/2026/index.php' => self::GOLDEN,
+			'wp-content/index.php' => self::GOLDEN,
+			'wp-content/themes/index.php' => self::GOLDEN,
+			'wp-content/plugins/index.php' => "<?php\n/**\n * Silence is golden.\n */\n?>\n",
 			'wp-content/plugins/akismet/akismet.php' => 'a',
-			'wp-content/plugins/akismet/inc.php' => '<?php // not in akismet\'s list',
-			'wp-content/plugins/premium/api.php' => '<?php // no list on wp.org',
-			'wp-content/plugins/hello.php' => '<?php // single-file plugin',
-			'wp-content/mu-plugins/m.php' => '<?php // must-use',
-			'wp-content/themes/t/f.php' => '<?php // a theme file',
+			'wp-content/plugins/akismet/inc.php' => '<?php echo 1; // not in akismet\'s list',
+			'wp-content/plugins/premium/api.php' => '<?php echo 1; // no list on wp.org',
+			'wp-content/plugins/hello.php' => '<?php echo 1; // single-file plugin',
+			'wp-content/mu-plugins/m.php' => '<?php echo 1; // must-use',
+			'wp-content/themes/t/f.php' => '<?php echo 1; // a theme file',
+			'wp-content/themes/twentytwentyfive/functions.php' => '<?php echo 1; // a default theme',
+			'wp-content/themes/twentytwentyfive/patterns.php' => '<?php echo 2; // updated since the release',
 			'wp-content/ovos-codesafe/index.php' => "<?php\n// silence is golden\n",
 		] as $path => $content)
 		{
@@ -176,10 +188,11 @@ class Entries extends Test
 	}
 	
 	/**
-	 * The plugin's judge with fixture lists: core vouches for admin-ajax.php
-	 * and version.php ('v'), akismet 5.7 for akismet.php ('a'); premium has
-	 * no list. `$cached` false makes every list cost a fetch, so the budget
-	 * of one shows
+	 * The plugin's judge with fixture lists: core vouches for admin-ajax.php,
+	 * version.php ('v') and two default-theme files (functions.php as it is
+	 * on disk, patterns.php as the release shipped it, not as it is now),
+	 * akismet 5.7 for akismet.php ('a'); premium has no list. `$cached` false
+	 * makes every list cost a fetch, so the budget of one shows
 	 *
 	 * @return BaseEntries&object{learnNow: callable}
 	 */
@@ -206,7 +219,9 @@ class Entries extends Test
 			{
 				$this->fetched++;
 				
-				return ['wp-admin/admin-ajax.php' => md5('<?php // core entry'), 'wp-includes/version.php' => md5('v')];
+				return ['wp-admin/admin-ajax.php' => md5('<?php // core entry'), 'wp-includes/version.php' => md5('v'),
+					'wp-content/themes/twentytwentyfive/functions.php' => md5('<?php echo 1; // a default theme'),
+					'wp-content/themes/twentytwentyfive/patterns.php' => md5('<?php echo 1; // as the release shipped it')];
 			}
 			
 			public function coreCached(
@@ -397,6 +412,48 @@ class Entries extends Test
 			&& $shell['learn'] === false
 			&& $stub['finding'] === null
 			&& $stub['learn'] === true;
+	}
+	
+	/**
+	 * The silence stub runs no code wherever core or a plugin left it —
+	 * core's guards in wp-content/, plugins/ and themes/ — and is judged on
+	 * the bytes that ran: a stub on disk that the layer saw run as other
+	 * bytes is the shell swapped out after use, and keeps its area's finding
+	 */
+	public function judgeTheSilenceStubWhereverItRan(): bool
+	{
+		$content = $this->judge('wp-content/index.php', $this->record(md5(self::GOLDEN)));
+		$themes = $this->judge('wp-content/themes/index.php', $this->record());
+		$plugins = $this->judge('wp-content/plugins/index.php', $this->record());
+		$swapped = $this->judge('wp-content/index.php', $this->record(md5(self::SHELL)));
+		$swappedUploads = $this->judge('wp-content/uploads/2026/index.php', $this->record(md5(self::SHELL)));
+		
+		return $content['finding'] === null && $content['learn'] === true
+			&& $themes['finding'] === null && $themes['learn'] === true
+			&& $plugins['finding'] === null && $plugins['learn'] === true
+			&& ($swapped['finding']['detector'] ?? '') === 'executed_content'
+			&& $swapped['finding']['tier'] === 'urgent'
+			&& ($swappedUploads['finding']['detector'] ?? '') === 'executed_uploads'
+			&& $swappedUploads['finding']['tier'] === 'urgent';
+	}
+	
+	/**
+	 * Core's list vouches for what the release ships under wp-content — a
+	 * default theme's file, byte for byte as it ran; a file it names with
+	 * other bytes (the theme updated since) is its area's to judge, and a
+	 * list not cached yet vouches for nothing and keeps nothing waiting
+	 */
+	public function judgeWhatCoreShipsUnderWpContent(): bool
+	{
+		$shipped = $this->judge('wp-content/themes/twentytwentyfive/functions.php', $this->record());
+		$updated = $this->judge('wp-content/themes/twentytwentyfive/patterns.php', $this->record());
+		$uncached = $this->judge('wp-content/themes/twentytwentyfive/functions.php', $this->record(), $this->entries(false));
+		
+		return $shipped['finding'] === null && $shipped['learn'] === true
+			&& ($updated['finding']['detector'] ?? '') === 'executed_unverified'
+			&& $updated['finding']['area'] === 'themes'
+			&& ($uncached['finding']['detector'] ?? '') === 'executed_unverified'
+			&& $uncached['wait'] === false;
 	}
 	
 	public function judgeRootContentAndHiddenPaths(): bool

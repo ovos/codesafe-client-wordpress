@@ -483,16 +483,28 @@ wordpress.org's list for that root know it, with the md5 **as it ran**:
 
 | the executed file | detector | tier proposed |
 |---|---|---|
-| under uploads (not a *silence is golden* stub) | `executed_uploads` | urgent |
+| under uploads | `executed_uploads` | urgent |
 | in the document root, not a core root file, no installed owner | `executed_root` | urgent |
 | in a directory of its own under the root (a second application?) | `executed_root` | high |
 | a plugin's own root file (`wordfence-waf.php`) | `executed_root_owned` | info, once |
 | a hidden path segment anywhere | `executed_hidden` | urgent |
-| loose in `wp-content` | `executed_content` | urgent |
+| loose in `wp-content`, and not a file core ships there | `executed_content` | urgent |
 | under `wp-admin` / `wp-includes`, not in the core list / md5 differs | `executed_core_foreign` / `executed_core_modified` | urgent |
 | in a wp.org plugin, not in its list / md5 differs | `executed_plugin_foreign` / `executed_plugin_modified` | urgent |
 | a premium or custom plugin, a single-file plugin, a theme, a must-use plugin | `executed_unverified` | info, once |
 | recorded, but gone by the time the judge looks | `executed_vanished` | urgent |
+
+Two answers come before the table, anywhere under `wp-content`. A *silence is
+golden* stub — an opener, comments, an optional closer, judged by PHP's own
+tokenizer — runs no code: core's listing guards in `wp-content/`, `plugins/`
+and `themes/`, the ones plugins write under uploads. It is judged on the bytes
+**as they ran**: a stub on disk that the layer saw run with another md5 is a
+shell swapped out after use, and keeps its row. And a file core's own checksum
+list names with the md5 it ran with — the guards, Hello Dolly, Akismet, the
+default themes as the release ships them — is shipped. That list is read only
+once it is cached (the watch needs it before it records anything), and a file
+it names with other bytes is no verdict, since a bundled plugin or theme
+updates on its own: the table decides.
 
 Executed is a stronger fact than present: where the scan says *high* for a
 plugin's foreign file, this proposes *urgent*. The console decides, as it does
