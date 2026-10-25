@@ -1102,6 +1102,7 @@ class Inventory
 		// the next request's inventory says it took
 		$this->markDirty();
 		
+		// codesafe's word, not the visitor's: the request this runs on caused none of it
 		if($this->sender !== null)
 		{
 			foreach($added as [$type, $slug, $reason])
@@ -1113,7 +1114,8 @@ class Inventory
 				
 				$this->sender->reportRefusal('privileged_action',
 					'auto-update enabled for ' . ($type === 'theme' ? 'theme ' : '') . $slug . ' (' . self::REASONS[$reason] . ')',
-					['action' => 'auto_update_enabled', 'type' => $type, 'reason' => $reason]);
+					['action' => 'auto_update_enabled', 'type' => $type, 'reason' => $reason],
+					Sender::withoutRequest());
 			}
 			
 			if($override !== null)
@@ -1121,21 +1123,24 @@ class Inventory
 				$this->sender->reportRefusal('privileged_action',
 					'auto-update enabled for WordPress core, minor releases (' . self::REASONS[$coreReason] . ')'
 						. ($override ? ' — WP_AUTO_UPDATE_CORE is false on this site, overridden for minor releases only' : ''),
-					['action' => 'auto_update_enabled', 'type' => 'core', 'reason' => $coreReason, 'override' => $override]);
+					['action' => 'auto_update_enabled', 'type' => 'core', 'reason' => $coreReason, 'override' => $override],
+					Sender::withoutRequest());
 			}
 			
 			foreach($removed as [$type, $slug])
 			{
 				$this->sender->reportRefusal('privileged_action',
 					'auto-update disabled for ' . ($type === 'theme' ? 'theme ' : '') . $slug . ' (switched off by an operator in codesafe)',
-					['action' => 'auto_update_disabled', 'type' => $type]);
+					['action' => 'auto_update_disabled', 'type' => $type],
+					Sender::withoutRequest());
 			}
 			
 			if($withdrawn)
 			{
 				$this->sender->reportRefusal('privileged_action',
 					'auto-update disabled for WordPress core, minor releases — codesafe\'s override withdrawn',
-					['action' => 'auto_update_disabled', 'type' => 'core']);
+					['action' => 'auto_update_disabled', 'type' => 'core'],
+					Sender::withoutRequest());
 			}
 			
 			// the Sender's own shutdown flush already ran — this handler

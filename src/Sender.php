@@ -424,6 +424,19 @@ class Sender
 	}
 	
 	/**
+	 * reportRefusal()'s per-event context for an action no visitor's request
+	 * caused — codesafe's own word applied at the end of whatever request read
+	 * it: every request-bound key unanswered, so the event names no address,
+	 * page or account that had nothing to do with it
+	 *
+	 * @return array<string, null>
+	 */
+	public static function withoutRequest(): array
+	{
+		return array_fill_keys(self::REQUEST_BOUND, null);
+	}
+	
+	/**
 	 * One security event onto the queue, past every gate — reportRefusal's
 	 * own, and summariseSecurity's for a window that closed over its budget
 	 */
