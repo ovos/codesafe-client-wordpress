@@ -8,6 +8,8 @@ namespace Ovos\Codesafe;
 use ErrorException;
 use Throwable;
 
+use function array_fill_keys;
+use function array_filter;
 use function array_keys;
 use function array_map;
 use function array_replace;
@@ -128,6 +130,13 @@ class Sender
 	
 	/** the one transient that holds every kind's window: {kind: {start, count, over}} */
 	protected const SECURITY_RATE_KEY = 'ovos_codesafe_security_rate';
+	
+	/**
+	 * The context keys only the request itself can answer: a report another
+	 * request queued (its context carries `at`) takes none of them from the
+	 * request sending it — host and dir are the site's and stay
+	 */
+	protected const REQUEST_BOUND = ['uri', 'method', 'referer', 'ip', 'ua', 'status', 'sessionId', 'userId', 'traceId', 'request'];
 	
 	protected const MAX_QUEUE = 100;
 	
@@ -460,6 +469,9 @@ class Sender
 			if(is_int($at) && $at > 0)
 			{
 				$payload['timestamp'] = gmdate('c', $at);
+				// what that request did not carry stays unanswered: a null
+				// keeps decorate() from filling it with the sender's own
+				$context += array_fill_keys(self::REQUEST_BOUND, null);
 			}
 			if($context !== [])
 			{
@@ -756,8 +768,10 @@ class Sender
 		// be told apart from a healthy one without opening the site
 		$payload['client'] = 'wordpress/' . Plugin::VERSION;
 		// a per-event context (reportRefusal's fourth argument) wins over the
-		// base built at the flush — the identity a caller knew at its moment
-		$payload['context'] = array_replace($context['context'], $payload['context'] ?? [])
+		// base built at the flush — the identity a caller knew at its moment;
+		// its null removes the base's answer (a report another request queued)
+		$payload['context'] = array_filter(array_replace($context['context'], $payload['context'] ?? []),
+				static fn(mixed $value): bool => $value !== null)
 			+ ['extra' => Redactor::scrub($payload['extra'], identities: false) + $this->buildWpExtra($payload)];
 		unset($payload['extra']);
 		

@@ -11,9 +11,13 @@ use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Test;
 use Ovos\Test\Internal;
 
+use function array_key_exists;
 use function array_keys;
+use function array_replace;
 use function count;
 use function dirname;
+use function escapeshellarg;
+use function exec;
 use function file_put_contents;
 use function is_dir;
 use function is_file;
@@ -30,6 +34,7 @@ use function uniqid;
 use function unlink;
 
 use const DIRECTORY_SEPARATOR;
+use const PHP_BINARY;
 
 // the layer's file brings the kernel classes the way the stub does
 require_once __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Shield' . DIRECTORY_SEPARATOR . 'Prepend.php';
@@ -52,6 +57,12 @@ class Entries extends Test
 	
 	/** what a shell looked like as it ran, before a stub took its place */
 	protected const string SHELL = '<?php system($_GET[1]);';
+	
+	/** W3 Total Cache's config: an exit, then the data */
+	protected const string W3TC = "<?php exit; ?>{\"pgcache.enabled\":false}";
+	
+	/** AIOS's firewall settings: halted, then the data */
+	protected const string HALTED = "<?php __halt_compiler();{\"rules\":[]}";
 	
 	protected string $root;
 	
@@ -100,6 +111,10 @@ class Entries extends Test
 			'wp-content/themes/twentytwentyfive/functions.php' => '<?php echo 1; // a default theme',
 			'wp-content/themes/twentytwentyfive/patterns.php' => '<?php echo 2; // updated since the release',
 			'wp-content/ovos-codesafe/index.php' => "<?php\n// silence is golden\n",
+			'wp-content/w3tc-config/master.php' => self::W3TC,
+			'wp-content/uploads/aios/settings.php' => self::HALTED,
+			// the exit runs system() first: no guard
+			'wp-content/guarded.php' => "<?php exit(system('id')); ?>",
 		] as $path => $content)
 		{
 			$file = $this->root . '/' . $path;
@@ -333,6 +348,56 @@ class Entries extends Test
 			&& count(Prepend::seen($this->dir)['paths']) === 1;
 	}
 	
+	/**
+	 * The status is the request's own, onto its record: an HTTP status only,
+	 * and never onto a later hit's facts. The record holds exactly what
+	 * contextOf() built, which is what the layer hands its shutdown function
+	 */
+	public function theStatusIsTheRequestsOwn(): bool
+	{
+		$this->clearQueue();
+		$consent = $this->consent();
+		$relative = 'wp-content/x.php';
+		Prepend::entry($this->dir, $this->server($relative, 'a=1'), $consent);
+		$first = Prepend::seen($this->dir)['paths'][$relative]['context'];
+		$built = array_replace(Prepend::contextOf($this->server($relative, 'a=1'), null, self::IP), ['at' => $first['at']]);
+		Prepend::recordStatus($this->dir, $relative, $first, false);
+		Prepend::recordStatus($this->dir, $relative, $first, 1000);
+		$none = Prepend::seen($this->dir)['paths'][$relative]['context'];
+		Prepend::recordStatus($this->dir, $relative, $first, 200);
+		$own = Prepend::seen($this->dir)['paths'][$relative]['context'];
+		Prepend::entry($this->dir, ['REMOTE_ADDR' => '198.51.100.7'] + $this->server($relative, 'a=2'), $consent);
+		Prepend::recordStatus($this->dir, $relative, $first, 404);
+		$later = Prepend::seen($this->dir)['paths'][$relative]['context'];
+		
+		return $first === $built
+			&& array_key_exists('status', $none) === false
+			&& $own['status'] === 200
+			&& $own['uri'] === '/wp-content/x.php?a=1'
+			&& $later['ip'] === '198.51.100.7'
+			&& array_key_exists('status', $later) === false;
+	}
+	
+	/**
+	 * The status is written when the request ends, by the shutdown function
+	 * the layer registers — a PHP of its own records a stranger and answers 404
+	 */
+	public function theStatusIsWrittenWhenTheRequestEnds(): bool
+	{
+		$this->clearQueue();
+		$relative = 'wp-content/x.php';
+		$output = [];
+		exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . 'files' . DIRECTORY_SEPARATOR . 'entry-status.file.php')
+			. ' ' . escapeshellarg($this->dir) . ' ' . escapeshellarg($this->root) . ' ' . escapeshellarg($relative) . ' 404 2>&1', $output, $exit);
+		$record = Prepend::seen($this->dir)['paths'][$relative] ?? null;
+		
+		return $exit === 0
+			&& $output === []
+			&& $record !== null
+			&& $record['n'] === 1
+			&& ($record['context']['status'] ?? null) === 404;
+	}
+	
 	public function withoutTheSwitchOrTheKnownSetNothingIsRecorded(): bool
 	{
 		$off = Prepend::entry($this->dir, $this->server('about.php'), $this->consent(false));
@@ -454,6 +519,38 @@ class Entries extends Test
 			&& $updated['finding']['area'] === 'themes'
 			&& ($uncached['finding']['detector'] ?? '') === 'executed_unverified'
 			&& $uncached['wait'] === false;
+	}
+	
+	/**
+	 * A plugin's data file under a PHP name stops before any code runs — W3
+	 * Total Cache's config loose in wp-content, AIOS's settings under uploads
+	 * — and is listed the way the scan lists it. Judged on the bytes that
+	 * ran: the same file seen run as a shell keeps its area's finding, and an
+	 * exit that runs code first guards nothing
+	 */
+	public function judgeAnInertFileThatRan(): bool
+	{
+		$config = $this->judge('wp-content/w3tc-config/master.php', $this->record(md5(self::W3TC)));
+		$settings = $this->judge('wp-content/uploads/aios/settings.php', $this->record());
+		$swapped = $this->judge('wp-content/w3tc-config/master.php', $this->record(md5(self::SHELL)));
+		$swappedUploads = $this->judge('wp-content/uploads/aios/settings.php', $this->record(md5(self::SHELL)));
+		$guarded = $this->judge('wp-content/guarded.php', $this->record());
+		
+		return ($config['finding']['detector'] ?? '') === 'inert_php'
+			&& $config['finding']['tier'] === 'info'
+			&& $config['finding']['area'] === 'content'
+			&& $config['finding']['path'] === 'w3tc-config/master.php'
+			&& str_contains((string)$config['finding']['detail'], 'stops before any code runs')
+			&& $config['learn'] === true
+			&& ($settings['finding']['detector'] ?? '') === 'inert_php'
+			&& $settings['finding']['area'] === 'uploads'
+			&& $settings['learn'] === true
+			&& ($swapped['finding']['detector'] ?? '') === 'executed_content'
+			&& $swapped['finding']['tier'] === 'urgent'
+			&& $swapped['learn'] === false
+			&& ($swappedUploads['finding']['detector'] ?? '') === 'executed_uploads'
+			&& ($guarded['finding']['detector'] ?? '') === 'executed_content'
+			&& $guarded['finding']['tier'] === 'urgent';
 	}
 	
 	public function judgeRootContentAndHiddenPaths(): bool
