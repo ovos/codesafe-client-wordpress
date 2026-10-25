@@ -172,8 +172,8 @@ class Scan
 	/** the plugin's own store files are read whole up to this: the queue and the seen list are capped well below it */
 	protected const STORE_BYTES = 1048576;
 	
-	/** a PHP-named data file is read whole up to this to judge it; a larger one is not judged data */
-	protected const DATA_BYTES = 262144;
+	/** a PHP-named data file is read whole up to this to judge it; a larger one is not judged data (the executed-file judge reads the same) */
+	public const DATA_BYTES = 262144;
 	
 	/** how long the database phase waits for a WP-Cron or admin request before any loaded one will do */
 	protected const DATABASE_WAIT = 86400;

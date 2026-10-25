@@ -16,6 +16,7 @@ use function defined;
 use function delete_option;
 use function explode;
 use function fastcgi_finish_request;
+use function file_get_contents;
 use function filesize;
 use function function_exists;
 use function get_bloginfo;
@@ -30,6 +31,7 @@ use function is_int;
 use function is_string;
 use function max;
 use function mb_substr;
+use function md5;
 use function md5_file;
 use function microtime;
 use function preg_match;
@@ -441,6 +443,11 @@ class Entries
 		switch($area)
 		{
 			case 'uploads':
+				if($this->ranInert($file, $record))
+				{
+					return $this->finding('inert_php', Scan::TIER_INFO, $area, $path, $record, 'stops before any code runs', true);
+				}
+				
 				return $this->finding('executed_uploads', Scan::TIER_URGENT, $area, $path, $record);
 				
 			case 'plugins':
@@ -464,6 +471,12 @@ class Entries
 				{
 					// must-use plugins are custom code by definition
 					return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'a must-use plugin — no list vouches for it', true);
+				}
+				
+				// a plugin's data file under a PHP name (W3 Total Cache's config): the scan lists it as inert too
+				if($this->ranInert($file, $record))
+				{
+					return $this->finding('inert_php', Scan::TIER_INFO, $area, $path, $record, 'stops before any code runs', true);
 				}
 				
 				return $this->finding('executed_content', Scan::TIER_URGENT, $area, $path, $record);
@@ -661,6 +674,28 @@ class Entries
 		$now = @md5_file($file);
 		
 		return is_string($now) && strtolower($now) === $this->ranMd5($file, $record);
+	}
+	
+	/**
+	 * Whether PHP stops before any code in the file runs (Scan::inert()) and
+	 * did so when it ran: the md5 is taken of the very bytes judged, held
+	 * against the one the layer took
+	 */
+	protected function ranInert(
+		string $file,
+		array $record,
+	): bool
+	{
+		$size = @filesize($file);
+		
+		if(is_int($size) === false || $size > Scan::DATA_BYTES)
+		{
+			return false;
+		}
+		
+		$source = @file_get_contents($file, false, null, 0, Scan::DATA_BYTES);
+		
+		return is_string($source) && Scan::inert($source) && md5($source) === $this->ranMd5($file, $record);
 	}
 	
 	/**

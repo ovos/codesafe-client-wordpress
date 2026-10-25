@@ -445,8 +445,9 @@ verdict is handed to the plugin to report with the request's full context
 (one verdict, one count, one report per request); a block's report — and an
 observe verdict on a request WordPress never loads for, such as a direct hit
 on a plugin file — is queued with that request's own URI, address, user agent,
-status and time, and sent on the site's next request wearing them, not the
-next request's. The stub lives outside the plugin
+status and time, and sent on the site's next request wearing them and nothing
+of the next request's — not its status, session, signed-in account or trace.
+The stub lives outside the plugin
 directory and includes the plugin only if it is still there, so removing the
 plugin never leaves PHP with a missing prepend file — a fatal on every
 request — and everything fails open. The plugin never edits server
@@ -467,7 +468,8 @@ string comparison, no file read. A `wp-admin` page or a plugin's own endpoint
 reads one small JSON file — the *known set* — and is done. Only a stranger
 writes: its path, hit count, first and last time, and the file as it was when
 it ran (size, mtime, md5 — the evidence that survives its deletion), with the
-last request's address, URI, user agent and method.
+last request's address, URI, user agent and method, and the HTTP status that
+request ended with, written as it ends.
 
 What decides *known*: wp-admin's entry scripts come from the wordpress.org
 core checksum list for the running version, never from a pattern
@@ -489,6 +491,7 @@ wordpress.org's list for that root know it, with the md5 **as it ran**:
 | a plugin's own root file (`wordfence-waf.php`) | `executed_root_owned` | info, once |
 | a hidden path segment anywhere | `executed_hidden` | urgent |
 | loose in `wp-content`, and not a file core ships there | `executed_content` | urgent |
+| under uploads or loose in `wp-content`, stopping before any code runs (an `exit` or `__halt_compiler()` first, as W3 Total Cache and AIOS write their data), judged on the bytes as they ran | `inert_php` | info, once |
 | under `wp-admin` / `wp-includes`, not in the core list / md5 differs | `executed_core_foreign` / `executed_core_modified` | urgent |
 | in a wp.org plugin, not in its list / md5 differs | `executed_plugin_foreign` / `executed_plugin_modified` | urgent |
 | a premium or custom plugin, a single-file plugin, a theme, a must-use plugin | `executed_unverified` | info, once |
@@ -519,7 +522,8 @@ ledger, INBOX case, mail and chat digest, removal advice and it-came-back
 logic are the scan's. Beside it, **one security event per foreign file**
 (kind `file_executed`, `extra.source` uploads or unknown, `extra.file`,
 `extra.hits`, `extra.md5`, `extra.layer: prepend`) wearing the last
-request's own facts, so the address that ran it scores as an offender and
+request's own facts and nothing of the request that sends it, so the address
+that ran it scores as an offender and
 joins the attack waves. Info rows are listed, not scored.
 
 Consent: the *Executed-file watch* box (on by default — pointing PHP at the

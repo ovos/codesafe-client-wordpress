@@ -831,8 +831,13 @@ final class Prepend
 			{
 				return null;
 			}
-			self::record($dir, $relative, $file, $server, $now ?? time(),
+			$context = self::record($dir, $relative, $file, $server, $now ?? time(),
 				self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])));
+			if($context !== null)
+			{
+				// the status exists only once the file ran: written at this request's end
+				register_shutdown_function(static fn() => self::recordStatus($dir, $relative, $context, http_response_code()));
+			}
 			
 			return $relative;
 		}
@@ -931,6 +936,7 @@ final class Prepend
 	 * is right now, before whatever it does
 	 *
 	 * @param array<string, mixed> $server
+	 * @return ?array<string, mixed> the facts it stored (contextOf()), null when the queue was full
 	 */
 	protected static function record(
 		string $dir,
@@ -939,7 +945,7 @@ final class Prepend
 		array $server,
 		int $now,
 		string $ip = '',
-	): void
+	): ?array
 	{
 		$path = $dir . DIRECTORY_SEPARATOR . self::SEEN;
 		$seen = self::seen($dir);
@@ -969,6 +975,41 @@ final class Prepend
 			];
 		}
 		self::write($path, $seen);
+		
+		return isset($seen['paths'][$relative]) ? $context : null;
+	}
+	
+	/**
+	 * The status the request that ran a recorded file ended with, onto its
+	 * record — only while the record still holds that request's context: a
+	 * later hit's facts, or a record the judge took meanwhile, stay as they are.
+	 * Never throws
+	 */
+	public static function recordStatus(
+		string $dir,
+		string $relative,
+		array $context,
+		int|false $status,
+	): void
+	{
+		try
+		{
+			if(is_int($status) === false || $status < 100 || $status > 599)
+			{
+				return;
+			}
+			$seen = self::seen($dir);
+			if(($seen['paths'][$relative]['context'] ?? null) !== $context)
+			{
+				return;
+			}
+			$seen['paths'][$relative]['context']['status'] = $status;
+			self::write($dir . DIRECTORY_SEPARATOR . self::SEEN, $seen);
+		}
+		catch(Throwable)
+		{
+			// a recorder: the status is a detail, the record stands without it
+		}
 	}
 	
 	/**
