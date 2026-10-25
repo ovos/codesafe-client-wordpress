@@ -218,6 +218,8 @@ class Inventory extends Test
 			]
 			&& $first[0][0] === 'privileged_action'
 			&& $first[0][2] === ['action' => 'auto_update_enabled', 'type' => 'plugin', 'reason' => 'requested']
+			// codesafe's word, never the visitor's request it happened to run on
+			&& array_column($first, 3) === [Sender::withoutRequest(), Sender::withoutRequest(), Sender::withoutRequest()]
 			&& count($inventory->sender->said) === 3
 			&& $inventory->sender->flushed === 1;
 	}
@@ -431,6 +433,7 @@ class Inventory extends Test
 			&& array_column($overridden, 1) === ['auto-update enabled for WordPress core, minor releases (requested by an operator in codesafe)'
 				. ' — WP_AUTO_UPDATE_CORE is false on this site, overridden for minor releases only']
 			&& $overridden[0][2] === ['action' => 'auto_update_enabled', 'type' => 'core', 'reason' => 'requested', 'override' => true]
+			&& $overridden[0][3] === Sender::withoutRequest()
 			&& ($flag['reason'] ?? null) === 'requested'
 			&& $dirty === 1
 			&& array_column($plain->sender->said, 1) === ['auto-update enabled for WordPress core, minor releases (vulnerable and probed, per codesafe)']
@@ -477,6 +480,7 @@ class Inventory extends Test
 			]
 			&& $inventory->sender->said[0][0] === 'privileged_action'
 			&& $inventory->sender->said[1][2] === ['action' => 'auto_update_disabled', 'type' => 'theme']
+			&& array_column($inventory->sender->said, 3) === [Sender::withoutRequest(), Sender::withoutRequest()]
 			&& ($GLOBALS['wp']['options'][self::DIRTY] ?? null) === 1
 			&& $inventory->sender->flushed === 1;
 	}
@@ -502,6 +506,7 @@ class Inventory extends Test
 			&& $GLOBALS['wp']['options']['auto_update_core_minor'] === 'enabled'
 			&& array_column($said, 1) === ['auto-update disabled for WordPress core, minor releases — codesafe\'s override withdrawn']
 			&& $said[0][2] === ['action' => 'auto_update_disabled', 'type' => 'core']
+			&& $said[0][3] === Sender::withoutRequest()
 			&& $again->sender->said === [];
 	}
 	
@@ -674,7 +679,7 @@ class Inventory extends Test
 			'api_key' => str_repeat('a', 64)];
 		$sender = new class extends Sender
 		{
-			/** @var list<array{0: string, 1: string, 2: array}> */
+			/** @var list<array{0: string, 1: string, 2: array, 3: array}> */
 			public array $said = [];
 			
 			public int $flushed = 0;
@@ -691,7 +696,7 @@ class Inventory extends Test
 				?int $priority = null,
 			): void
 			{
-				$this->said[] = [$kind, $message, $extra];
+				$this->said[] = [$kind, $message, $extra, $context];
 			}
 			
 			public function flush(): void

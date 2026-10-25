@@ -103,6 +103,36 @@ class SenderRefusal extends Test
 			&& $mine['uri'] === '/de/';
 	}
 	
+	/**
+	 * An action no visitor caused — codesafe's own word applied on whatever
+	 * request read it — names no request at all: of the sending request's base
+	 * only the site's host and directory stay
+	 */
+	public function anActionNoRequestCausedNamesNoRequest(): bool
+	{
+		$sender = $this->sender();
+		$sender->reportRefusal('privileged_action', 'auto-update enabled for hello', ['action' => 'auto_update_enabled'],
+			Sender::withoutRequest());
+		$base = [
+			'dir' => '/srv/site',
+			'traceId' => 'abc123',
+			'host' => 'site.test',
+			'uri' => '/index.php?controller=../../etc/passwd',
+			'method' => 'GET',
+			'referer' => 'https://site.test/',
+			'ip' => '198.51.100.7',
+			'ua' => 'Mozilla/5.0',
+			'status' => 200,
+			'sessionId' => 's1',
+			'userId' => '1',
+			'request' => ['get' => ['controller' => '../../etc/passwd']],
+		];
+		$context = $sender->decorated($sender->queued()[0], $base)['context'];
+		unset($context['extra']);
+		
+		return $context === ['dir' => '/srv/site', 'host' => 'site.test'];
+	}
+	
 	public function aRefusalCarriesThePriorityTheSiteNamesAndInfoWithoutOne(): bool
 	{
 		$sender = $this->sender();

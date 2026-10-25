@@ -251,7 +251,10 @@ moment whether it may:
 Each switch-on is a `privileged_action` security event: "auto-update
 enabled for WordPress core, minor releases (requested by an operator in
 codesafe) — WP_AUTO_UPDATE_CORE is false on this site, overridden for minor
-releases only". WordPress then installs the minor release at its own
+releases only". Every such line codesafe's word caused (on, off, the override
+and its withdrawal) names no request: it is applied at the end of whatever
+request read the answer, and that visitor's address, page, session and
+account had nothing to do with it. WordPress then installs the minor release at its own
 twice-daily check, with its own compatibility and filesystem checks; the
 inventory's `core` block says the new policy at once and the new version
 once it landed. Not reported: whether WordPress has the filesystem
