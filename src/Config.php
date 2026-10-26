@@ -79,7 +79,8 @@ class Config
 	 * main site's word counts, and only a super admin may give it (security
 	 * audit 2026-10-03 M14); the trusted proxy rides the same consent file
 	 */
-	public const NETWORK_KEYS = ['shield_detect', 'shield_enforce', 'entry_watch', 'trusted_proxy_header', 'trusted_proxies'];
+	public const NETWORK_KEYS = ['shield_detect', 'shield_enforce', 'entry_watch', 'trusted_proxy_header', 'trusted_proxies',
+		'inventory', 'auto_update_vulnerable', 'scan', 'scan_interval'];
 	
 	/**
 	 * The CIDR ranges `cloudflare` stands for in trusted_proxies — Cloudflare's
@@ -183,7 +184,8 @@ class Config
 	
 	public function inventory(): bool
 	{
-		return (bool)$this->get('inventory');
+		// the network's plugin and theme lists: on a network the main site's to send
+		return (bool)$this->get('inventory') && $this->ownsSharedStore();
 	}
 	
 	/**
@@ -193,7 +195,8 @@ class Config
 	 */
 	public function autoUpdateVulnerable(): bool
 	{
-		return (bool)$this->get('auto_update_vulnerable');
+		// it writes the network's auto-update options: on a network the main site's
+		return (bool)$this->get('auto_update_vulnerable') && $this->ownsSharedStore();
 	}
 	
 	public function securityEvents(): bool
@@ -328,7 +331,8 @@ class Config
 	 */
 	public function scan(): bool
 	{
-		return (bool)$this->get('scan');
+		// one docroot for the whole network: on a network the main site's to walk
+		return (bool)$this->get('scan') && $this->ownsSharedStore();
 	}
 	
 	/**

@@ -144,6 +144,13 @@
 		/pwd|secret|authorization|cookie|api[_-]?key|jwt|bearer|signature|wpnonce|rp[_-]?key|card[_-]?(?:code|cvc|cvv)|security[_-]?code/i,
 		/(?:^|[^A-Za-z])[Nn][Oo][Nn][Cc][Ee]|Nonce/,
 		/(?:^|[^A-Za-z])(?:[Cc][Vv][Vv]2?|[Cc][Vv][Cc]2?|[Cc][Ss][Cc]|[Cc][Cc][Vv])(?![a-z])/,
+		// the credentials beside password and token: a passphrase, a credential,
+		// the keys that name what they unlock, a second factor's backup and auth
+		// codes, a CSRF value — no ordinary name contains them
+		/passphrase|credential|(?:private|access|consumer|licen[cs]e|encryption|signing)[_-]?key|backup[_-]?codes?|auth[_-]?code|csrf|xsrf/i,
+		// a second factor's one-time code only as a word of the name: otpaper
+		// stays, and so does a build hash (e02fa5) — `2fa` is all hex
+		/(?:^|[^A-Za-z0-9])(?:[Oo][Tt][Pp]|[Tt][Oo][Tt][Pp]|[Mm][Ff][Aa]|2[Ff][Aa])(?:[_-]?[Cc][Oo][Dd][Ee][Ss]?)?(?![a-z0-9])/,
 	];
 	// Scrubber::QUERY_NAMES — secrets only as a WHOLE query parameter name
 	var QUERY_NAMES = ['key', 'auth', 'code', 'sig', 'signature', 'otp', 'pin', 'hash'];

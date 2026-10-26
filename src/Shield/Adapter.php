@@ -276,7 +276,8 @@ final class Adapter
 			$xmlrpc = defined('XMLRPC_REQUEST') && constant('XMLRPC_REQUEST') === true;
 			// plugins_loaded runs before wp_magic_quotes(): the superglobals are still unslashed
 			$caller = self::caller($_SERVER, $_GET, $_POST, $signedIn, self::servesRest($_SERVER, $_GET, $_POST, $restPrefix), $xmlrpc);
-			$request = [$_SERVER, $_GET, $_POST, $_COOKIE, $_FILES];
+			// $_REQUEST as PHP built it: WordPress rebuilds it from the query and the form only after plugins_loaded
+			$request = [$_SERVER, $_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST];
 			// the prepend layer judged this request already: one verdict, one count —
 			// this hook only lends it the Sender, with the request's full context;
 			// claiming the stash tells the layer's shutdown that it need not queue it
@@ -331,7 +332,7 @@ final class Adapter
 		bool $xmlrpc = false,
 	): ?Verdict
 	{
-		$facts = self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix);
+		$facts = self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix, $request[5] ?? null);
 		$verdict = $this->kernel()->judge($facts, $this->consent());
 		if(($caller['known'] ?? true) === false && $verdict->reason === Verdict::REASON_UNANSWERED)
 		{
@@ -372,9 +373,10 @@ final class Adapter
 			}
 			$this->held = null;
 			[$server, $get, $post, $cookies, $files] = $held['request'];
+			$bag = $held['request'][5] ?? null;
 			// WordPress has authenticated the request by now: the current user is the one it runs
 			$caller ??= self::caller($server, $get, $post, function_exists('is_user_logged_in') && is_user_logged_in(), false);
-			$facts = self::facts($server, $get, $post, $cookies, $files, $caller, $held['ip'], $held['restPrefix']);
+			$facts = self::facts($server, $get, $post, $cookies, $files, $caller, $held['ip'], $held['restPrefix'], $bag);
 			$this->settle($facts, $this->kernel()->judge($facts, $this->consent()));
 		}
 		catch(Throwable)
@@ -403,7 +405,8 @@ final class Adapter
 	{
 		try
 		{
-			$this->kernel()->tally(self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix), $this->consent());
+			$this->kernel()->tally(self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix, $request[5] ?? null),
+				$this->consent());
 		}
 		catch(Throwable)
 		{
@@ -859,6 +862,8 @@ final class Adapter
 		$response = wp_remote_get($url, [
 			'timeout' => max(1, (int)ceil($timeoutMs / 1000)),
 			'redirection' => 0,
+			// the kernel refuses an answer past BODY_MAX unread: one byte more is all it needs to see
+			'limit_response_size' => Kernel::BODY_MAX + 1,
 			'headers' => $named,
 			'user-agent' => Kernel::USER_AGENT . ' wordpress',
 			'sslverify' => (bool)Legacy::filter('ovos_codesafe_sslverify', true),
@@ -984,6 +989,7 @@ final class Adapter
 		array $caller,
 		string $ip,
 		string $restPrefix = 'wp-json',
+		?array $request = null,
 	): Facts
 	{
 		return Facts::fromServer(
@@ -1002,6 +1008,7 @@ final class Adapter
 			kses: function_exists('wp_kses_post') ? self::htmlUnsafe(...) : null,
 			platforms: Prepend::platforms(),
 			options: [Wordpress::OPTION_REST_PREFIX => $restPrefix],
+			request: $request,
 		);
 	}
 	

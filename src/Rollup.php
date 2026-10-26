@@ -50,6 +50,10 @@ use function time;
 use function update_option;
 
 use const CURLINFO_RESPONSE_CODE;
+use const CURLOPT_PROTOCOLS;
+use const CURLOPT_REDIR_PROTOCOLS;
+use const CURLPROTO_HTTP;
+use const CURLPROTO_HTTPS;
 use const PHP_SAPI;
 
 /**
@@ -1012,6 +1016,9 @@ class Rollup
 			CURLOPT_TIMEOUT_MS => 1000,
 			CURLOPT_SSL_VERIFYPEER => $verify,
 			CURLOPT_SSL_VERIFYHOST => $verify ? 2 : 0,
+			// codesafe is http(s): a gopher:// or dict:// URL would send raw bytes to any host and port it names
+			CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+			CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 		]);
 		
 		$body = curl_exec($handle);

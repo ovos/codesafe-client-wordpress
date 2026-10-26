@@ -104,6 +104,45 @@ class Redaction extends Test
 	}
 	
 	/**
+	 * The credentials beside password and token are secret everywhere too —
+	 * a passphrase, an API key written without a separator, a credential, a
+	 * private, access, consumer (WooCommerce's ck_), licence, encryption or
+	 * signing key, a second factor's one-time and backup codes (the Two-Factor
+	 * plugin's `authcode` on wp-login.php?action=validate_2fa), a CSRF value,
+	 * a session id, a bare `auth` — and the words that merely contain the
+	 * letters stay readable. Falsify: drop the names — a backup code posted
+	 * during a notice on wp-login reaches codesafe whole.
+	 */
+	public function theOtherCredentialNamesAreSecretToo(): bool
+	{
+		$secret = ['passphrase', 'apikey', 'credentials', 'private_key', 'access_key', 'consumer_key', 'license_key', 'licence-key',
+			'encryption_key', 'signing_key', 'mfa_code', 'otp_code', 'totp', '2fa', 'backup_code', 'authcode', 'auth_code', '_csrf',
+			'xsrf', 'session_id', 'PHPSESSID', 'auth', 'x-auth', 'wp-2fa-totp-code'];
+		$ordinary = ['otpaper', 'credit', 'licensee', 'encryption', 'backup', 'author', 'authority', 'session', 'sessions_count', 'e02fa5'];
+		
+		foreach($secret as $name)
+		{
+			if(Redactor::isSecretName($name) === false
+				|| Redactor::scrub([$name => 'S3cretV4lue'], request: true)[$name] !== '[redacted]'
+				|| str_contains(Redactor::scrubText($name . '=S3cretV4lue&x=1'), 'S3cretV4lue'))
+			{
+				return false;
+			}
+		}
+		foreach($ordinary as $name)
+		{
+			if(Redactor::isSecretName($name))
+			{
+				return false;
+			}
+		}
+		// a build hash carries `2fa` among hex digits: a stack line keeps its line and column
+		$frame = 'at render (https://shop.test/js/app.e02fa5.js:2:5390)';
+		
+		return Redactor::scrubText($frame) === $frame;
+	}
+	
+	/**
 	 * The reset form, as wp-login.php receives it: the key in the query and
 	 * rp_key in the post leave nowhere in the JSON. The login name in the
 	 * bags travels as typed: codesafe masks it on arrival and keeps the

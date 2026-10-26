@@ -299,7 +299,8 @@ requests against it — automatically, nobody has to approve it.
 **On by default; codesafe decides.** The Shield pulls the rules and
 matches every request. A rule in **observe** reports a match to codesafe as
 a `shield_observe` security event — the rule, the CVE, the matched fragment
-capped at 200 bytes, the address — and the request is served. A rule set to
+capped at 200 bytes and never a secret (below), the address — and the
+request is served. A rule set to
 **block** answers 403 and reports `shield_block`, with an `X-Shield-Rule`
 header naming the rule. Which rules may block is codesafe's word: the
 project's Shield switch (block, observe or off) and each rule's mode — and a
@@ -317,7 +318,24 @@ reached. The site tells codesafe when the kill constant is set.
 **What is read per request:** the path and query string, the user agent, the
 address — and the request body only while a *body rule* is live for this
 site (form fields as `name=value` lines, other bodies capped at 64 KB).
-Nothing of it is stored or sent except the matched fragment.
+Nothing of it is stored, and the one part sent is the matched fragment — never
+where a secret could be it: a rule that reads any cookie, a header or a
+parameter named like a secret, or a parameter by a wildcard name reports no
+fragment, nor does a `uri` rule on a request whose query carries a
+secret-named parameter, nor a `body` rule on a body that holds one or can be
+read only raw. What is sent is scrubbed of secrets by text as an error message
+is, so a pattern that matched a form does not carry the `pwd=` beside the
+match.
+
+**How a rule reads it:** a `uri` rule matches the query as sent and as PHP's
+`$_GET` reads it, every `+` a space, so a rule on `union select` meets
+`union+select`. A virtual patch's `request:` condition reads the query's and
+the form's values, then whatever PHP's `$_REQUEST` holds beside them — the
+cookies, on a host whose `request_order` takes them in. A JSON body is
+decoded up to 1 MiB; a larger one sent to the handler a blocking virtual
+patch pins is taken to carry what the patch looks for and refused — the
+application decodes it whole, and padding must not turn a block into an
+observe — while on any other handler such a rule only observes it.
 
 **Where the rules live:** the kernel pulls `GET /api/v1/shield` from codesafe
 every five minutes as a conditional request (a `304` costs nothing), and caches
@@ -328,11 +346,16 @@ drawn at random and every other file in the directory begins with a PHP
 it; the settings page warns there, and the `CODESAFE_STORE_DIR` constant moves
 the store to a directory outside the document root (the prepend stub stays
 where PHP's configuration names it). A codesafe that goes
-silent for a day lifts the rules: a stale shield is not a shield. The rules a
-site holds are never more than 25, and each is one of `uri`, `ua`, `ip` or
-`body` with `equals`, `prefix`, `contains`, `cidr` or a **bounded regex** —
-the same grammar the JS side and codesafe's own screen run, conformance-tested
-in all three, with nothing that can be made to run slow.
+silent for a day lifts the rules: a stale shield is not a shield. Of what
+codesafe serves a site keeps at most 25 match and rate rules, 100 virtual
+patches and 5 000 threat addresses — the rest is dropped — and no match rule
+that would refuse an ordinary visitor: one that holds on the home page asked
+by a current browser with no body, or an address range wider than a /8 (IPv6:
+a /32). A match rule is one of `uri`, `ua`, `ip` or `body` with `equals`,
+`prefix`, `contains`, `cidr` or a **regex** — the same grammar the JS side and
+codesafe's own screen run, conformance-tested in all three. The regex runs in
+PHP's PCRE, which backtracks: a pattern written to run slow stops at PHP's
+`pcre.backtrack_limit` and matches nothing.
 
 **It fails open, always.** A rule the engine cannot run, a codesafe that does
 not answer, a store that cannot be written, an error of any kind — the request
@@ -390,9 +413,10 @@ Shield is on the plugin keeps `wp-content/mu-plugins/ovos-codesafe-shield.php`
 (it creates the directory if needed; removed when the Shield is switched off,
 on deactivation and on uninstall; a file of that name it did not write is
 never touched). WordPress loads must-use plugins before every other plugin,
-so an **anonymous** request is judged before a vulnerable plugin's own code
-has run — the before-WordPress layer's judge below, without the server
-edit; a signed-in request is still judged at `plugins_loaded`. One judge per
+so a request is judged before a vulnerable plugin's own code has run — the
+before-WordPress layer's judge below, without the server edit: an
+**anonymous** one whole, a signed-in one by the blocks that refuse whoever
+asks, the rest of it at `plugins_loaded` (below). One judge per
 request: with the prepend layer active the mu-plugin does nothing, and a
 request either early layer passed is not judged again (a rate rule counts it
 once).
@@ -412,12 +436,19 @@ file the plugin rewrites whenever a box changes — and a block answers 403
 with `X-Shield-Rule` and `X-Shield-Layer: prepend` for the cost of a file
 read. A request carrying a WordPress login cookie to a file WordPress runs
 through — `index.php`, `wp-login.php`, `xmlrpc.php`, `wp-cron.php`,
-`wp-comments-post.php`, wp-admin's own pages but `load-scripts.php` and
-`load-styles.php` — is left to `plugins_loaded`, which knows the user: an
-editor is never refused by a layer that cannot tell them from a bot, and the
-alarm's signed-in signal keeps working. So is a REST request carrying Basic
-credentials: WordPress checks an application password only after this
-layer, and at `plugins_loaded` the plugin checks it the same way, read-only
+`wp-comments-post.php`, wp-admin's own pages but `load-scripts.php`,
+`load-styles.php` and the installer's `install.php`, `upgrade.php` and
+`setup-config.php` — is judged here with its caller unknown. Anyone can send
+a cookie by that name, and mu-plugins, drop-ins and a plugin's own files run
+before `plugins_loaded`, so a block that refuses whoever asks — a match rule,
+a virtual patch for anyone — refuses it here; a rule that asks who the
+caller is, a rate rule and every observe wait for `plugins_loaded`, which
+judges the request whole, with its user: an editor is refused here only by a
+rule that would refuse them there too, and the alarm's signed-in signal keeps
+working. So is a REST request carrying Basic credentials, judged here the
+same way and whole at `plugins_loaded`: WordPress checks an application
+password only after this layer, and at `plugins_loaded` the plugin checks it
+the same way, read-only
 (no use recorded, no action fired), so an integration is judged as its user
 — not as anonymous; the REST prefix comes from the consent file, where the
 plugin writes `rest_get_url_prefix()` once every plugin and the theme have
@@ -429,15 +460,20 @@ each method checks — is unknown to the kernel at `plugins_loaded`: a rule
 for anonymous callers or a capability waits instead of refusing, and the
 request is judged again where WordPress has settled the user
 (`rest_pre_dispatch`, `xmlrpc_call`), its verdict reported once then; never
-judged again, it is reported as the observe it was. The early layers leave
-such a request to the adapter the same way, and the must-use plugin, which
-runs inside WordPress, leaves every signed-in request to it whatever the
-script. A request to the REST API's `/batch/v1` has each request its body
-lists judged as a request of its own. Where the user cannot be told, a rule
-that asks only observes. Anywhere else (a direct hit on a
-plugin's PHP file) no adapter will ever run and the cookie's name proves
-nothing, so this layer judges it like any other request. The queued
-reports' URLs are scrubbed before they are written. Behind a proxy or CDN the
+judged again, it is reported as the observe it was. The early layers judge
+such a request by the rules for anyone and leave the rest to the adapter the
+same way, and the must-use plugin, which runs inside WordPress, treats every
+signed-in request as this layer treats one to a file WordPress runs through,
+whatever the script. A request to the REST API's `/batch/v1` has each
+request its body lists judged as a request of its own. Where the user cannot
+be told, a rule that asks only observes. Anywhere else — a direct hit on a
+plugin's PHP file, or WordPress's installer pages (`wp-admin/install.php`,
+`upgrade.php`, `setup-config.php`, `wp-activate.php`), which load no
+plugins — no adapter will ever run and the cookie's name proves nothing, so
+this layer judges the request whole, like any other. The queued reports'
+URLs are scrubbed before they are written, and what a queued report carries
+of its request is capped — the URL at 2 KB, the user agent, referer and host
+at 512 bytes each — since every refused request rewrites the queue. Behind a proxy or CDN the
 *Trusted proxy* settings make this layer, the adapter and every report name
 the visitor instead of the edge; the header is read only when the connecting
 address is in the trusted ranges. Deactivating the plugin rewrites the consent
@@ -661,11 +697,21 @@ default), the plugin reports:
 - **Sensitive admin changes** (`privileged_action`) — the moves an attacker
   makes *after* getting in, routine for an admin but an audit trail during an
   incident: user creation and role grants (an administrator created is its
-  own kind), plugin and theme installs and activations, changes to the
+  own kind; a sign-up is not reported — see below), plugin and theme
+  installs and activations, changes to the
   `users_can_register`, `default_role`, `admin_email`, `siteurl` and `home`
   options (the option *name* only — values are deliberately not reported),
-  saves from the theme/plugin file editor, application passwords minted for
-  administrators, and every plugin the auto-update switched on.
+  saves from the theme/plugin file editor by an account WordPress lets edit
+  those files (anyone else's attempt, which WordPress refuses, is a
+  `permission_denied` under that kind's budget), application passwords minted
+  for administrators, and every plugin the auto-update switched on.
+
+  A sign-up is routine and reports nothing, as a clean login does: an account
+  made by no one who may create accounts, with no capability the site's
+  default role lacks — what an open registration or a shop's checkout makes.
+  An account above the default role, any account an administrator creates,
+  and every sign-up while the default role itself can write posts (the
+  open-signup-into-administrator trap) are reported.
 
 They arrive in codesafe as `security` events, grouped apart from errors and
 accepted independently of the project's severity threshold. The refusals
@@ -745,8 +791,9 @@ again on its side as a backstop, but the first cut happens here:
   never a URL, an address, a user agent or a cookie.
 - **The inventory** says what is installed, never where or how it is
   configured; **the scan** sends paths, sizes and dates, never content; **the
-  Shield** sends the matched fragment, capped at 200 bytes, and reads the body
-  only while a body rule is live.
+  Shield** sends the matched fragment, capped at 200 bytes, none where a
+  secret could be it and scrubbed of secrets by text, and reads the body only
+  while a body rule is live.
 - **DOM snapshots** (on by default) strip input values and scripts in the
   browser, before upload, and blank every area marked `data-codesafe-mask`;
   the page's text goes as it is — a customer's account page with it. Untick

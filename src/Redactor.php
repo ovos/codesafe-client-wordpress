@@ -80,7 +80,14 @@ final class Redactor
 		. '|card[-_]?(?:num(?:ber)?|no(?![a-z])|code|cvc|cvv|exp(?:iry|iration|(?![a-z])))'
 		. '|cc[-_]?(?:num(?:ber)?|no(?![a-z]))'
 		. '|(?<![a-z])(?:cvv2?|cvc2?|csc|ccv)(?![a-z])|security[-_]?code'
-		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])';
+		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])'
+		// the credentials beside password and token, as codesafe's own scrubber
+		// has them: an API key without a separator, a credential, the keys that
+		// name what they unlock, a second factor's backup and auth codes (the
+		// Two-Factor plugin's `authcode`), a CSRF value, a session id; a
+		// one-time code and a bare `auth` only as a word of the name
+		. '|apikey|credential|(?:private|access|consumer|licen[cs]e|encryption|signing)[-_]?key|backup[-_]?codes?|auth[-_]?code'
+		. '|csrf|xsrf|sess(?:ion)?[-_]?id|(?<![a-z0-9])(?:otp|totp|mfa|2fa)(?:[-_]?codes?)?(?![a-z0-9])|(?<![a-z])auth(?![a-z])';
 	
 	/** the names above, matched against a field name */
 	protected const REDACT_PATTERN = '/' . self::SECRET_NAMES . '/i';

@@ -72,11 +72,13 @@ final class Lifecycle
 		Hello::OPTION,
 		Rollup::OPTION_REFUSED,
 		CoreUpdate::OPTION,
+		Inventory::OURS,
 	];
 	
 	/** the network's own options a multisite uninstall removes once, after every site's */
 	public const SITE_OPTIONS = [
 		CoreUpdate::OPTION,
+		Inventory::OURS,
 	];
 	
 	/**

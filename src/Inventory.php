@@ -43,8 +43,8 @@ use function ksort;
 use function max;
 use function mb_substr;
 use function min;
-use function preg_match;
 use function parse_url;
+use function preg_match;
 use function preg_replace;
 use function register_shutdown_function;
 use function sha1;
@@ -63,6 +63,10 @@ use function wp_is_file_mod_allowed;
 
 use const ABSPATH;
 use const CURLINFO_RESPONSE_CODE;
+use const CURLOPT_PROTOCOLS;
+use const CURLOPT_REDIR_PROTOCOLS;
+use const CURLPROTO_HTTP;
+use const CURLPROTO_HTTPS;
 use const PHP_URL_HOST;
 use const PHP_VERSION;
 use const WP_PLUGIN_DIR;
@@ -126,6 +130,13 @@ class Inventory
 	 * heard), consumed by the next shutdown send
 	 */
 	protected const OPTION_DIRTY = 'ovos_codesafe_inventory_dirty';
+	
+	/**
+	 * The automatic updates codesafe switched on, by type — the only ones a
+	 * TURN OFF from codesafe takes back: the site's own choices are the
+	 * site's. A site option, like the lists it shadows
+	 */
+	public const OURS = 'ovos_codesafe_auto_updates';
 	
 	/**
 	 * The heartbeat cadence — an unchanged report this old is re-sent and
@@ -1005,6 +1016,9 @@ class Inventory
 			CURLOPT_TIMEOUT_MS => 1000,
 			CURLOPT_SSL_VERIFYPEER => $verify,
 			CURLOPT_SSL_VERIFYHOST => $verify ? 2 : 0,
+			// codesafe is http(s): a gopher:// or dict:// URL would send raw bytes to any host and port it names
+			CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+			CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 		]);
 		
 		$body = curl_exec($handle);
@@ -1063,11 +1077,14 @@ class Inventory
 			$added[] = ['core', 'wordpress', $coreReason, $override];
 		}
 		
+		$ours = (array)get_site_option(self::OURS, []);
+		$oursBefore = $ours;
 		foreach(['plugin' => $this->plugins(), 'theme' => $this->themes()] as $type => $installed)
 		{
 			$option = 'auto_update_' . $type . 's';
 			$enabled = (array)get_site_option($option, []);
 			$before = count($enabled);
+			$mine = array_values(array_filter((array)($ours[$type] ?? []), 'is_string'));
 			
 			foreach($installed as $key => $headers)
 			{
@@ -1078,20 +1095,31 @@ class Inventory
 				{
 					$enabled[] = (string)$key;
 					$added[] = [$type, $slug, $reason];
+					$mine[] = (string)$key;
 				}
 				
-				// that entry alone leaves the list; every other choice on it is the site's
-				if(isset($unwanted[$type . '|' . $slug]) && in_array((string)$key, $enabled, true))
+				// that entry alone leaves the list, and only when codesafe put it there: the site's own choices are the site's
+				if(isset($unwanted[$type . '|' . $slug]) && in_array((string)$key, $enabled, true) && in_array((string)$key, $mine, true))
 				{
 					$enabled = array_values(array_filter($enabled, static fn(mixed $file): bool => $file !== (string)$key));
+					$mine = array_values(array_filter($mine, static fn(string $file): bool => $file !== (string)$key));
 					$removed[] = [$type, $slug];
 				}
+			}
+			if($mine !== [] || isset($ours[$type]))
+			{
+				$ours[$type] = array_values(array_unique($mine));
 			}
 			
 			if(count($enabled) !== $before || $removed !== [])
 			{
 				update_site_option($option, array_values(array_unique($enabled)));
 			}
+		}
+		
+		if($ours !== $oursBefore)
+		{
+			update_site_option(self::OURS, $ours);
 		}
 		
 		if($added === [] && $removed === [] && $withdrawn === false)

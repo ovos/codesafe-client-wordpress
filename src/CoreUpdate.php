@@ -241,6 +241,11 @@ class CoreUpdate
 		string $reason,
 	): ?bool
 	{
+		// the network's own options: a subsite's codesafe never writes them
+		if($this->config->ownsSharedStore() === false)
+		{
+			return null;
+		}
 		$report = $this->report($data, $installed);
 		if($report['blocked_by'] !== '' || ($report['forced'] ?? null) === false
 			|| $report['policy'] === 'filter' || $report['minor'])
