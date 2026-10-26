@@ -51,6 +51,8 @@ function wp_shim_reset(): void
 		'users' => [],
 		// the ids is_super_admin() answers true for
 		'super_admins' => [],
+		// the roles get_role() finds: name => [capability => granted]
+		'roles' => [],
 		// wp_remote_post(): every [url, args] posted, the status it answers (0 = unreachable) and its body
 		'posted' => [],
 		'post_status' => 202,
@@ -129,6 +131,33 @@ function user_can(
 ): bool
 {
 	return in_array($capability, $user->caps, true);
+}
+
+class WP_Role
+{
+	public function __construct(
+		public string $name = '',
+		/** capability => granted, as core keeps a role's */
+		public array $capabilities = [],
+	)
+	{
+	}
+	
+	public function has_cap(
+		string $cap,
+	): bool
+	{
+		return empty($this->capabilities[$cap]) === false;
+	}
+}
+
+function get_role(
+	string $role,
+): ?WP_Role
+{
+	$capabilities = $GLOBALS['wp']['roles'][$role] ?? null;
+	
+	return $capabilities === null ? null : new WP_Role($role, $capabilities);
 }
 
 function is_super_admin(
@@ -435,11 +464,13 @@ function sanitize_text_field(
 	return $found ? trim((string)preg_replace('/ +/', ' ', $value)) : $value;
 }
 
+/** core's esc_url() with a protocol list: a scheme outside it empties the URL */
 function esc_url_raw(
 	string $url,
+	?array $protocols = null,
 ): string
 {
-	return $url;
+	return $protocols === null || in_array(strtolower((string)parse_url($url, PHP_URL_SCHEME)), $protocols, true) ? $url : '';
 }
 
 function wp_get_environment_type(): string

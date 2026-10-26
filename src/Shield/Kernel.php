@@ -76,9 +76,13 @@ declare(strict_types=1);
  * tail when a condition names its contents). `who` is anyone,
  * anonymous or lacks:<capability>, and a nonce test asks the platform: a
  * blocking vpatch whose who or nonce the adapter cannot answer, or that
- * reads what the kernel could not (an upload, a JSON body past
- * Facts::JSON_CAP, a WordPress batch not read in full), is held with the reason `unanswered`
- * (Verdict::REASON_UNANSWERED), never blocked.
+ * reads what the kernel could not (an upload, a WordPress batch not read
+ * in full, a JSON body past Facts::JSON_CAP on a handler none of its other
+ * entries pins), is held with the reason `unanswered`
+ * (Verdict::REASON_UNANSWERED), never blocked. A JSON body past the cap on
+ * the handler its other entries pin is taken to carry what its json:
+ * conditions look for: the app decodes it whole, and an honest client sends
+ * no such body to a patched handler.
  * Every vpatch a request reaches is counted per minute beside the hits,
  * whether or not it decided the verdict: `entry` (its selecting entries
  * held, Ruleset::selects()), `match` (it held, who included) and `authed`
@@ -139,19 +143,23 @@ use function apcu_enabled;
 use function apcu_fetch;
 use function apcu_inc;
 use function apcu_store;
+use function array_diff;
 use function array_filter;
 use function array_is_list;
 use function array_key_exists;
 use function array_keys;
 use function array_map;
+use function array_pop;
 use function array_slice;
+use function array_unique;
 use function array_values;
 use function base64_decode;
+use function bin2hex;
 use function ceil;
 use function chr;
 use function class_exists;
 use function count;
-use function crc32;
+use function ctype_digit;
 use function curl_exec;
 use function curl_getinfo;
 use function curl_init;
@@ -160,9 +168,11 @@ use function explode;
 use function fclose;
 use function file_get_contents;
 use function file_put_contents;
+use function filter_var;
 use function fopen;
 use function fstat;
 use function function_exists;
+use function fwrite;
 use function get_debug_type;
 use function hash;
 use function hexdec;
@@ -176,6 +186,7 @@ use function is_array;
 use function is_bool;
 use function is_file;
 use function is_int;
+use function is_link;
 use function is_readable;
 use function is_scalar;
 use function is_string;
@@ -192,6 +203,7 @@ use function preg_quote;
 use function preg_replace;
 use function preg_replace_callback;
 use function preg_split;
+use function random_bytes;
 use function rawurldecode;
 use function rename;
 use function rtrim;
@@ -215,7 +227,6 @@ use function strtoupper;
 use function substr;
 use function time;
 use function trim;
-use function uniqid;
 use function unlink;
 
 use const CURLINFO_RESPONSE_CODE;
@@ -227,9 +238,9 @@ use const CURLOPT_RETURNTRANSFER;
 use const CURLOPT_TIMEOUT_MS;
 use const CURLOPT_URL;
 use const CURLOPT_USERAGENT;
+use const FILTER_VALIDATE_IP;
 use const JSON_UNESCAPED_SLASHES;
 use const JSON_UNESCAPED_UNICODE;
-use const LOCK_EX;
 
 /**
  * A platform's kernel module: the vocabulary only its app gives a request a
@@ -310,7 +321,11 @@ final class Facts
 	/** a body rule cannot see past this, and the report says so */
 	public const BODY_CAP = 65536;
 	
-	/** a JSON body past this is not decoded, and its json: conditions hold unanswered (jsonUnread()): padding never hides one */
+	/**
+	 * a JSON body past this is not decoded (jsonUnread()): its json: conditions
+	 * hold as answered where the rule's other entries pin the handler, else
+	 * unanswered (Kernel::patched()) — padding never hides one
+	 */
 	public const JSON_CAP = 1048576;
 	
 	/**
@@ -368,6 +383,8 @@ final class Facts
 	 * @param ?Closure(string): ?string $fileReader an upload's bytes by its temp path; null when the host cannot read it
 	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms()); anything else is ignored
 	 * @param array<string, scalar> $options what a platform module reads of the host, by the module's own key (WordPress's REST prefix)
+	 * @param ?array<string, mixed> $request the host's request bag ($_REQUEST), whose values a request: target reads beside the
+	 *     query's and the form's; null where the host has none
 	 */
 	public function __construct(
 		public readonly string $method,
@@ -391,6 +408,7 @@ final class Facts
 		protected ?Closure $fileReader = null,
 		array $platforms = [],
 		public readonly array $options = [],
+		public readonly ?array $request = null,
 	)
 	{
 		$this->platforms = array_values(array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform));
@@ -442,7 +460,7 @@ final class Facts
 			$this->query, $this->form, $this->cookies, $this->headers, $this->files, $this->jsonFor === null ? $this->jsonThrough(...) : ($this->jsonFor)($platforms),
 			fn(string $capability): ?bool => $this->can($capability), fn(string $action, string $value): ?bool => $this->nonceValid($action, $value),
 			$this->callerKnown, fn(string $value): ?bool => $this->htmlUnsafe($value), $this->uploads, fn(string $path): ?string => $this->fileContent($path),
-			$platforms, $this->options);
+			$platforms, $this->options, $this->request);
 		$copy->outer = $this->outer;
 		$copy->jsonFor = $this->jsonFor;
 		
@@ -504,6 +522,7 @@ final class Facts
 	 * @param ?callable(string): ?string $fileReader an upload's bytes by its temp path; null reads PHP's own (uploadReader())
 	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms())
 	 * @param array<string, scalar> $options what a platform module reads of the host (Facts::$options)
+	 * @param ?array<string, mixed> $request the host's request bag ($_REQUEST), read by a request: target beside the query and the form
 	 */
 	public static function fromServer(
 		array $server,
@@ -522,6 +541,7 @@ final class Facts
 		?callable $fileReader = null,
 		array $platforms = [],
 		array $options = [],
+		?array $request = null,
 	): self
 	{
 		$uri = is_string($server['REQUEST_URI'] ?? null) ? $server['REQUEST_URI'] : '/';
@@ -556,6 +576,7 @@ final class Facts
 			$fileReader === null ? self::uploadReader() : Closure::fromCallable($fileReader),
 			$platforms,
 			$options,
+			$request,
 		);
 		$facts->jsonFor = static fn(array $platforms): ?Closure => self::jsonReader($contentType, $input, platforms: $platforms);
 		
@@ -831,6 +852,7 @@ final class Facts
 		return rawurldecode($value);
 	}
 	
+	
 	/** the body as a rule reads it; null when the request has none the kernel can read */
 	public function body(): ?string
 	{
@@ -975,12 +997,97 @@ final class Facts
 		return $this->answer('nonce:' . strlen($action) . ':' . $action . ':' . $value, $this->nonce, $action, $value);
 	}
 	
-	/** the path alone — what a report line names; the query may carry what the body may not */
+	/**
+	 * The path alone, as a server maps it to a file (normalPath()) — what a
+	 * `path` condition and a report line read; the query may carry what the
+	 * body may not
+	 */
 	public function path(): string
 	{
-		$path = explode('?', $this->uri, 2)[0];
+		return self::normalPath(explode('?', $this->uri, 2)[0]);
+	}
+	
+	/**
+	 * The script a PHP server runs for this path: the path cut after its
+	 * first `.php` segment — /wp-admin/admin-ajax.php/x runs admin-ajax.php
+	 * with /x as PATH_INFO under mod_php and the usual fastcgi_split_path_info
+	 * — the path itself when it names none
+	 */
+	public function scriptPath(): string
+	{
+		$path = $this->path();
 		
-		return $path === '' ? '/' : $path;
+		return preg_match('~^.*?\.php(?=/)~i', $path, $match) === 1 ? $match[0] : $path;
+	}
+	
+	/**
+	 * A path as a server maps it to a resource: a run of slashes as one, the
+	 * dot segments resolved (RFC 3986 §5.2.4) — Apache and nginx serve
+	 * /wp-admin//admin-ajax.php, /wp-admin/./admin-ajax.php and
+	 * /wp-admin/../wp-admin/admin-ajax.php all as /wp-admin/admin-ajax.php,
+	 * so a rule naming that path must read every one of them so. A `..` never
+	 * climbs above the root; a trailing dot segment leaves a directory
+	 */
+	public static function normalPath(
+		string $path,
+	): string
+	{
+		$segments = explode('/', (string)preg_replace('~/{2,}~', '/', $path));
+		$last = count($segments) - 1;
+		$kept = [];
+		foreach($segments as $index => $segment)
+		{
+			if($segment === '.' || $segment === '..')
+			{
+				// the leading '' is the root: a `..` stops there
+				if($segment === '..' && count($kept) > 1)
+				{
+					array_pop($kept);
+				}
+				if($index === $last)
+				{
+					$kept[] = '';
+				}
+				
+				continue;
+			}
+			$kept[] = $segment;
+		}
+		$normal = implode('/', $kept);
+		
+		return $normal === '' ? '/' : $normal;
+	}
+	
+	/**
+	 * The subjects a field reads: field()'s, and for the uri its query as
+	 * $_GET reads it too, every `+` a space, where that differs — a rule on
+	 * `union select` meets `union+select`, and one spelled with the `+`
+	 * still meets it; none when the request has none
+	 *
+	 * @return list<string>
+	 */
+	public function subjects(
+		string $field,
+	): array
+	{
+		$subject = $this->field($field);
+		if($subject === null)
+		{
+			return [];
+		}
+		$spaced = $field === Ruleset::FIELD_URI ? self::querySpaced($subject) : $subject;
+		
+		return $spaced === $subject ? [$subject] : [$subject, $spaced];
+	}
+	
+	/** a decoded URI with every `+` of its query read as a space, as PHP parses the query into $_GET */
+	public static function querySpaced(
+		string $uri,
+	): string
+	{
+		$at = strpos($uri, '?');
+		
+		return $at === false ? $uri : substr($uri, 0, $at + 1) . str_replace('+', ' ', substr($uri, $at + 1));
 	}
 	
 	/** the subject a field reads — null when this request has none */
@@ -1226,6 +1333,28 @@ final class Ruleset
 	/** at most this many addresses, this many pass paths of at most PASS_MAX bytes */
 	public const THREATS_MAX = 5000;
 	
+	/**
+	 * The most match and rate rules a kernel keeps, and the most virtual
+	 * patches — the door's own caps per project; past them the rest of the
+	 * door's order is dropped, so no door serves a kernel more work per
+	 * request than codesafe's would
+	 */
+	public const RULES_MAX = 25;
+	
+	public const VPATCHES_MAX = 100;
+	
+	/**
+	 * An ordinary visitor's request as a match rule's field reads it: the
+	 * home page, a current browser, no body. A match rule that holds on it
+	 * would refuse everyone (reachesEverything())
+	 */
+	public const ORDINARY = ['uri' => '/', 'ua' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', 'body' => ''];
+	
+	/** the widest address range a match rule may name: a /8 of IPv4, a /32 of IPv6 */
+	public const CIDR_V4_MIN = 8;
+	
+	public const CIDR_V6_MIN = 32;
+	
 	public const PASSES_MAX = 20;
 	
 	public const PASS_MAX = 100;
@@ -1285,12 +1414,23 @@ final class Ruleset
 		$rules = [];
 		if($usable)
 		{
+			// the door's caps, in the door's order: what is past them is dropped
+			$kept = ['match' => 0, 'vpatch' => 0];
 			foreach($payload['rules'] as $rule)
 			{
-				if(self::wellFormed($rule, $platforms))
+				// a match rule that would refuse every visitor is no door's to serve
+				if(self::wellFormed($rule, $platforms) === false
+					|| (self::isVpatch($rule) === false && self::isRate($rule) === false && self::reachesEverything($rule)))
 				{
-					$rules[] = $rule;
+					continue;
 				}
+				$slot = self::isVpatch($rule) ? 'vpatch' : 'match';
+				if($kept[$slot] >= ($slot === 'vpatch' ? self::VPATCHES_MAX : self::RULES_MAX))
+				{
+					continue;
+				}
+				$kept[$slot]++;
+				$rules[] = $rule;
 			}
 		}
 		if(preg_match('~^[0-9a-f]{64}$~', $digest) !== 1)
@@ -1450,6 +1590,32 @@ final class Ruleset
 			&& is_string($rule['mode'] ?? null)
 			&& (isset($rule['kind']) === false || in_array($rule['kind'], self::KINDS, true))
 			&& (self::isRate($rule) === false || self::rateWellFormed($rule['rate'] ?? null));
+	}
+	
+	/**
+	 * Whether a match rule would refuse every visitor: it holds on an
+	 * ordinary request (ORDINARY) or names an address range wider than a /8
+	 * (a /32 of IPv6). Such a rule is no patch but the site down, whoever set
+	 * it or served it, and a kernel keeps none. A rate rule over every
+	 * request is a site's ceiling and is not asked
+	 */
+	public static function reachesEverything(
+		array $rule,
+	): bool
+	{
+		$value = trim((string)$rule['value']);
+		if($rule['op'] === self::OP_CIDR)
+		{
+			[$address, $bits] = explode('/', $value, 2) + [1 => null];
+			$packed = filter_var($address, FILTER_VALIDATE_IP) === false ? false : inet_pton($address);
+			
+			// a bare address, or no address at all, is no range
+			return $packed !== false && is_string($bits) && ctype_digit($bits)
+				&& (int)$bits < (strlen($packed) === 4 ? self::CIDR_V4_MIN : self::CIDR_V6_MIN);
+		}
+		$ordinary = self::ORDINARY[$rule['field']] ?? null;
+		
+		return $ordinary !== null && Kernel::match($rule, $ordinary) !== null;
 	}
 	
 	public static function isVpatch(
@@ -1804,10 +1970,11 @@ final class Store
 			$hit = apcu_fetch($this->key('rules'));
 			if(is_array($hit))
 			{
-				return $hit;
+				return self::clamped($hit);
 			}
 		}
-		if($this->file === '' || is_file($this->file) === false)
+		// a link planted at the path is no store: the next pull writes a real one
+		if($this->file === '' || is_link($this->file) || is_file($this->file) === false)
 		{
 			return null;
 		}
@@ -1823,9 +1990,28 @@ final class Store
 		{
 			return null;
 		}
+		$record = self::clamped($record);
 		if($this->apcu)
 		{
 			apcu_store($this->key('rules'), $record);
+		}
+		
+		return $record;
+	}
+	
+	/**
+	 * A record whose fetched_at lies in the future (a clock that ran ahead, a
+	 * file written by hand) as fetched now: the pull would skip it for as
+	 * long as it lies ahead, and the ceiling would never lift it
+	 */
+	protected static function clamped(
+		array $record,
+	): array
+	{
+		$now = time();
+		if(is_int($record['fetched_at'] ?? null) && $record['fetched_at'] > $now)
+		{
+			$record['fetched_at'] = $now;
 		}
 		
 		return $record;
@@ -1839,27 +2025,32 @@ final class Store
 		$written = false;
 		if($this->file !== '')
 		{
-			// a temp file of its own: concurrent writers never share one, and rename() swaps the file whole
-			$temp = $this->file . '.' . uniqid('', true) . '.tmp';
+			$temp = '';
+			$created = false;
 			try
 			{
+				// a temp file of its own, unguessable: concurrent writers never share one, and rename() swaps the file whole
+				$temp = $this->file . '.' . bin2hex(random_bytes(12)) . '.tmp';
 				$json = (string)json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-				// a short write (a full disk) never replaces the good file
-				if(file_put_contents($temp, $json, LOCK_EX) === strlen($json) && rename($temp, $this->file))
+				// created exclusively: a file or a link planted at the name fails the open instead of being written through
+				$handle = @fopen($temp, 'xb');
+				if($handle !== false)
 				{
-					$written = true;
-				}
-				elseif(is_file($temp))
-				{
-					unlink($temp);
+					$created = true;
+					$whole = fwrite($handle, $json) === strlen($json);
+					fclose($handle);
+					// a short write (a full disk) never replaces the good file
+					$written = $whole && rename($temp, $this->file);
 				}
 			}
 			catch(Throwable)
 			{
-				if(is_file($temp))
-				{
-					@unlink($temp);
-				}
+				// not written: the temp goes below
+			}
+			// only a temp this call created: after a failed open the name is someone else's
+			if($created && $written === false && is_file($temp))
+			{
+				@unlink($temp);
 			}
 		}
 		if($this->apcu)
@@ -1967,8 +2158,8 @@ final class Store
 			return null;
 		}
 		$bucket = intdiv($now, $window);
-		// the key as crc32, a short fixed-width name: two keys that collide share a count
-		$head = 'rate:' . $ruleId . ':' . crc32($key) . ':';
+		// the key as its sha256, a fixed-width name no other key is given: two keys never share a count
+		$head = 'rate:' . $ruleId . ':' . hash('sha256', $key) . ':';
 		// a bucket outlives the next window, which reads it as the previous one
 		$ttl = 2 * $window + 1;
 		$name = $this->key($head . $bucket);
@@ -2050,8 +2241,27 @@ final class Kernel
 	
 	public const TIMEOUT_MS = 2000;
 	
+	/** the most bytes of a pull's answer the kernel decodes */
+	public const BODY_MAX = 2097152;
+	
 	/** `matched` is attacker-controlled: bounded here, scrubbed by the sender */
 	public const MATCHED_MAX = 200;
+	
+	/**
+	 * The names whose value a report never carries (shown()): a password, a
+	 * token, a session, a CSRF or one-time code, a reset, API or private key,
+	 * a card's security code — the senders' secret names, restated because
+	 * the kernel loads nothing else. The short words a query parameter uses
+	 * for a credential (`key`, `code`, `auth`, `sig`, `otp`, `pin`, `hash`)
+	 * only as the whole name
+	 */
+	public const SECRET_NAME = '~pass(?:word|wd|phrase)?|pwd|token|secret|authori[sz]ation|cookie|session|sessid|csrf|xsrf|nonce|jwt|bearer'
+		. '|signature|credential|api[-_]?key|(?:private|access|consumer|licen[cs]e|encryption|signing|rp)[-_]?key|auth[-_]?(?:code|key)'
+		. '|backup[-_]?code|(?<![a-z0-9])(?:otp|totp|mfa|2fa)(?![a-z0-9])|card[-_]?(?:num|no|code|cvc|cvv|exp)|cc[-_]?(?:num|no)'
+		. '|(?<![a-z])(?:cvv2?|cvc2?|csc|ccv|iban)(?![a-z])|security[-_]?code|^(?:key|auth|code|sig|otp|pin|hash)$~i';
+	
+	/** how deep shown() looks for a secret-named field in a parsed body before it assumes one */
+	public const SECRET_DEPTH = 8;
 	
 	public const DOOR = '/api/v1/shield';
 	
@@ -2377,7 +2587,7 @@ final class Kernel
 	/**
 	 * The threat section's word on this request: the pseudo-rule it is judged
 	 * by (id THREAT_RULE, the section's mode) when the address is listed, the
-	 * request is not signed in and its path ends in none of the pass paths;
+	 * request is not signed in and the script it runs ends in none of the pass paths;
 	 * null otherwise
 	 *
 	 * @return ?array{id: int, kind: string, mode: string}
@@ -2393,7 +2603,8 @@ final class Kernel
 		{
 			return null;
 		}
-		$path = $facts->path();
+		// the script that runs: /xmlrpc.php/wp-login.php is xmlrpc.php, its PATH_INFO no pass
+		$path = $facts->scriptPath();
 		foreach((array)($threats['pass'] ?? []) as $pass)
 		{
 			if(str_ends_with($path, (string)$pass))
@@ -2405,15 +2616,22 @@ final class Kernel
 		return ['id' => Ruleset::THREAT_RULE, 'kind' => Ruleset::KIND_THREAT, 'mode' => (string)$threats['mode']];
 	}
 	
-	/** a rule's predicate over the request: the fragment, or null */
+	/** a rule's predicate over the request: the fragment of the first of the field's subjects (Facts::subjects()) it matches, or null */
 	protected function matched(
 		array $rule,
 		Facts $facts,
 	): ?string
 	{
-		$subject = $facts->field((string)$rule['field']);
+		foreach($facts->subjects((string)$rule['field']) as $subject)
+		{
+			$matched = self::match($rule, $subject);
+			if($matched !== null)
+			{
+				return $matched;
+			}
+		}
 		
-		return $subject === null ? null : self::match($rule, $subject);
+		return null;
 	}
 	
 	/**
@@ -2701,7 +2919,7 @@ final class Kernel
 				'field' => Ruleset::isVpatch($rule) ? Ruleset::KIND_VPATCH : (string)$rule['field'],
 				'op' => Ruleset::isVpatch($rule) ? 'conditions' : (string)$rule['op'],
 				'mode' => (string)$rule['mode'],
-				'matched' => $verdict->matched,
+				'matched' => self::shown($rule, $verdict->matched, $facts),
 				'authed' => $facts->authed,
 				'body_capped' => $facts->bodyWasCapped(),
 			] + (Ruleset::isVpatch($rule) ? ['who' => (string)($rule['who'] ?? '')] : []));
@@ -2728,7 +2946,7 @@ final class Kernel
 		$window = (int)$rate['window'];
 		$key = self::rateKey($rule, $facts);
 		// claimed until the window ends: the next window's first request past the limit reports again
-		if($this->store->once('rate:' . (int)$rule['id'] . ':' . crc32($key), max(1, $verdict->retryAfter)) === false)
+		if($this->store->once('rate:' . (int)$rule['id'] . ':' . hash('sha256', $key), max(1, $verdict->retryAfter)) === false)
 		{
 			return;
 		}
@@ -2742,13 +2960,135 @@ final class Kernel
 			'field' => (string)$rule['field'],
 			'op' => (string)$rule['op'],
 			'mode' => (string)$rule['mode'],
-			'matched' => $verdict->matched,
+			'matched' => self::shown($rule, $verdict->matched, $facts),
 			'key' => (string)$rate['key'],
 			'limit' => (int)$rate['limit'],
 			'window' => $window,
 			'count' => $verdict->count,
 			'authed' => $facts->authed,
 		]);
+	}
+	
+	/**
+	 * What a report says matched: the fragment, unless a secret could be
+	 * it. Whoever serves the rules chooses what a rule reads, so a report is
+	 * never how a request's secrets leave the site: a vpatch reading any
+	 * cookie, a header or a parameter named like a secret, or a parameter by
+	 * a wildcard name shows nothing; nor does a uri rule on a request whose
+	 * query holds a secret-named parameter, nor a body rule on a body that
+	 * holds one or that is read only raw. A name test alone would not do:
+	 * a pattern cut to `wd=` reads the password behind `pwd=` all the same.
+	 * The rule matched either way — only the report says less
+	 */
+	public static function shown(
+		array $rule,
+		string $matched,
+		Facts $facts,
+	): string
+	{
+		if($matched === '')
+		{
+			return '';
+		}
+		if(Ruleset::isVpatch($rule))
+		{
+			foreach((array)($rule['conditions'] ?? []) as $entry)
+			{
+				$members = is_array($entry) && isset($entry[Ruleset::GROUP_ANY]) ? (array)$entry[Ruleset::GROUP_ANY] : [$entry];
+				foreach($members as $member)
+				{
+					if(is_array($member) && self::secretTarget((string)($member['target'] ?? '')))
+					{
+						return '';
+					}
+				}
+			}
+			
+			return $matched;
+		}
+		
+		return match((string)($rule['field'] ?? ''))
+		{
+			Ruleset::FIELD_URI => self::holdsSecret($facts->query) ? '' : $matched,
+			Ruleset::FIELD_BODY => self::bodyShown($facts) ? $matched : '',
+			default => $matched,
+		};
+	}
+	
+	/** whether a target reads a secret's value: any cookie, a header or a parameter named like a secret, a parameter by a wildcard name */
+	public static function secretTarget(
+		string $target,
+	): bool
+	{
+		$at = strpos($target, ':');
+		if($at === false)
+		{
+			return false;
+		}
+		$name = substr($target, $at + 1);
+		
+		return match(substr($target, 0, $at))
+		{
+			'cookie' => true,
+			'header' => self::secretName($name),
+			'query', 'body', 'request', 'json', 'file' => str_contains($name, '*') || self::secretName($name),
+			default => false,
+		};
+	}
+	
+	/** whether a name, or one segment of it (`opts[api_key]`, `account.password`), is a secret's */
+	public static function secretName(
+		string $name,
+	): bool
+	{
+		foreach([$name, ...preg_split('~[\[\].]+~', $name)] as $segment)
+		{
+			if(preg_match(self::SECRET_NAME, trim($segment)) === 1)
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/** whether a parsed bag holds a secret-named field at any depth; past SECRET_DEPTH a nested array is assumed to */
+	protected static function holdsSecret(
+		mixed $bag,
+		int $depth = 0,
+	): bool
+	{
+		if(is_array($bag) === false)
+		{
+			return false;
+		}
+		if($depth > self::SECRET_DEPTH)
+		{
+			return true;
+		}
+		foreach($bag as $name => $value)
+		{
+			if((is_string($name) && self::secretName($name)) || self::holdsSecret($value, $depth + 1))
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/** whether a body rule's fragment may be shown: a form or a JSON document without a secret-named field, never a body read only raw */
+	protected static function bodyShown(
+		Facts $facts,
+	): bool
+	{
+		if($facts->form !== [])
+		{
+			return self::holdsSecret($facts->form) === false;
+		}
+		$json = $facts->json();
+		
+		return is_array($json) && self::holdsSecret($json) === false;
 	}
 	
 	/** the uncapped per-rule counter for this minute */
@@ -2878,6 +3218,13 @@ final class Kernel
 			
 			return self::PULL_FAILED;
 		}
+		// far past what RULES_MAX, VPATCHES_MAX and THREATS_MAX hold: a larger answer is no door's, and is never decoded
+		if(strlen((string)($response['body'] ?? '')) > self::BODY_MAX)
+		{
+			$this->log('pull answered more than ' . self::BODY_MAX . ' bytes');
+			
+			return self::PULL_FAILED;
+		}
 		$payload = json_decode((string)($response['body'] ?? ''), true);
 		if(is_array($payload) === false)
 		{
@@ -2921,7 +3268,10 @@ final class Kernel
 	 * A vpatch over the request: the value that passed (a parameter's, else
 	 * the frame's) and whether all of it was answered — `who` and any nonce
 	 * test — or null when it does not hold. A request that is not signed in
-	 * lacks every capability; a signed-in one asks Facts::can()
+	 * lacks every capability; a signed-in one asks Facts::can(). A json:
+	 * condition over a body past Facts::JSON_CAP is answered as holding once
+	 * an entry that held answered pins the handler (pins()): the app decodes
+	 * the body whole, and padding must not turn a block into an observe
 	 *
 	 * @return ?array{matched: string, resolved: bool}
 	 */
@@ -2954,6 +3304,9 @@ final class Kernel
 		}
 		$matched = '';
 		$framed = '';
+		// whether an entry the kernel read pins the handler, and whether a JSON body it did not read waits on that
+		$pinned = false;
+		$unread = false;
 		$entries = (array)($rule['conditions'] ?? []);
 		// an upload's contents are read last, once every cheaper condition held
 		$entries = [...array_filter($entries, static fn(mixed $entry): bool => self::readsUpload($entry) === false),
@@ -2965,7 +3318,15 @@ final class Kernel
 			{
 				return null;
 			}
-			$resolved = $resolved && $hit['resolved'];
+			if($hit['unread'] ?? false)
+			{
+				$unread = true;
+			}
+			else
+			{
+				$resolved = $resolved && $hit['resolved'];
+			}
+			$pinned = $pinned || ($hit['resolved'] && self::pins((array)$entry, $facts->platforms));
 			// a method, path or route value only stands in when no parameter's value matched
 			if($hit['frame'])
 			{
@@ -2977,7 +3338,35 @@ final class Kernel
 			}
 		}
 		
-		return ['matched' => $matched !== '' ? $matched : $framed, 'resolved' => $resolved];
+		return ['matched' => $matched !== '' ? $matched : $framed, 'resolved' => $resolved && ($unread === false || $pinned)];
+	}
+	
+	/**
+	 * Whether an entry pins the handler a request reaches: it selects
+	 * (Ruleset::selects()) and none of its members reads the method, which
+	 * every handler shares. A json: member pins only where the body was
+	 * read, as patched() asks of an entry that held answered
+	 *
+	 * @param list<Platform> $platforms
+	 */
+	protected static function pins(
+		array $entry,
+		array $platforms,
+	): bool
+	{
+		if(Ruleset::selects($entry, $platforms) === false)
+		{
+			return false;
+		}
+		foreach(isset($entry[Ruleset::GROUP_ANY]) ? (array)$entry[Ruleset::GROUP_ANY] : [$entry] as $member)
+		{
+			if((((array)$member)['target'] ?? '') === 'method')
+			{
+				return false;
+			}
+		}
+		
+		return true;
 	}
 	
 	/** whether an entry reads an upload's contents — a plain condition: a group never holds one (Ruleset::entryWellFormed) */
@@ -3029,9 +3418,9 @@ final class Kernel
 	 * that is not there is an invalid one, and a present one needs the host,
 	 * and an upload the host cannot read holds unanswered where no value
 	 * passes; a JSON body the kernel did not read holds every json: condition
-	 * unanswered
+	 * unanswered and says so (`unread`), for patched() to answer
 	 *
-	 * @return ?array{matched: string, resolved: bool}
+	 * @return ?array{matched: string, resolved: bool, unread?: true}
 	 */
 	public static function condition(
 		array $condition,
@@ -3042,7 +3431,7 @@ final class Kernel
 		// before exists and nonce_invalid: an unread body is neither absent nor missing its nonce
 		if(str_starts_with($target, 'json:') && $facts->jsonUnread())
 		{
-			return ['matched' => '', 'resolved' => false];
+			return ['matched' => '', 'resolved' => false, 'unread' => true];
 		}
 		[$values, $unread] = str_starts_with($target, 'file-content:')
 			? self::contents($facts, substr($target, strlen('file-content:'))) : [self::values($target, $facts), false];
@@ -3146,7 +3535,8 @@ final class Kernel
 		}
 		if($target === 'path')
 		{
-			return [$facts->path()];
+			// a script reached with PATH_INFO behind it is that script too
+			return array_values(array_unique([$facts->path(), $facts->scriptPath()]));
 		}
 		$platform = Ruleset::targetOf($target, $facts->platforms);
 		if($platform !== null)
@@ -3160,7 +3550,7 @@ final class Kernel
 		$values = match($prefix)
 		{
 			'query' => self::pick($facts->query, $name),
-			'request' => [...self::pick($facts->query, $name), ...self::pick($facts->form, $name)],
+			'request' => self::requested($facts, $name),
 			'body' => self::pick($facts->form, $name),
 			'json' => self::pickJson($facts->json(), $name),
 			'cookie' => self::pick($facts->cookies, $name),
@@ -3178,6 +3568,30 @@ final class Kernel
 		}
 		
 		return [...$values, ...self::values($target, $outer)];
+	}
+	
+	/**
+	 * A request: target's own values: the query's and the form's, then what
+	 * the host's request bag (Facts::$request) holds beside them — PHP's
+	 * $_REQUEST takes the cookies in where request_order leaves them in, a
+	 * cookie overriding the query's value there. A union, never the bag
+	 * alone: WordPress rebuilds $_REQUEST from the query and the form after
+	 * plugins_loaded, and its handlers read that one
+	 *
+	 * @return list<string>
+	 */
+	protected static function requested(
+		Facts $facts,
+		string $name,
+	): array
+	{
+		$sent = [...self::pick($facts->query, $name), ...self::pick($facts->form, $name)];
+		if($facts->request === null)
+		{
+			return $sent;
+		}
+		
+		return [...$sent, ...array_values(array_diff(self::pick($facts->request, $name), $sent))];
 	}
 	
 	/**
@@ -3774,6 +4188,8 @@ final class Kernel
 				'timeout' => $timeoutMs / 1000,
 				// a non-2xx answer (a 304 too) is still read, its status taken from the headers
 				'ignore_errors' => true,
+				// a redirect is answered, never followed: the key header would go to wherever it points
+				'follow_location' => 0,
 			]]);
 			$body = @file_get_contents($url, false, $context);
 			$status = 0;

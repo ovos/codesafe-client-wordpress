@@ -11,6 +11,7 @@ use Ovos\Test\Internal;
 use function array_flip;
 use function array_intersect_key;
 use function gmdate;
+use function str_contains;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -39,6 +40,11 @@ class SenderRefusal extends Test
 		$config = new class extends Config
 		{
 			public function securityEvents(): bool
+			{
+				return true;
+			}
+			
+			public function shieldDetect(): bool
 			{
 				return true;
 			}
@@ -101,6 +107,24 @@ class SenderRefusal extends Test
 			&& $mine['status'] === 301
 			&& $mine['sessionId'] === 's1'
 			&& $mine['uri'] === '/de/';
+	}
+	
+	/**
+	 * The Shield's matched fragment is the request's own text: by text it
+	 * loses a password a pattern matched around and keeps the rest; the key
+	 * walk alone sees only the key `matched`. Falsify: scrub the extra bag by
+	 * key alone — `pwd=hunter2` travels to codesafe.
+	 */
+	public function aShieldFragmentLosesItsSecretsByText(): bool
+	{
+		$sender = $this->sender();
+		$sender->reportRefusal('shield_observe', 'shield rule 4 observed POST /wp-login.php',
+			['rule' => 4, 'matched' => 'log=admin&pwd=hunter2&rememberme=forever']);
+		$extra = $sender->decorated($sender->queued()[0], ['host' => 'site.test'])['context']['extra'];
+		
+		return str_contains($extra['matched'], 'hunter2') === false
+			&& str_contains($extra['matched'], 'rememberme=forever')
+			&& $extra['rule'] === 4;
 	}
 	
 	/**

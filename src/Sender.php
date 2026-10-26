@@ -55,6 +55,10 @@ use function time;
 use function trim;
 use function usleep;
 
+use const CURLOPT_PROTOCOLS;
+use const CURLOPT_REDIR_PROTOCOLS;
+use const CURLPROTO_HTTP;
+use const CURLPROTO_HTTPS;
 use const PHP_SESSION_ACTIVE;
 use const PHP_URL_HOST;
 
@@ -760,6 +764,25 @@ class Sender
 	}
 	
 	/**
+	 * The extra bag by key, identities kept for codesafe's vault, and the
+	 * Shield's matched fragment by text too: it is the request's own text, so
+	 * a pattern that matched a form carries the pairs around the match, and
+	 * the key walk sees only the key `matched`
+	 */
+	protected static function scrubExtra(
+		array $extra,
+	): array
+	{
+		$extra = Redactor::scrub($extra, identities: false);
+		if(is_string($extra['matched'] ?? null))
+		{
+			$extra['matched'] = Redactor::scrubText($extra['matched'], identities: false);
+		}
+		
+		return $extra;
+	}
+	
+	/**
 	 * Merges context, WP extras and the release label into a payload
 	 */
 	protected function decorate(
@@ -785,7 +808,7 @@ class Sender
 		// its null removes the base's answer (a report another request queued)
 		$payload['context'] = array_filter(array_replace($context['context'], $payload['context'] ?? []),
 				static fn(mixed $value): bool => $value !== null)
-			+ ['extra' => Redactor::scrub($payload['extra'], identities: false) + $this->buildWpExtra($payload)];
+			+ ['extra' => self::scrubExtra($payload['extra']) + $this->buildWpExtra($payload)];
 		unset($payload['extra']);
 		
 		$release = $this->config->release();
@@ -1472,6 +1495,9 @@ class Sender
 				CURLOPT_TIMEOUT_MS => 1000,
 				CURLOPT_SSL_VERIFYPEER => $verify,
 				CURLOPT_SSL_VERIFYHOST => $verify ? 2 : 0,
+				// codesafe is http(s): a gopher:// or dict:// URL would send raw bytes to any host and port it names
+				CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+				CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 			]);
 			
 			$body = curl_exec($handle);

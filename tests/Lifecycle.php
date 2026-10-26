@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Tests;
 
 use Ovos\Codesafe\CoreUpdate;
+use Ovos\Codesafe\Inventory;
 use Ovos\Codesafe\Lifecycle as BaseLifecycle;
 use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Codesafe\Shield\Ruleset;
@@ -200,8 +201,10 @@ class Lifecycle extends Test
 	 */
 	public function theNetworksOwnOptionGoesOnce(): bool
 	{
-		return BaseLifecycle::SITE_OPTIONS === [CoreUpdate::OPTION]
-			&& in_array(CoreUpdate::OPTION, BaseLifecycle::OPTIONS, true);
+		// core's kept switch-on and the automatic updates codesafe switched on: the network's, removed once
+		return BaseLifecycle::SITE_OPTIONS === [CoreUpdate::OPTION, Inventory::OURS]
+			&& in_array(CoreUpdate::OPTION, BaseLifecycle::OPTIONS, true)
+			&& in_array(Inventory::OURS, BaseLifecycle::OPTIONS, true);
 	}
 	
 	/**

@@ -129,10 +129,13 @@ class Settings
 	{
 		$input = is_array($input) ? $input : [];
 		$stored = (array)get_option(Config::OPTION, []);
+		// a field the input leaves out reads as its default, never as a notice
+		$interval = (int)($input['scan_interval'] ?? Config::DEFAULTS['scan_interval']);
 		
 		$clean = [
 			'enabled' => $this->truthy($input['enabled'] ?? ''),
-			'url' => esc_url_raw(trim((string)($input['url'] ?? ''))),
+			// http(s) only: the transports hand this URL to curl, which speaks gopher:// and dict:// as well
+			'url' => esc_url_raw(trim((string)($input['url'] ?? '')), ['https', 'http']),
 			'api_key' => trim((string)($input['api_key'] ?? '')),
 			'log_level' => max(0, min(7, (int)($input['log_level'] ?? Config::DEFAULTS['log_level']))),
 			'report_404' => $this->truthy($input['report_404'] ?? ''),
@@ -141,9 +144,7 @@ class Settings
 			'auto_update_vulnerable' => $this->truthy($input['auto_update_vulnerable'] ?? ''),
 			'request_body' => Body::mode((string)($input['request_body'] ?? '')),
 			'scan' => $this->truthy($input['scan'] ?? ''),
-			'scan_interval' => in_array((int)($input['scan_interval'] ?? 7), [1, 7], true)
-				? (int)$input['scan_interval']
-				: 7,
+			'scan_interval' => in_array($interval, [1, 7], true) ? $interval : Config::DEFAULTS['scan_interval'],
 			'entry_watch' => $this->truthy($input['entry_watch'] ?? ''),
 			'release' => mb_substr(sanitize_text_field((string)($input['release'] ?? '')), 0, 64),
 			'environment' => mb_substr(sanitize_text_field((string)($input['environment'] ?? '')), 0, 64),
@@ -900,7 +901,11 @@ class Settings
 		
 		$state = $this->runner->state();
 		
-		if($state !== null)
+		if($this->runner->mayRunManually() === false)
+		{
+			echo '<p>' . esc_html__('On a network the scan walks the files every site shares, so a super admin starts it on the main site.', 'ovos-codesafe') . '</p>';
+		}
+		elseif($state !== null)
 		{
 			$this->renderScanProgress($state);
 		}

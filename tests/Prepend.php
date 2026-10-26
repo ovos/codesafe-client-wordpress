@@ -28,6 +28,7 @@ use function implode;
 use function is_dir;
 use function is_file;
 use function is_int;
+use function json_encode;
 use function mkdir;
 use function preg_match;
 use function realpath;
@@ -39,6 +40,7 @@ use function str_ends_with;
 use function str_repeat;
 use function str_replace;
 use function str_starts_with;
+use function strlen;
 use function sys_get_temp_dir;
 use function time;
 use function uniqid;
@@ -255,38 +257,93 @@ class Prepend extends Test
 	}
 	
 	/**
-	 * RULE: the mu-plugin stage runs inside WordPress, so a signed-in request
-	 * is the adapter's there whatever the script — a file outside the stored
-	 * root, as on a WordPress-in-a-subdirectory install or a wp-load.php
-	 * include — while the prepend layer, before WordPress, judges such a
-	 * script itself. Falsify: tell it by the script in the mu-plugin stage
-	 * too — a signed-in editor on a subdirectory install is judged anonymous.
+	 * RULE: the mu-plugin stage runs inside WordPress, so what a signed-in
+	 * request's verdict waits on is the adapter's there whatever the script —
+	 * a file outside the stored root, as on a WordPress-in-a-subdirectory
+	 * install or a wp-load.php include — while the prepend layer, before
+	 * WordPress, judges such a script itself. Falsify: tell it by the script
+	 * in the mu-plugin stage too — a signed-in editor on a subdirectory
+	 * install is judged anonymous.
 	 */
 	public function theMuPluginStageIsInsideWordPress(): bool
 	{
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
 		$cookie = ['wordpress_logged_in_abc123' => 'x'];
-		$outside = $this->server(self::BOT, '/x.php', $this->dir . '/outside.php');
+		// rule 8 observes it: nothing this layer refuses whoever asks
+		$outside = $this->server('Mozilla/5.0', '/x.php?include=../../etc/passwd', $this->dir . '/outside.php');
 		
 		return BasePrepend::judge($this->dir, $outside, [], $cookie) !== null
 			&& BasePrepend::judge($this->dir, $outside, [], $cookie, null, null, $ran, null, [], true) === null;
 	}
 	
 	/**
-	 * A signed-in request to a file WordPress runs through is the plugins_loaded
-	 * judge's, not this layer's — WordPress's test cookie is not a login
+	 * What a signed-in request to a file WordPress runs through observes is
+	 * the plugins_loaded judge's, not this layer's, which reports it with the
+	 * user — WordPress's test cookie is not a login
 	 */
 	public function loginCookieDefersToPluginsLoadedWhereWordPressRuns(): bool
 	{
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
 		$cookie = ['wordpress_logged_in_abc123' => 'x'];
+		$probe = '?include=../../etc/passwd';
 		
-		return BasePrepend::judge($this->dir, $this->server(self::BOT, '/', $root . '/index.php'), [], $cookie) === null
-			&& BasePrepend::judge($this->dir, $this->server(self::BOT, '/wp-admin/admin-ajax.php', $root . '/wp-admin/admin-ajax.php'), [], $cookie) === null
-			&& BasePrepend::judge($this->dir, $this->server(self::BOT, '/wp-admin/network/sites.php', $root . '/wp-admin/network/sites.php'), [], $cookie) === null
-			&& BasePrepend::judge($this->dir, $this->server(self::BOT, '/', $root . '/index.php'), [], ['wordpress_test_cookie' => 'WP Cookie check']) !== null;
+		return BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/' . $probe, $root . '/index.php'), [], $cookie) === null
+			&& BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/wp-admin/admin-ajax.php' . $probe, $root . '/wp-admin/admin-ajax.php'), [], $cookie) === null
+			&& BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/wp-admin/network/sites.php' . $probe, $root . '/wp-admin/network/sites.php'), [], $cookie) === null
+			&& BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/' . $probe, $root . '/index.php'), [], ['wordpress_test_cookie' => 'WP Cookie check']) !== null;
+	}
+	
+	/**
+	 * RULE: a login cookie, or Basic credentials on a REST request, is a NAME
+	 * anyone can send, and WordPress's mu-plugins, drop-ins and plugin files
+	 * run before plugins_loaded: this layer still refuses what holds
+	 * whoever asks — a match rule, a vpatch for anyone — judging the caller
+	 * as one it cannot tell, and leaves to the adapter what waits on who (a
+	 * vpatch for anonymous callers) unjudged, a rate rule uncounted. Falsify:
+	 * step aside for the cookie — `Cookie: wordpress_logged_in_x=1` walks a
+	 * blocked exploit past this layer to code that runs before the adapter.
+	 */
+	public function aLoginCookieOrBasicCredentialsSkipNoBlockForAnyone(): bool
+	{
+		$rules = [
+			['id' => 7, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'ua', 'op' => 'contains', 'value' => 'zz-prepend-bot', 'ci' => true, 'mode' => 'proven', 'expires_at' => null],
+			['id' => 41, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
+				'who' => 'anonymous', 'conditions' => [['target' => 'query:action', 'test' => 'equals', 'value' => 'fx_save']]],
+			['id' => 42, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'uri', 'op' => 'prefix', 'value' => '/shop/', 'ci' => true,
+				'mode' => 'proven', 'expires_at' => null, 'kind' => 'rate', 'rate' => ['key' => 'ip', 'limit' => 1, 'window' => 60]],
+		];
+		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
+			'contract' => 1,
+			'dialect' => 're2-2026',
+			'project' => 'harness',
+			'rules' => $rules,
+		], time(), platforms: BasePrepend::platforms())->toRecord());
+		$root = $this->site();
+		$apcu = function_exists('apcu_enabled') && apcu_enabled();
+		BasePrepend::writeConsent($this->dir, ['root' => $root, 'prefix' => 'tests:prepend-deferred:' . uniqid()] + self::ENFORCE);
+		$cookie = ['wordpress_logged_in_x' => '1'];
+		$basic = ['HTTP_AUTHORIZATION' => 'Basic ' . base64_encode('x:y')];
+		$ran = null;
+		$bot = BasePrepend::judge($this->dir, $this->server(self::BOT, '/', $root . '/index.php'), [], $cookie, null, null, $ran);
+		$botRan = $ran;
+		$rest = BasePrepend::judge($this->dir, $basic + $this->server(self::BOT, '/wp-json/fx/v1/save', $root . '/index.php'));
+		$anonymous = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/?action=fx_save', $root . '/index.php'), [], $cookie, null, null, $ran);
+		$anonymousRan = $ran;
+		// the same request without the cookie is the anonymous caller it is
+		$plain = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/?action=fx_save', $root . '/index.php'));
+		// two requests the adapter judges again count nothing here: the first one judged here is the rule's first
+		$shop = fn(array $cookies): ?array => BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/shop/', $root . '/index.php'), [], $cookies);
+		$deferred = [$shop($cookie), $shop($cookie)];
+		$counted = [$shop([]), $shop([])];
+		
+		return ($bot['verdict'] ?? null)?->isBlock() === true && (int)$bot['verdict']->rule['id'] === 7 && $botRan === true
+			&& ($rest['verdict'] ?? null)?->isBlock() === true
+			&& $anonymous === null && $anonymousRan === false
+			&& ($plain['verdict'] ?? null)?->isBlock() === true && (int)$plain['verdict']->rule['id'] === 41
+			&& $deferred === [null, null]
+			&& ($apcu === false || ($counted[0] === null && ($counted[1]['verdict'] ?? null)?->status() === 429));
 	}
 	
 	/**
@@ -367,6 +424,31 @@ class Prepend extends Test
 	public function contextOfLeavesStatusOutWhenNoneDecided(): bool
 	{
 		return isset(BasePrepend::contextOf($this->server('x'), null)['status']) === false;
+	}
+	
+	/**
+	 * RULE: a refused request's facts are capped before the queue and the
+	 * seen list hold them — the uri at CONTEXT_URI_MAX bytes, the user agent,
+	 * the referer and the host at CONTEXT_FIELD_MAX — never inside a UTF-8
+	 * character, so the file stays JSON. Falsify: keep them whole — 8 KB of
+	 * each per hit grows the rewritten queue to megabytes, a cost the sender
+	 * pays on every request it sends.
+	 */
+	public function contextOfCapsEveryField(): bool
+	{
+		$long = str_repeat('a', 9000);
+		$server = ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/' . $long, 'HTTP_USER_AGENT' => $long, 'HTTP_REFERER' => 'https://x.test/' . $long,
+			'HTTP_HOST' => $long, 'REMOTE_ADDR' => '203.0.113.9'];
+		$context = BasePrepend::contextOf($server, 403);
+		// an umlaut across the cut: the whole character goes
+		$umlaut = BasePrepend::contextOf(['HTTP_USER_AGENT' => str_repeat('a', BasePrepend::CONTEXT_FIELD_MAX - 1) . "\u{e4}x"], null);
+		
+		return strlen($context['uri']) === BasePrepend::CONTEXT_URI_MAX
+			&& strlen($context['ua']) === BasePrepend::CONTEXT_FIELD_MAX
+			&& strlen($context['referer']) === BasePrepend::CONTEXT_FIELD_MAX
+			&& strlen($context['host']) === BasePrepend::CONTEXT_FIELD_MAX
+			&& $umlaut['ua'] === str_repeat('a', BasePrepend::CONTEXT_FIELD_MAX - 1)
+			&& json_encode($umlaut) !== false;
 	}
 	
 	public function queueIsCappedAtQueueMaxOldestGoingFirst(): bool
@@ -822,51 +904,110 @@ class Prepend extends Test
 		$blocked = null;
 		BasePrepend::judge($this->dir, $this->server(self::BOT), [], [], null, null, $blocked);
 		$signedIn = null;
-		BasePrepend::judge($this->dir, $this->server(self::BOT, '/', $root . '/index.php'), [], ['wordpress_logged_in_abc123' => 'x'], null, null, $signedIn);
+		BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/?include=../../etc/passwd', $root . '/index.php'), [], ['wordpress_logged_in_abc123' => 'x'],
+			null, null, $signedIn);
 		
 		return $without === false && $plain === null && $passed === true && $blocked === true && $signedIn === false;
 	}
 	
 	/**
-	 * RULE: a REST request carrying Basic credentials to a file WordPress runs
-	 * through is the plugins_loaded judge's, not this layer's — an application
-	 * password makes it a user's only once WordPress checks it — whether the
-	 * server parsed the credentials or the header still holds them, addressed
-	 * by path or by rest_route, under the REST prefix the consent keeps;
-	 * anything else is judged here as before. Falsify: judge it — an
-	 * integration's REST call is refused as anonymous before WordPress could
-	 * tell who it is.
+	 * RULE: what a REST request carrying Basic credentials to a file
+	 * WordPress runs through waits on — a rule for anonymous callers — is the
+	 * plugins_loaded judge's, not this layer's: an application password makes
+	 * it a user's only once WordPress checks it — whether the server parsed
+	 * the credentials or the header still holds them, addressed by path or by
+	 * rest_route, under the REST prefix the consent keeps; anything else is
+	 * judged here as before. Falsify: judge it as anonymous — an
+	 * integration's REST call is refused before WordPress could tell who it is.
 	 */
 	public function aRestRequestWithBasicCredentialsIsLeftToTheAdapter(): bool
 	{
+		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
+			'contract' => 1,
+			'dialect' => 're2-2026',
+			'project' => 'harness',
+			'rules' => [['id' => 43, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
+				'who' => 'anonymous', 'conditions' => [['target' => 'query:probe', 'test' => 'equals', 'value' => '1']]]],
+		], time(), platforms: BasePrepend::platforms())->toRecord());
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
 		$basic = ['HTTP_AUTHORIZATION' => 'Basic ' . base64_encode('integration:abcd 1234')];
-		$request = fn(string $uri, array $extra = [], string $script = '/index.php'): array => $extra + $this->server(self::BOT, $uri, $root . $script);
+		$request = fn(string $uri, array $extra = [], string $script = '/index.php'): array => $extra + $this->server('Mozilla/5.0', $uri, $root . $script);
 		$ran = null;
-		$header = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save', $basic), [], [], null, null, $ran);
+		$header = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save?probe=1', $basic), [], [], null, null, $ran);
 		$headerRan = $ran;
-		$parsed = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save', ['PHP_AUTH_USER' => 'integration', 'PHP_AUTH_PW' => 'abcd']));
-		$route = BasePrepend::judge($this->dir, $request('/?rest_route=/fx/v1/save', $basic));
-		$posted = BasePrepend::judge($this->dir, $request('/', $basic), ['rest_route' => '/fx/v1/save']);
-		$without = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save'));
-		$page = BasePrepend::judge($this->dir, $request('/shop/', $basic));
-		$bearer = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save', ['HTTP_AUTHORIZATION' => 'Bearer abc']));
-		$file = BasePrepend::judge($this->dir, $request('/wp-content/plugins/some-plugin/file.php/wp-json/x', $basic,
+		$parsed = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save?probe=1', ['PHP_AUTH_USER' => 'integration', 'PHP_AUTH_PW' => 'abcd']));
+		$route = BasePrepend::judge($this->dir, $request('/?rest_route=/fx/v1/save&probe=1', $basic));
+		$posted = BasePrepend::judge($this->dir, $request('/?probe=1', $basic), ['rest_route' => '/fx/v1/save']);
+		$without = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save?probe=1'));
+		$page = BasePrepend::judge($this->dir, $request('/shop/?probe=1', $basic));
+		$file = BasePrepend::judge($this->dir, $request('/wp-content/plugins/some-plugin/file.php/wp-json/x?probe=1', $basic,
 			'/wp-content/plugins/some-plugin/file.php'));
 		// the site's own prefix: /api/ is the REST API, /wp-json/ no longer is
 		BasePrepend::writeConsent($this->dir, ['root' => $root, 'rest_prefix' => 'api'] + self::ENFORCE);
-		$custom = BasePrepend::judge($this->dir, $request('/api/fx/v1/save', $basic));
-		$default = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save', $basic));
+		$custom = BasePrepend::judge($this->dir, $request('/api/fx/v1/save?probe=1', $basic));
+		$default = BasePrepend::judge($this->dir, $request('/wp-json/fx/v1/save?probe=1', $basic));
 		
 		return $header === null && $headerRan === false
 			&& $parsed === null && $route === null && $posted === null
 			&& ($without['verdict'] ?? null)?->isBlock() === true
 			&& ($page['verdict'] ?? null)?->isBlock() === true
-			&& ($bearer['verdict'] ?? null)?->isBlock() === true
 			&& ($file['verdict'] ?? null)?->isBlock() === true
 			&& $custom === null
 			&& ($default['verdict'] ?? null)?->isBlock() === true;
+	}
+	
+	/**
+	 * RULE: wp-admin's installer and upgrader and the network's activation
+	 * page define WP_INSTALLING, under which WordPress loads no site plugin:
+	 * no adapter will judge them, so this layer does, a login cookie or not;
+	 * the rest of wp-admin and the root entries load WordPress whole.
+	 * Falsify: count them as loading WordPress — a login cookie's NAME walks
+	 * an exploit past both layers on install.php.
+	 */
+	public function theInstallerAndTheActivationPageLoadNoPlugins(): bool
+	{
+		$root = $this->site();
+		foreach(['wp-admin/install.php', 'wp-admin/upgrade.php', 'wp-admin/setup-config.php', 'wp-activate.php'] as $file)
+		{
+			file_put_contents($root . '/' . $file, "<?php\n");
+			if(BasePrepend::loadsWordPress(['SCRIPT_FILENAME' => $root . '/' . $file], $root))
+			{
+				return false;
+			}
+		}
+		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
+		$observed = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/wp-admin/install.php?include=../../etc/passwd', $root . '/wp-admin/install.php'), [],
+			['wordpress_logged_in_x' => '1']);
+		
+		return BasePrepend::loadsWordPress(['SCRIPT_FILENAME' => $root . '/wp-admin/admin-ajax.php'], $root)
+			&& BasePrepend::loadsWordPress(['SCRIPT_FILENAME' => $root . '/index.php'], $root)
+			&& ($observed['verdict'] ?? null)?->outcome === Verdict::OBSERVE;
+	}
+	
+	/**
+	 * RULE: the layer hands the kernel the host's request bag ($_REQUEST)
+	 * beside the query and the form, so a request: rule meets a value a
+	 * cookie put there. Falsify: build the facts without it — a handler that
+	 * reads $_REQUEST before WordPress rebuilds it gets the cookie's value
+	 * past the rule.
+	 */
+	public function theRequestBagReachesTheKernel(): bool
+	{
+		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
+			'contract' => 1,
+			'dialect' => 're2-2026',
+			'project' => 'harness',
+			'rules' => [['id' => 44, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
+				'who' => 'anyone', 'conditions' => [['target' => 'path', 'test' => 'suffix', 'value' => '/file.php'],
+				['target' => 'request:action', 'test' => 'equals', 'value' => 'fx_delete']]]],
+		], time(), platforms: BasePrepend::platforms())->toRecord());
+		BasePrepend::writeConsent($this->dir, self::ENFORCE);
+		$server = $this->server('Mozilla/5.0', '/wp-content/plugins/some-plugin/file.php?action=benign');
+		$bag = BasePrepend::judge($this->dir, $server, [], ['action' => 'fx_delete'], null, null, $ran, ['action' => 'benign'], [], null, ['action' => 'fx_delete']);
+		$none = BasePrepend::judge($this->dir, $server, [], ['action' => 'fx_delete'], null, null, $ran, ['action' => 'benign']);
+		
+		return ($bag['verdict'] ?? null)?->isBlock() === true && $none === null;
 	}
 	
 	/**

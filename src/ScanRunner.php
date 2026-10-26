@@ -185,12 +185,22 @@ class ScanRunner
 	}
 	
 	/**
+	 * Whether this request's user may press Scan now: whoever may open the
+	 * settings on a single site; on a network a super admin on the main site
+	 * alone — the walk covers the one docroot every site of it shares
+	 */
+	public function mayRunManually(): bool
+	{
+		return current_user_can('manage_options') && $this->config->mayChangeNetworkKeys();
+	}
+	
+	/**
 	 * admin-post: one round of the manual scan, then back to the settings
 	 * page with the outcome in the query (running | done | busy)
 	 */
 	public function handleManual(): void
 	{
-		if(current_user_can('manage_options') === false)
+		if($this->mayRunManually() === false)
 		{
 			wp_die(esc_html__('Insufficient permissions.', 'ovos-codesafe'));
 		}

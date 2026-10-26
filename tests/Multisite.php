@@ -108,6 +108,43 @@ class Multisite extends Test
 			&& $super['trusted_proxies'] === 'cloudflare';
 	}
 	
+	/**
+	 * RULE: the software inventory, codesafe's auto-update word, core's
+	 * switch-on and the integrity scan act on the whole network — its plugin
+	 * and theme lists, the network's auto-update options, the one docroot —
+	 * so they are the main site's alone: a subsite's ticked boxes send no
+	 * inventory, switch no update and walk no file, its form cannot change
+	 * them, and only a super admin on the main site may press Scan now.
+	 * Falsify: read a subsite's own boxes — a subsite admin connects their
+	 * own codesafe and steers the network's auto-updates and reads its files.
+	 */
+	public function aSubsitesBoxesDriveNoNetworkWideFeature(): bool
+	{
+		$network = ['inventory' => true, 'auto_update_vulnerable' => true, 'scan' => true, 'scan_interval' => 7];
+		$GLOBALS['wp']['options']['ovos_codesafe'] = self::BOXES + $network;
+		$GLOBALS['wp']['current_caps'] = ['manage_options'];
+		$this->network(main: false);
+		$sub = new Config();
+		// read while the request is the subsite's: ownership is the network's answer at the moment it is asked
+		$subFeatures = [$sub->inventory(), $sub->autoUpdateVulnerable(), $sub->scan(), (new Inventory($sub))->isEnabled()];
+		$subForm = $this->settings()->sanitize(['auto_update_vulnerable' => '0', 'scan' => '0', 'scan_interval' => '1']);
+		$core = new TestCoreUpdate($sub);
+		$core->constantValue = false;
+		$subSwitched = $core->switchOn(null, '6.8', 'requested');
+		$subScan = (new ScanRunner($sub, new Scan($sub)))->mayRunManually();
+		$this->network(main: true);
+		$main = new Config();
+		$adminScan = (new ScanRunner($main, new Scan($main)))->mayRunManually();
+		$GLOBALS['wp']['super_admins'] = [7];
+		$superScan = (new ScanRunner($main, new Scan($main)))->mayRunManually();
+		
+		return $subFeatures === [false, false, false, false]
+			&& $subSwitched === null && isset($GLOBALS['wp']['site_options']['auto_update_core_minor']) === false
+			&& $subForm['auto_update_vulnerable'] === true && $subForm['scan'] === true && $subForm['scan_interval'] === 7
+			&& $subScan === false && $adminScan === false && $superScan === true
+			&& $main->inventory() && $main->autoUpdateVulnerable() && $main->scan();
+	}
+	
 	/** the proxy is the server's: a subsite reads the main site's */
 	public function aSubsiteReadsTheMainSitesTrustedProxy(): bool
 	{

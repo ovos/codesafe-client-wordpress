@@ -6,6 +6,9 @@ namespace Ovos\Codesafe;
 use WP_Error;
 use WP_User;
 
+use function current_user_can;
+use function get_option;
+use function get_role;
 use function implode;
 use function in_array;
 use function is_array;
@@ -283,7 +286,8 @@ class Security
 	 * user id and role names only, never the account's identity. WP core
 	 * fires this for NEW users too (wp_insert_user always calls set_role),
 	 * so a born-admin account is seen here — the message says created vs
-	 * changed so the operator reads which move it was.
+	 * changed so the operator reads which move it was. An ordinary sign-up
+	 * is not reported (isSignUp()).
 	 */
 	public function reportRoleChange(
 		$userId,
@@ -293,6 +297,11 @@ class Security
 	{
 		$oldRoles = (array)$oldRoles;
 		$role = is_scalar($role) ? (string)$role : '?';
+		
+		if($oldRoles === [] && $this->isSignUp($role))
+		{
+			return;
+		}
 		
 		// extra.action names the sub-kind for the console's rules ("action = X")
 		$action = $oldRoles === []
@@ -307,11 +316,55 @@ class Security
 	}
 	
 	/**
+	 * Whether a new account is a sign-up: made by no one who may create or
+	 * add accounts (a visitor registering, a shop's checkout making a
+	 * customer), with no capability the site's default role lacks. Routine
+	 * as a clean login is, and as many as the site has visitors, so it is
+	 * not reported. A default role that can write posts is never a
+	 * sign-up's: open signup into an editor or administrator is the
+	 * post-compromise trap, and each such account stays the incident line.
+	 */
+	protected function isSignUp(
+		string $role,
+	): bool
+	{
+		if(current_user_can('create_users') || current_user_can('promote_users'))
+		{
+			return false;
+		}
+		
+		$default = get_role((string)get_option('default_role', 'subscriber'));
+		$granted = get_role($role);
+		
+		if($default === null || $granted === null || $default->has_cap('edit_posts'))
+		{
+			return false;
+		}
+		
+		// above the default role: any capability it grants that the default does not
+		foreach($granted->capabilities as $capability => $on)
+		{
+			if((bool)$on && $default->has_cap((string)$capability) === false)
+			{
+				return false;
+			}
+		}
+		
+		return true;
+	}
+	
+	/**
 	 * wp_ajax_edit-theme-plugin-file at priority 0 — a save from the theme
 	 * or plugin FILE EDITOR, observed before core's handler runs (and
 	 * wp_dies). The webshell-by-editor move: legitimate on almost no
 	 * production site, and even a refused attempt is worth the line. The
 	 * file name is the signal; the content is deliberately not touched.
+	 *
+	 * Any signed-in account can post to admin-ajax.php, so the line is a
+	 * privileged_action only for an account core lets save that kind of
+	 * file (edit_plugins / edit_themes, which DISALLOW_FILE_EDIT and a
+	 * network's super-admin rule already answer); anyone else's attempt is
+	 * a permission_denied, under that kind's budget.
 	 */
 	public function reportFileEditorSave(): void
 	{
@@ -321,6 +374,16 @@ class Security
 			: '?';
 		$container = isset($_POST['theme']) ? 'theme' : 'plugin';
 		// phpcs:enable WordPress.Security.NonceVerification
+		
+		// core's own check before a save (wp_edit_theme_plugin_file())
+		if(current_user_can($container === 'theme' ? 'edit_themes' : 'edit_plugins') === false)
+		{
+			$this->sender->reportRefusal('permission_denied',
+				'file editor save refused: ' . $container . ' ' . $file,
+				['action' => 'file_edit']);
+			
+			return;
+		}
 		
 		$this->sender->reportRefusal('privileged_action',
 			'file editor save: ' . $container . ' ' . $file,

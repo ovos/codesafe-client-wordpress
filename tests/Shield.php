@@ -509,6 +509,65 @@ class Shield extends Test
 			&& $facts->htmlUnsafe('<script>x</script>') === true && $facts->htmlUnsafe('a & b') === false;
 	}
 	
+	/**
+	 * RULE: the adapter hands the kernel PHP's $_REQUEST beside the query and
+	 * the form — taken at plugins_loaded, before WordPress rebuilds it from
+	 * the two — so a request: rule meets a value a cookie put there, on the
+	 * facts it builds and on the request it judges. Falsify: judge without
+	 * the bag — a handler that reads $_REQUEST at plugins_loaded gets the
+	 * cookie's value past the rule.
+	 */
+	public function theAdapterHandsTheKernelTheRequestBag(): bool
+	{
+		wp_shim_reset();
+		$server = ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/?action=benign'];
+		$get = ['action' => 'benign'];
+		$cookies = ['action' => 'fx_delete'];
+		$anonymous = ['authed' => false, 'user' => '', 'can' => null, 'nonce' => null, 'known' => true];
+		$facts = Adapter::facts($server, $get, [], $cookies, [], $anonymous, '203.0.113.9', 'wp-json', $cookies);
+		$path = sys_get_temp_dir() . '/shield-adapter-bag-' . uniqid() . '.json';
+		$store = new Store($path, '', false);
+		$store->write(Ruleset::fromPayload(['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => [['id' => 51, 'kind' => 'vpatch',
+			'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null, 'who' => 'anyone',
+			'conditions' => [['target' => 'request:action', 'test' => 'equals', 'value' => 'fx_delete']]]]], time(), platforms: Prepend::platforms())->toRecord());
+		$config = new class extends Config
+		{
+			public function __construct()
+			{
+			}
+			
+			public function shieldDetect(): bool
+			{
+				return true;
+			}
+			
+			public function shieldEnforce(): bool
+			{
+				return true;
+			}
+			
+			public function shieldKill(): bool
+			{
+				return false;
+			}
+		};
+		$adapter = new Adapter($config, new Sender(new Config),
+			new Kernel('https://codesafe.invalid', 'k', $store, static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''], platforms: Prepend::platforms()));
+		try
+		{
+			$bag = $adapter->judgeRequest([$server, $get, [], $cookies, [], $cookies], $anonymous, '203.0.113.9', 'wp-json');
+			$none = $adapter->judgeRequest([$server, $get, [], $cookies, []], $anonymous, '203.0.113.9', 'wp-json');
+		}
+		finally
+		{
+			unlink($path);
+			wp_shim_reset();
+		}
+		
+		return Kernel::values('request:action', $facts) === ['benign', 'fx_delete']
+			&& $bag?->isBlock() === true && $none?->isPass() === true;
+	}
+	
 	public function fragmentWithoutHitsCarriesNoShieldSections(): bool
 	{
 		return isset(Rollup::assemble(29833333, ['requests' => 3])['shield_observe']) === false;

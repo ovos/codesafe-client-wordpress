@@ -455,6 +455,8 @@ class Inventory extends Test
 	{
 		$GLOBALS['wp']['options']['auto_update_plugins'] = ['some/other.php', self::CF7, self::AKISMET];
 		$GLOBALS['wp']['options']['auto_update_themes'] = ['twentytwentyfour', 'astra'];
+		// codesafe switched these two on: its own to take back
+		$GLOBALS['wp']['options'][PluginInventory::OURS] = ['plugin' => [self::CF7], 'theme' => ['twentytwentyfour']];
 		$unwanted = PluginInventory::unwanted(['auto_update_off' => [
 			['type' => 'plugin', 'slug' => 'contact-form-7'],
 			['type' => 'theme', 'slug' => 'twentytwentyfour'],
@@ -483,6 +485,29 @@ class Inventory extends Test
 			&& array_column($inventory->sender->said, 3) === [Sender::withoutRequest(), Sender::withoutRequest()]
 			&& ($GLOBALS['wp']['options'][self::DIRTY] ?? null) === 1
 			&& $inventory->sender->flushed === 1;
+	}
+	
+	/**
+	 * RULE: codesafe takes back only what codesafe switched on: a switch-on
+	 * is remembered, and a TURN OFF of an entry the site's owner put on the
+	 * list changes nothing and says nothing, while one codesafe put there
+	 * leaves it and the record. Falsify: take any named entry out — a
+	 * codesafe, or whoever holds it, switches off the automatic update an
+	 * owner set for a vulnerable plugin and keeps it exploitable.
+	 */
+	public function turnOffTakesBackOnlyCodesafesOwnSwitchOn(): bool
+	{
+		$GLOBALS['wp']['options']['auto_update_plugins'] = [self::AKISMET];
+		$on = $this->inventory();
+		$on->applyAnswer('{"accepted":1,"auto_update_items":[{"type":"plugin","slug":"contact-form-7","reason":"requested"}]}');
+		$recorded = $GLOBALS['wp']['options'][PluginInventory::OURS] ?? null;
+		$off = $this->inventory();
+		$off->applyAnswer('{"accepted":1,"auto_update_off":[{"type":"plugin","slug":"contact-form-7"},{"type":"plugin","slug":"akismet"}]}');
+		
+		return $recorded === ['plugin' => [self::CF7]]
+			&& $GLOBALS['wp']['options']['auto_update_plugins'] === [self::AKISMET]
+			&& array_column($off->sender->said, 1) === ['auto-update disabled for contact-form-7 (switched off by an operator in codesafe)']
+			&& ($GLOBALS['wp']['options'][PluginInventory::OURS] ?? null) === ['plugin' => []];
 	}
 	
 	/**
@@ -526,6 +551,7 @@ class Inventory extends Test
 		$wasOff->applyAnswer($both);
 		$fromOff = $GLOBALS['wp']['options']['auto_update_plugins'];
 		$GLOBALS['wp']['options']['auto_update_plugins'] = [self::CF7];
+		$GLOBALS['wp']['options'][PluginInventory::OURS] = ['plugin' => [self::CF7]];
 		$wasOn = $this->inventory();
 		$wasOn->applyAnswer($both);
 		

@@ -40,10 +40,11 @@ use function is_string;
 use function json_decode;
 use function json_encode;
 use function max;
-use function mkdir;
 use function md5_file;
+use function mkdir;
 use function parse_str;
 use function preg_match;
+use function preg_replace;
 use function preg_replace_callback;
 use function random_bytes;
 use function rawurldecode;
@@ -109,15 +110,18 @@ catch(Throwable)
  *   on every request — and the stub itself includes this file only if it is
  *   there;
  * - a request carrying a WordPress login cookie to a file WordPress runs
- *   through is left to the plugins_loaded judge: only WordPress can say who
- *   the user is, the alarm's logged-in signal needs the user on the row, and
- *   an editor must never be refused by a layer that cannot tell them from a
- *   bot. Anywhere else — a direct hit on a plugin's file — no adapter will
- *   ever run, and the cookie's NAME proves nothing, so this layer judges
- *   (loadsWordPress(), 1.0.3); a REST request carrying Basic credentials is
- *   left to it the same way — an application password, which WordPress
- *   checks only after this layer, makes it a user's (isRest(), by the REST
- *   prefix the plugin keeps in the consent);
+ *   through is judged here as a caller this layer cannot tell: only
+ *   WordPress can say who the user is, so what depends on who, and every
+ *   observe (reported with the user on the row), is left to the
+ *   plugins_loaded judge, unjudged and uncounted here; but the cookie's NAME
+ *   is anyone's to send, and mu-plugins, drop-ins and plugin files run
+ *   before plugins_loaded, so a block that holds whoever asks — a match
+ *   rule, a vpatch for anyone — is refused here. Anywhere else — a direct
+ *   hit on a plugin's file — no adapter will ever run, so this layer judges
+ *   the request whole (loadsWordPress(), 1.0.3); a REST request carrying
+ *   Basic credentials is judged the same way — an application password,
+ *   which WordPress checks only after this layer, makes it a user's
+ *   (isRest(), by the REST prefix the plugin keeps in the consent);
  * - every file it reads or writes but the stub and the kernel's ruleset
  *   begins with `<?php exit; ?>` (GUARD), and the ruleset's name is drawn at
  *   random: the directory's .htaccess is read by Apache alone (1.0.3);
@@ -251,12 +255,23 @@ final class Prepend
 	 * leave a login cookie to the adapter: on any other file nothing would
 	 * judge it at all (security audit 2026-10-03 M12)
 	 */
-	public const LOADS_WORDPRESS = ['index.php', 'wp-activate.php', 'wp-blog-header.php', 'wp-comments-post.php',
+	public const LOADS_WORDPRESS = ['index.php', 'wp-blog-header.php', 'wp-comments-post.php',
 		'wp-cron.php', 'wp-links-opml.php', 'wp-load.php', 'wp-login.php', 'wp-mail.php', 'wp-signup.php',
 		'wp-trackback.php', 'xmlrpc.php'];
 	
-	/** wp-admin files that load WordPress without its plugins — the adapter never runs there */
-	public const ADMIN_WITHOUT_PLUGINS = ['load-scripts.php', 'load-styles.php'];
+	/**
+	 * wp-admin files that load WordPress without its plugins — the adapter
+	 * never runs there: the two asset loaders, and the installer, the
+	 * upgrader and the config setup, which define WP_INSTALLING (as does
+	 * wp-activate.php, which LOADS_WORDPRESS leaves out for it)
+	 */
+	public const ADMIN_WITHOUT_PLUGINS = ['load-scripts.php', 'load-styles.php', 'install.php', 'upgrade.php', 'setup-config.php'];
+	
+	/** a refused request's uri as the queue and the seen list hold it, at most, in bytes (contextOf()) */
+	public const CONTEXT_URI_MAX = 2048;
+	
+	/** its user agent, referer and host, each at most, in bytes */
+	public const CONTEXT_FIELD_MAX = 512;
 	
 	/**
 	 * Redactor's secret names and query names, restated: this layer references
@@ -270,7 +285,14 @@ final class Prepend
 		. '|card[-_]?(?:num(?:ber)?|no(?![a-z])|code|cvc|cvv|exp(?:iry|iration|(?![a-z])))'
 		. '|cc[-_]?(?:num(?:ber)?|no(?![a-z]))'
 		. '|(?<![a-z])(?:cvv2?|cvc2?|csc|ccv)(?![a-z])|security[-_]?code'
-		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])';
+		. '|(?:account|acct)[-_]?(?:num(?:ber)?|no(?![a-z]))|(?<![a-z])iban(?![a-z])'
+		// the credentials beside password and token, as codesafe's own scrubber
+		// has them: an API key without a separator, a credential, the keys that
+		// name what they unlock, a second factor's backup and auth codes (the
+		// Two-Factor plugin's `authcode`), a CSRF value, a session id; a
+		// one-time code and a bare `auth` only as a word of the name
+		. '|apikey|credential|(?:private|access|consumer|licen[cs]e|encryption|signing)[-_]?key|backup[-_]?codes?|auth[-_]?code'
+		. '|csrf|xsrf|sess(?:ion)?[-_]?id|(?<![a-z0-9])(?:otp|totp|mfa|2fa)(?:[-_]?codes?)?(?![a-z0-9])|(?<![a-z])auth(?![a-z])';
 	
 	public const QUERY_NAMES = ['key', 'auth', 'code', 'sig', 'signature', 'otp', 'pin', 'hash'];
 	
@@ -300,7 +322,7 @@ final class Prepend
 			self::entry($dir, $_SERVER, $consent);
 			$ran = false;
 			// the mu-plugin stage runs inside WordPress, which defined ABSPATH; the prepend layer runs before it
-			$judged = self::judge($dir, $_SERVER, $_POST, $_COOKIE, null, $consent, $ran, $_GET, $_FILES, defined('ABSPATH') ? true : null);
+			$judged = self::judge($dir, $_SERVER, $_POST, $_COOKIE, null, $consent, $ran, $_GET, $_FILES, defined('ABSPATH') ? true : null, $_REQUEST);
 			if($judged === null)
 			{
 				if($ran && defined(self::JUDGED) === false)
@@ -337,7 +359,8 @@ final class Prepend
 	/**
 	 * The pure part: the consent gate, the login-cookie rule, the judge. Null
 	 * when this layer has nothing to say (no consent, detection off, kill,
-	 * the kernel not ready(), a signed-in request, a REST request with Basic credentials); otherwise
+	 * the kernel not ready(), anything but a block for a request carrying a
+	 * login cookie or a REST request with Basic credentials); otherwise
 	 * the verdict and the report the kernel would have sent — the adapter
 	 * sends it, or the queue holds it
 	 *
@@ -350,6 +373,7 @@ final class Prepend
 	 * @param array<string, mixed> $files the uploads — a virtual patch reads their names
 	 * @param ?bool $wordpress whether WordPress loads for this request: true from the mu-plugin stage, which
 	 *     runs inside it; null tells it by the script (loadsWordPress())
+	 * @param ?array<string, mixed> $request PHP's $_REQUEST, which a request: rule reads beside the query and the form
 	 * @return ?array{verdict: Verdict, report: ?array{0: string, 1: string, 2: array}}
 	 */
 	public static function judge(
@@ -363,6 +387,7 @@ final class Prepend
 		?array $get = null,
 		array $files = [],
 		?bool $wordpress = null,
+		?array $request = null,
 	): ?array
 	{
 		$judged = false;
@@ -374,45 +399,39 @@ final class Prepend
 		$loads = $wordpress ?? self::loadsWordPress($server, (string)($consent['root'] ?? ''));
 		$restPrefix = self::restPrefixOf($consent['rest_prefix'] ?? null);
 		$query = $get ?? self::queryOf($server);
-		// a login cookie is the adapter's — but only where WordPress runs and the
-		// adapter with it; anyone can send a cookie by that NAME, and a direct hit
-		// on a plugin file is the request this layer exists for (M12)
-		if($loads)
-		{
-			foreach(array_keys($cookies) as $name)
-			{
-				if(str_starts_with((string)$name, self::LOGIN_COOKIE))
-				{
-					return null;
-				}
-			}
-			// an application password signs a REST request in only when WordPress
-			// checks it, after this layer; the adapter names its user, so the whole
-			// request is its: a refusal then reports who it refused
-			if(self::carriesBasicAuth($server) && self::isRest($server, $query, $post, $restPrefix))
-			{
-				return null;
-			}
-		}
+		// a login cookie, or Basic credentials on a REST request (an application password, which WordPress
+		// checks only after this layer), signs a caller in where WordPress runs: the adapter names that user.
+		// Anyone can send either by NAME, and plugin files run before the adapter, so this layer refuses what
+		// holds whoever asks and leaves the rest to the adapter (deferred); where no adapter runs it judges
+		// the request whole — a direct hit on a plugin file is the request it exists for
+		$deferred = $loads && (self::carriesLoginCookie($cookies) || (self::carriesBasicAuth($server) && self::isRest($server, $query, $post, $restPrefix)));
 		$report = null;
-		$kernel = new Kernel('', '', new Store(self::rules($dir, $consent), $consent['prefix']),
-			// this layer never pulls: a transport that answers nothing keeps even a mis-call harmless
-			static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''],
-			static function(string $kind, string $message, array $extra) use (&$report): void
-			{
-				$report = [$kind, $message, $extra];
-			}, platforms: self::platforms());
-		// who WordPress will run it as is told only later for an XML-RPC call (inside each method) and a
-		// REST request with a token another plugin reads; the adapter cannot name that caller either, so
-		// the rules for anyone are judged here and what depends on who waits for the adapter
-		$known = ($loads && (self::isXmlRpc($server) || (self::carriesToken($server) && self::isRest($server, $query, $post, $restPrefix)))) === false;
+		$reporter = static function(string $kind, string $message, array $extra) use (&$report): void
+		{
+			$report = [$kind, $message, $extra];
+		};
+		$store = new Store(self::rules($dir, $consent), $consent['prefix']);
+		// this layer never pulls: a transport that answers nothing keeps even a mis-call harmless
+		$kernel = static fn(Store $store): Kernel => new Kernel('', '', $store, static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''],
+			$reporter, platforms: self::platforms());
+		$counting = $kernel($store);
+		// who WordPress will run it as is told only later for a deferred request, an XML-RPC call (inside each
+		// method) and a REST request with a token another plugin reads; the adapter cannot name that caller
+		// either, so the rules for anyone are judged here and what depends on who waits for the adapter
+		$known = ($deferred || ($loads && (self::isXmlRpc($server) || (self::carriesToken($server) && self::isRest($server, $query, $post, $restPrefix))))) === false;
 		// before WordPress: no user (the request is anonymous here) and no nonce check — a
 		// virtual patch that needs one only observes
 		$facts = Facts::fromServer($server, $post, static fn(): string => (string)file_get_contents('php://input'), false,
 			ip: self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])),
-			user: self::loginName($server, $post), get: $get, cookies: $cookies, files: $files, callerKnown: $known, platforms: $kernel->platforms(),
-			options: [Wordpress::OPTION_REST_PREFIX => $restPrefix]);
-		$verdict = $kernel->judge($facts, new Consent(true, $consent['enforce'], false), $now);
+			user: self::loginName($server, $post), get: $get, cookies: $cookies, files: $files, callerKnown: $known, platforms: $counting->platforms(),
+			options: [Wordpress::OPTION_REST_PREFIX => $restPrefix], request: $request);
+		// a deferred request the adapter judges again whole: judged here on the file tier alone, which counts no rate rule
+		$verdict = ($deferred ? $kernel(new Store($store->file, '', false)) : $counting)->judge($facts, new Consent(true, $consent['enforce'], false), $now);
+		// a deferred request is refused here, or left to the adapter whole: counted and reported there, with its user
+		if($deferred && $verdict->isBlock() === false)
+		{
+			return null;
+		}
 		// a blocking vpatch this layer could not answer (a nonce it cannot check): where
 		// WordPress loads, the adapter judges it with wp_verify_nonce — left to it, counted
 		// nowhere yet; a junk nonce must not turn a block into an observe here
@@ -425,8 +444,8 @@ final class Prepend
 		{
 			return null;
 		}
-		$kernel->count($verdict, $now);
-		$kernel->report($verdict, $facts);
+		$counting->count($verdict, $now);
+		$counting->report($verdict, $facts);
 		
 		return ['verdict' => $verdict, 'report' => $report];
 	}
@@ -592,6 +611,27 @@ final class Prepend
 		$needle = '/' . self::restPrefixOf($prefix) . '/';
 		
 		return str_contains($path . '/', $needle) || str_contains(rawurldecode($path) . '/', $needle);
+	}
+	
+	/**
+	 * Whether the request carries a cookie by WordPress's login cookie name —
+	 * valid or not, which only WordPress can tell
+	 *
+	 * @param array<string, mixed> $cookies
+	 */
+	public static function carriesLoginCookie(
+		array $cookies,
+	): bool
+	{
+		foreach(array_keys($cookies) as $name)
+		{
+			if(str_starts_with((string)$name, self::LOGIN_COOKIE))
+			{
+				return true;
+			}
+		}
+		
+		return false;
 	}
 	
 	/**
@@ -1077,12 +1117,12 @@ final class Prepend
 	}
 	
 	/**
-	 * The mu-plugin (ovos/codesafe docs/plans/shield-auto-deploy.md P7.g): this
-	 * layer's judge before the other plugins load — where a vulnerable
-	 * plugin's own file has not run yet — without the server edit the prepend
-	 * needs. It includes this file only while it is there, on the PHP this
-	 * plugin needs, and calls run(): an anonymous request is judged, a
-	 * signed-in one left to plugins_loaded. Written only when it is not the
+	 * The mu-plugin: this layer's judge before the other plugins load — where
+	 * a vulnerable plugin's own file has not run yet — without the server edit
+	 * the prepend needs. It includes this file only while it is there, on the
+	 * PHP this plugin needs, and calls run(): an anonymous request is judged
+	 * whole, a signed-in one on the rules that refuse whoever asks, the rest
+	 * left to plugins_loaded. Written only when it is not the
 	 * current one, never over a file by that name it did not write; '' when
 	 * it is not there (the plugins_loaded judge then stands alone)
 	 */
@@ -1255,13 +1295,14 @@ final class Prepend
 		?string $ip = null,
 	): array
 	{
+		// capped: every hit rewrites the file that holds them
 		$context = [
-			'uri' => self::scrubUri(trim((string)($server['REQUEST_URI'] ?? ''))),
-			'method' => trim((string)($server['REQUEST_METHOD'] ?? '')),
-			'ip' => trim($ip ?? (string)($server['REMOTE_ADDR'] ?? '')),
-			'ua' => trim((string)($server['HTTP_USER_AGENT'] ?? '')),
-			'referer' => self::scrubUri(trim((string)($server['HTTP_REFERER'] ?? ''))),
-			'host' => trim((string)($server['HTTP_HOST'] ?? '')),
+			'uri' => self::capped(self::scrubUri(trim((string)($server['REQUEST_URI'] ?? ''))), self::CONTEXT_URI_MAX),
+			'method' => self::capped(trim((string)($server['REQUEST_METHOD'] ?? '')), self::CONTEXT_FIELD_MAX),
+			'ip' => self::capped(trim($ip ?? (string)($server['REMOTE_ADDR'] ?? '')), self::CONTEXT_FIELD_MAX),
+			'ua' => self::capped(trim((string)($server['HTTP_USER_AGENT'] ?? '')), self::CONTEXT_FIELD_MAX),
+			'referer' => self::capped(self::scrubUri(trim((string)($server['HTTP_REFERER'] ?? ''))), self::CONTEXT_FIELD_MAX),
+			'host' => self::capped(trim((string)($server['HTTP_HOST'] ?? '')), self::CONTEXT_FIELD_MAX),
 			'at' => time(),
 		];
 		if($status !== null && $status >= 100 && $status <= 599)
@@ -1270,6 +1311,21 @@ final class Prepend
 		}
 		
 		return $context;
+	}
+	
+	/** a value cut to $max bytes, never inside a UTF-8 character: the files are JSON, and a broken one fails the write */
+	protected static function capped(
+		string $value,
+		int $max,
+	): string
+	{
+		if(strlen($value) <= $max)
+		{
+			return $value;
+		}
+		
+		// a character's lead byte and what is left of it at the cut go with it
+		return (string)preg_replace('~[\xC0-\xFF][\x80-\xBF]*$~D', '', substr($value, 0, $max));
 	}
 	
 	/**
