@@ -1977,10 +1977,17 @@ final class RegexGate
 	 */
 	public const BOUNDED_CHOICES_MAX = 256;
 	
+	/** a POSIX class's opening: read where the classes still stand, as it is a class's own spelling */
+	protected const POSIX_CLASS = '~\[\[:~';
+
+	/** a character class, read as one atom by the construct checks: `[*+]` and `[(?]` are sets of characters, no quantifier and no group */
+	protected const CLASS_ATOM = '~\[\^?\]?[^\]]*\]~';
+
 	/**
 	 * What the regex gate refuses — on the pattern with every escaped pair
 	 * replaced by a plain atom, so `\(?=` (a literal) is not read as a
-	 * lookahead and `\s*` keeps its quantifier on something — each with the
+	 * lookahead and `\s*` keeps its quantifier on something, and every class
+	 * one atom more (CLASS_ATOM), the POSIX class aside — each with the
 	 * words a log line and a redraft carry
 	 */
 	protected const REFUSED_CONSTRUCTS = [
@@ -1995,7 +2002,7 @@ final class RegexGate
 		'~\(\?\(~' => 'conditional',
 		'~\(\?#~' => 'comment',
 		'~\(\*~' => 'verb',
-		'~\[\[:~' => 'POSIX class',
+		self::POSIX_CLASS => 'POSIX class',
 		'~[*+?}]\+~' => 'possessive quantifier',
 	];
 	
@@ -2038,9 +2045,11 @@ final class RegexGate
 		}
 		// every escaped pair as a plain atom: `\(` opens no group, `\*` is no quantifier
 		$bare = (string)preg_replace('~\\\\.~s', 'a', $value);
+		// and every class one more: `[*+]` holds no possessive quantifier, `[(?=]` no lookahead
+		$atoms = (string)preg_replace(self::CLASS_ATOM, 'a', $bare);
 		foreach(self::REFUSED_CONSTRUCTS as $pattern => $reason)
 		{
-			if(preg_match($pattern, $bare) === 1)
+			if(preg_match($pattern, $pattern === self::POSIX_CLASS ? $bare : $atoms) === 1)
 			{
 				return $reason . ' is not in the ' . Ruleset::DIALECT . ' dialect';
 			}
@@ -3534,12 +3543,17 @@ final class Kernel
 	/**
 	 * Over the cached ruleset. pass when consent says so, when there is no
 	 * store (and the next tick will pull), when the contract is unknown, when
-	 * the ruleset is past the ceiling; else the first MATCH or VPATCH rule
+	 * the ruleset is past the ceiling; a listed threat address the section
+	 * blocks is refused before any rule (held, as an unanswered vpatch is,
+	 * when the host cannot tell the caller); else the first MATCH or VPATCH rule
 	 * that matches — in the door's order, blocking first — as block (set to
 	 * block AND enforce, a vpatch's who and nonce answered) or observe; a vpatch that
 	 * could not be answered observes unless a later rule blocks; else the
 	 * first RATE rule whose predicate matches and whose key
-	 * is over its limit, the same way. A rule the engine cannot run matches
+	 * is over its limit, the same way; else a listed address the section
+	 * only observes, observed under its pseudo-rule — the rules judge it
+	 * first, so a blocking rule still blocks it and a rule's match is the
+	 * rule's. A rule the engine cannot run matches
 	 * nothing. The one side effect: a rate rule's predicate that matches
 	 * counts the request
 	 */
@@ -3581,17 +3595,27 @@ final class Kernel
 			$facts = $this->readable($facts);
 			// a vpatch that would block but could not be answered: observed unless a later rule blocks
 			$held = null;
-			// a listed address is judged before any rule
+			// a listed address the section only observes: the verdict when no rule decides
+			$observed = null;
+			// a listed address the section blocks is refused before any rule
 			$threat = $this->threatened($ruleset, $facts);
 			if($threat !== null)
 			{
 				$blocks = Ruleset::blocks($threat['mode']) && $consent->blocks();
-				if($facts->callerKnown || $blocks === false)
+				if($blocks && $facts->callerKnown)
 				{
-					return new Verdict($blocks ? Verdict::BLOCK : Verdict::OBSERVE, $threat, $facts->ip);
+					return new Verdict(Verdict::BLOCK, $threat, $facts->ip);
 				}
-				// a caller the host cannot tell may be signed in: held, and a rule after it may still block
-				$held = new Verdict(Verdict::OBSERVE, $threat, $facts->ip, Verdict::REASON_UNANSWERED);
+				// observed only: the rules judge it first, or a blocking vpatch would never block the address most likely to attack
+				if($blocks === false)
+				{
+					$observed = new Verdict(Verdict::OBSERVE, $threat, $facts->ip);
+				}
+				else
+				{
+					// a caller the host cannot tell may be signed in: held, and a rule after it may still block
+					$held = new Verdict(Verdict::OBSERVE, $threat, $facts->ip, Verdict::REASON_UNANSWERED);
+				}
 			}
 			$rates = [];
 			[$subs, $unread] = self::subRequests($facts);
@@ -3662,8 +3686,8 @@ final class Kernel
 					return $verdict;
 				}
 			}
-			
-			return Verdict::pass('no match');
+
+			return $observed ?? Verdict::pass('no match');
 		}
 		catch(Throwable $e)
 		{
