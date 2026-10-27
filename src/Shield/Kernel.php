@@ -54,7 +54,9 @@ declare(strict_types=1);
  * Rules are codesafe's one grammar for every runtime (dialect re2-2026,
  * contract 1): {field: uri|ua|ip|body, op: equals|prefix|contains|cidr|regex,
  * value, ci}. Literal ops fold ASCII only; regex runs as `~…~D[i]`, never
- * `u` — the two semantics codesafe's conformance corpus pins.
+ * `u` — the two semantics codesafe's conformance corpus pins. A pulled
+ * regex is held to the dialect's gate first (RegexGate): a rule whose
+ * pattern it refuses never enters the ruleset, whoever served it.
  *
  * Two kinds. A match rule (no `kind` key) decides on its own: observe or a
  * 403. A rate rule (`kind: rate`, `rate: {key: ip|user|route, limit,
@@ -167,7 +169,6 @@ use function curl_setopt_array;
 use function explode;
 use function fclose;
 use function file_get_contents;
-use function file_put_contents;
 use function filter_var;
 use function fopen;
 use function fstat;
@@ -211,6 +212,7 @@ use function sprintf;
 use function str_contains;
 use function str_ends_with;
 use function str_ireplace;
+use function str_repeat;
 use function str_replace;
 use function str_starts_with;
 use function strcasecmp;
@@ -224,6 +226,7 @@ use function strpos;
 use function strrpos;
 use function strtolower;
 use function strtoupper;
+use function strtr;
 use function substr;
 use function time;
 use function trim;
@@ -1589,7 +1592,9 @@ final class Ruleset
 			&& (isset($rule['ci']) === false || is_bool($rule['ci']))
 			&& is_string($rule['mode'] ?? null)
 			&& (isset($rule['kind']) === false || in_array($rule['kind'], self::KINDS, true))
-			&& (self::isRate($rule) === false || self::rateWellFormed($rule['rate'] ?? null));
+			&& (self::isRate($rule) === false || self::rateWellFormed($rule['rate'] ?? null))
+			// a pattern the dialect's gate refuses never reaches the engine, whoever served it
+			&& ($rule['op'] !== self::OP_REGEX || RegexGate::refusal($rule['value'], ($rule['ci'] ?? true) === true) === null);
 	}
 	
 	/**
@@ -1862,7 +1867,13 @@ final class Ruleset
 			return is_int($value) && abs($value) <= self::NUMBER_MAX;
 		}
 		
-		return is_string($value) && trim($value) !== '' && strlen($value) <= self::VALUE_MAX;
+		if(is_string($value) === false || trim($value) === '' || strlen($value) > self::VALUE_MAX)
+		{
+			return false;
+		}
+		
+		// a pattern the dialect's gate refuses never reaches the engine, whoever served it
+		return ($test !== 'regex' && $test !== 'not_regex') || RegexGate::refusal($value, ($condition['ci'] ?? true) === true) === null;
 	}
 	
 	/**
@@ -1923,6 +1934,1084 @@ final class Ruleset
 			&& in_array($rate['key'] ?? null, self::RATE_KEYS, true)
 			&& is_int($rate['limit'] ?? null) && $rate['limit'] >= 1 && $rate['limit'] <= self::RATE_LIMIT_MAX
 			&& is_int($rate['window'] ?? null) && $rate['window'] >= 1 && $rate['window'] <= self::RATE_WINDOW_MAX;
+	}
+}
+
+/**
+ * The regex gate of the rule dialect: the RE2-safe subset both engines read
+ * alike, and nothing a backtracking engine runs in more than polynomial
+ * time: no nested quantifier, no alternation inside a repeated group, at
+ * most UNBOUNDED_MAX unbounded quantifiers, none that overlap. codesafe's
+ * gate (Codesafe\Shield\Dialect::checkRegex()) answers with this class, and
+ * a kernel holds every pulled regex to it (Ruleset::wellFormed(),
+ * Ruleset::conditionWellFormed()), so a pattern an outdated, mistaken or
+ * hostile codesafe serves never runs here: in PHP it fails open at
+ * pcre.backtrack_limit, and in the Node twin (client-node/shield.mjs) it
+ * would hold the event loop. Pure; asked at a pull, never per request
+ */
+final class RegexGate
+{
+	/**
+	 * Unbounded quantifiers (`*`, `+`, `{n,}`) one regex may carry. Each
+	 * one beside another that can match the same text multiplies the work a
+	 * backtracking engine does on a near-miss: `.*.*.*.*.*.*.*.*z` is
+	 * O(n^8), and V8 has no backtracking limit to stop it. Two keep the
+	 * shapes the catalog uses (`\bon\w+\s*=`, a `\s*` either side of an
+	 * optional slash) at O(n^2) at worst
+	 */
+	public const UNBOUNDED_MAX = 2;
+	
+	/**
+	 * A count `{n,m}` (lazy or not) with m at least this many is unbounded to
+	 * the gate — in the UNBOUNDED_MAX count and in the overlap check alike:
+	 * `\w{0,300}\w{0,300}\w{0,300}x` carries no `*` or `+` and backtracks as
+	 * badly in V8. An exact `{n}` has no choice to backtrack over and stays
+	 * bounded whatever its n
+	 */
+	public const LARGE_COUNT = 16;
+	
+	/**
+	 * The most choices a run of overlapping small counts may multiply to:
+	 * `\w{1,8}\w{1,8}` (64) and `\w{1,15}\w{1,15}` (225) pass, three
+	 * `\w{1,8}` (512) do not
+	 */
+	public const BOUNDED_CHOICES_MAX = 256;
+	
+	/**
+	 * What the regex gate refuses — on the pattern with every escaped pair
+	 * replaced by a plain atom, so `\(?=` (a literal) is not read as a
+	 * lookahead and `\s*` keeps its quantifier on something — each with the
+	 * words a log line and a redraft carry
+	 */
+	protected const REFUSED_CONSTRUCTS = [
+		'~\(\?[=!]~' => 'lookahead',
+		'~\(\?<[=!]~' => 'lookbehind',
+		'~\(\?>~' => 'atomic group',
+		'~\(\?[imsxUXJn^-]+[:)]~' => 'inline flag',
+		'~\(\?P[<=>]~' => 'Python-style named group',
+		'~\(\?\'~' => 'quoted named group',
+		'~\(\?\|~' => 'branch reset',
+		'~\(\?[R0-9&+-]~' => 'recursion or subroutine call',
+		'~\(\?\(~' => 'conditional',
+		'~\(\?#~' => 'comment',
+		'~\(\*~' => 'verb',
+		'~\[\[:~' => 'POSIX class',
+		'~[*+?}]\+~' => 'possessive quantifier',
+	];
+	
+	/**
+	 * What the regex gate refuses among the escapes — on the pattern with its
+	 * escaped BACKSLASHES removed, so `\\A` (a backslash then an A) passes.
+	 * `\g` and `\k` go whole: any spelling PCRE takes is a backreference
+	 * (`\g-1` too), and to V8 a plain letter
+	 */
+	protected const REFUSED_ESCAPES = [
+		'~\\\\[1-9]~' => 'backreference',
+		'~\\\\[gk]~' => 'backreference',
+		'~\\\\[AzZGKhHRXCNaeEQpPo]~' => 'PCRE-only escape',
+		'~\\\\[uU]~' => 'JavaScript-only escape',
+		'~\\\\x\{~' => 'PCRE-only \x{…} escape',
+		// PCRE reads `\x` before fewer than two hex digits as a byte, V8 as the letter x
+		'~\\\\x(?![0-9a-fA-F]{2})~' => '\x without two hex digits',
+		'~\\\\x[89a-fA-F][0-9a-fA-F]~' => 'non-ASCII byte escape',
+		'~\\\\[vV]~' => '\v or \V escape (a class in PCRE, one byte or a letter in JavaScript)',
+		'~\\\\c~' => 'control escape',
+	];
+	
+	/**
+	 * Null when a rule's regex is in the dialect, else the reason, in the words
+	 * a log line and a redraft carry: the RE2-safe subset, nested quantifiers
+	 * refused, it compiles here and the overlap walk reads it whole
+	 */
+	public static function refusal(
+		string $value,
+		bool $ci = true,
+	): ?string
+	{
+		if($value === '' || strlen($value) > Ruleset::VALUE_MAX)
+		{
+			return $value === '' ? 'the pattern is empty' : 'the pattern is longer than ' . Ruleset::VALUE_MAX . ' bytes';
+		}
+		if(self::isAscii($value) === false)
+		{
+			return 'the pattern is not ASCII';
+		}
+		// every escaped pair as a plain atom: `\(` opens no group, `\*` is no quantifier
+		$bare = (string)preg_replace('~\\\\.~s', 'a', $value);
+		foreach(self::REFUSED_CONSTRUCTS as $pattern => $reason)
+		{
+			if(preg_match($pattern, $bare) === 1)
+			{
+				return $reason . ' is not in the ' . Ruleset::DIALECT . ' dialect';
+			}
+		}
+		// escaped backslashes dropped: `\\A` is a backslash and an A, not `\A`
+		$escapes = strtr($value, ['\\\\' => '']);
+		foreach(self::REFUSED_ESCAPES as $pattern => $reason)
+		{
+			if(preg_match($pattern, $escapes) === 1)
+			{
+				return $reason . ' is not in the ' . Ruleset::DIALECT . ' dialect';
+			}
+		}
+		if(self::hasBracketLedClass($bare))
+		{
+			return 'a class that opens with `]` (`[]a]`, `[^]a]`) is a literal `]` to PCRE and an empty or any-byte class to JavaScript — write `\]`';
+		}
+		if(self::hasLooseCount($bare))
+		{
+			return 'a count only PCRE reads as one (`{,n}`, a blank inside the braces) is text to JavaScript — write `{0,n}`';
+		}
+		if(self::hasNestedQuantifier($bare))
+		{
+			return 'a nested quantifier is valid RE2 and catastrophic in a backtracking engine';
+		}
+		if(self::hasQuantifiedAlternation($bare))
+		{
+			return 'an alternation inside a repeated group (`(a|aa)+`) is valid RE2 and catastrophic in a backtracking engine — repeat a class instead';
+		}
+		if(self::unboundedQuantifiers($bare) > self::UNBOUNDED_MAX)
+		{
+			return 'more than ' . self::UNBOUNDED_MAX . ' unbounded quantifiers (`* + {n,}`, and a `{n,m}` with m of ' . self::LARGE_COUNT . ' or more) backtrack polynomially in a backtracking engine';
+		}
+		// on the value itself: the parser reads each escape as its byte set; null when it cannot read the pattern
+		$overlapping = self::hasOverlappingQuantifiers($value, $ci);
+		if($overlapping === true)
+		{
+			return 'quantifiers that can match the same character back to back (`.*.*`, `\w+\w+`, a run of `\w{1,8}` past ' . self::BOUNDED_CHOICES_MAX . ' choices) backtrack polynomially in a backtracking engine — make their sets disjoint or bound them';
+		}
+		// run on an empty subject: a pattern that does not compile is no rule
+		if(self::compiles($value, $ci) === false)
+		{
+			return 'the pattern does not compile';
+		}
+		// compiled, yet unread by the walk: a group PCRE alone knows (`(?C)`, `(?*…)`, `(?a)`), a SyntaxError or another meaning in V8
+		if($overlapping === null)
+		{
+			return 'a construct the gate cannot read is not in the ' . Ruleset::DIALECT . ' dialect — a group opens with `(`, `(?:` or `(?<name>`';
+		}
+		
+		return null;
+	}
+	
+	/** printable ASCII and the tab: no other control byte, nothing past 0x7E */
+	public static function isAscii(
+		string $value,
+	): bool
+	{
+		return preg_match('~^[\x20-\x7e\t]*$~D', $value) === 1;
+	}
+	
+	/**
+	 * Whether PCRE compiles a rule's pattern as Kernel::match() runs it, on an
+	 * empty subject: one it refuses warns (a host's error handler may throw
+	 * that) and answers false
+	 */
+	protected static function compiles(
+		string $value,
+		bool $ci,
+	): bool
+	{
+		try
+		{
+			return @preg_match(Kernel::regexPattern($value, $ci), '') !== false;
+		}
+		catch(Throwable)
+		{
+			return false;
+		}
+	}
+	
+	/**
+	 * A quantified group whose body carries a quantifier of its own — on the
+	 * pattern with escapes removed and character classes skipped. `(a+)+`,
+	 * `(\w*)*`, `(?:x{0,5})+`, `(a?)+` are all refused: RE2 runs them in
+	 * linear time, PCRE and JavaScript may not
+	 */
+	protected static function hasNestedQuantifier(
+		string $bare,
+	): bool
+	{
+		$stack = [];
+		$n = strlen($bare);
+		for($i = 0; $i < $n; $i++)
+		{
+			$char = $bare[$i];
+			if($char === '[')
+			{
+				// a class is a literal set: skip to its close, honouring a
+				// leading `]` or `^]`
+				$j = $i + 1;
+				if($j < $n && $bare[$j] === '^')
+				{
+					$j++;
+				}
+				if($j < $n && $bare[$j] === ']')
+				{
+					$j++;
+				}
+				while($j < $n && $bare[$j] !== ']')
+				{
+					$j++;
+				}
+				$i = $j;
+				
+				continue;
+			}
+			if($char === '(')
+			{
+				$stack[] = false;
+				// the `?` of `(?:` and `(?<name>` is syntax, not a quantifier
+				if(($bare[$i + 1] ?? '') === '?')
+				{
+					$i++;
+				}
+				
+				continue;
+			}
+			if($char === ')')
+			{
+				// the group closes: quantified itself while carrying a quantifier is the nesting
+				$quantifiedInside = array_pop($stack) ?? false;
+				$next = $bare[$i + 1] ?? '';
+				if($quantifiedInside && ($next === '*' || $next === '+' || $next === '{'))
+				{
+					return true;
+				}
+				// either way the enclosing group now carries a quantifier
+				if($stack !== [] && ($quantifiedInside || $next === '*' || $next === '+' || $next === '{' || $next === '?'))
+				{
+					$stack[count($stack) - 1] = true;
+				}
+				
+				continue;
+			}
+			if(($char === '*' || $char === '+' || $char === '?' || $char === '{') && $stack !== [])
+			{
+				$stack[count($stack) - 1] = true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * A group holding an alternation — at its own depth or in a group inside
+	 * it — repeated by `*`, `+` or `{…}`: `(a|a)*b`, `(a|aa)+$`, `(\w|\d)*x`,
+	 * `((a|b)c)+`. Branches that can match the same text give a backtracking
+	 * engine two ways through every repetition, 2^n on a near-miss. The rule
+	 * is the simple safe one — it refuses the harmless `(?:a|b)+` too, which
+	 * is `[ab]+`. `?` stays allowed here: one optional group cannot
+	 * multiply, and a run of them is the overlap walk's (counted()). On the
+	 * pattern with escapes removed and character classes skipped — a `|`
+	 * inside `[…]` is a literal
+	 */
+	protected static function hasQuantifiedAlternation(
+		string $bare,
+	): bool
+	{
+		$stack = [];
+		$n = strlen($bare);
+		for($i = 0; $i < $n; $i++)
+		{
+			$char = $bare[$i];
+			if($char === '[')
+			{
+				$i = self::classEnd($bare, $i);
+				
+				continue;
+			}
+			if($char === '(')
+			{
+				$stack[] = false;
+				
+				continue;
+			}
+			if($char === '|' && $stack !== [])
+			{
+				$stack[count($stack) - 1] = true;
+				
+				continue;
+			}
+			if($char === ')')
+			{
+				// a group holding an alternation trips when repeated, else passes it up to the group around it
+				$alternates = array_pop($stack) ?? false;
+				$next = $bare[$i + 1] ?? '';
+				if($alternates && ($next === '*' || $next === '+' || $next === '{'))
+				{
+					return true;
+				}
+				if($alternates && $stack !== [])
+				{
+					$stack[count($stack) - 1] = true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * How many `*`, `+`, `{n,}` and large counts (`{n,m}` with m at least
+	 * LARGE_COUNT) the pattern carries — on the pattern with escapes removed
+	 * and character classes skipped. A lazy `*?` is one quantifier; the `?`
+	 * of `(?:` is syntax; a small count or a `{` that opens no count is not
+	 * counted
+	 */
+	protected static function unboundedQuantifiers(
+		string $bare,
+	): int
+	{
+		$count = 0;
+		$n = strlen($bare);
+		for($i = 0; $i < $n; $i++)
+		{
+			$char = $bare[$i];
+			if($char === '[')
+			{
+				$i = self::classEnd($bare, $i);
+				
+				continue;
+			}
+			if($char === '*' || $char === '+')
+			{
+				$count++;
+				
+				continue;
+			}
+			// `{n,}` or `{n,m}` with a large m; an exact `{n}` (no comma) never counts
+			if($char === '{' && preg_match('~\G\{\d+(,(\d*))?\}~', $bare, $match, 0, $i) === 1
+				&& isset($match[1]) && self::isUnboundedMax(($match[2] ?? '') === '' ? null : (int)$match[2]))
+			{
+				$count++;
+			}
+		}
+		
+		return $count;
+	}
+	
+	/**
+	 * A `{…}` of digits, commas and blanks that PCRE reads as a count and
+	 * JavaScript as the text it is: `{,5}`, `{ 2}`, `{2, 5}` — on the pattern
+	 * with escapes removed and character classes skipped. The strict `{n}`,
+	 * `{n,}` and `{n,m}` mean the same in both, braces without a digit
+	 * (`{,}`) are text in both
+	 */
+	protected static function hasLooseCount(
+		string $bare,
+	): bool
+	{
+		$n = strlen($bare);
+		for($i = 0; $i < $n; $i++)
+		{
+			if($bare[$i] === '[')
+			{
+				$i = self::classEnd($bare, $i);
+				
+				continue;
+			}
+			if($bare[$i] === '{' && preg_match('~\G\{[\d, \t]*\}~', $bare, $match, 0, $i) === 1
+				&& preg_match('~\d~', $match[0]) === 1 && preg_match('~^\{\d+(,\d*)?\}$~D', $match[0]) !== 1)
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * A class whose first member (after a `^`) is a bare `]`: `[]a]` is the
+	 * class of `]` and `a` to PCRE, an empty class and the text `a]` to
+	 * JavaScript, and `[^]a]` any byte there — on the pattern with escapes
+	 * removed, so `[\]a]` passes, and with classes skipped, so the `[` of
+	 * `[[]` opens nothing
+	 */
+	protected static function hasBracketLedClass(
+		string $bare,
+	): bool
+	{
+		$n = strlen($bare);
+		for($i = 0; $i < $n; $i++)
+		{
+			if($bare[$i] !== '[')
+			{
+				continue;
+			}
+			$first = ($bare[$i + 1] ?? '') === '^' ? $i + 2 : $i + 1;
+			if(($bare[$first] ?? '') === ']')
+			{
+				return true;
+			}
+			$i = self::classEnd($bare, $i);
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * The index of the `]` closing the class opened at $i, honouring a
+	 * leading `]` or `^]` — the last index when the class never closes
+	 */
+	protected static function classEnd(
+		string $bare,
+		int $i,
+	): int
+	{
+		$n = strlen($bare);
+		$j = $i + 1;
+		if($j < $n && $bare[$j] === '^')
+		{
+			$j++;
+		}
+		if($j < $n && $bare[$j] === ']')
+		{
+			$j++;
+		}
+		while($j < $n && $bare[$j] !== ']')
+		{
+			$j++;
+		}
+		
+		return $j;
+	}
+	
+	/**
+	 * Two unbounded quantifiers (`*`, `+`, `{n,}`, or a count of LARGE_COUNT
+	 * and more) that can match the same byte back to back — adjacent
+	 * (`\w+\w+`, `.*.*`, `\d+\w*`), with only optional or zero-width parts
+	 * between them (`\s*\/?\s*`, `\w+\b\w+`), or with a required part between
+	 * them that the first can swallow too (`.*a.*`). Each is a second way to
+	 * split the same run, and an unanchored exec in V8 pays for it
+	 * cubically on a near-miss (`\w+\w+=` over a few KiB of word bytes).
+	 * Disjoint neighbours (`\d+[a-z]+`, `[a-z]+=\d+`) cost nothing extra.
+	 *
+	 * Small counts chain the same way and multiply: the choices of the
+	 * overlapping ones in a row (`\w{1,8}\w{1,8}` is 8 × 8) may not pass
+	 * BOUNDED_CHOICES_MAX, or forty `\w{1,15}` in 600 bytes would be the
+	 * same hang without a single large count.
+	 *
+	 * Conservative: a set the parser cannot read exactly is every byte, a
+	 * repeated group is the union of everything inside it, `ci` folds the
+	 * letters. A pattern the parser cannot follow at all answers null, never
+	 * "no conflict": checkRegex() lets the compile check name a broken one
+	 * and refuses one that compiles.
+	 */
+	protected static function hasOverlappingQuantifiers(
+		string $value,
+		bool $ci,
+	): ?bool
+	{
+		$at = 0;
+		$tree = self::parseAlternation($value, $at, $ci);
+		if($tree === null || $at !== strlen($value))
+		{
+			return null;
+		}
+		
+		$conflict = false;
+		self::walkAlternation($tree, self::emptyChain(), $conflict);
+		
+		return $conflict;
+	}
+	
+	/**
+	 * What flows along a sequence: `open`, every byte an unbounded
+	 * quantifier still in reach could swallow; `chain`, the bytes of the
+	 * small counts in the current overlapping run, and `choices`, the
+	 * product of their choices
+	 *
+	 * @return array{open: string, chain: string, choices: int}
+	 */
+	protected static function emptyChain(): array
+	{
+		return ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1];
+	}
+	
+	/**
+	 * Each branch from the same entry; the exit is the union of the
+	 * branches' sets and the worst of their choices
+	 *
+	 * @param list<list<array>> $branches
+	 * @param array{open: string, chain: string, choices: int} $state
+	 * @return array{open: string, chain: string, choices: int}
+	 */
+	protected static function walkAlternation(
+		array $branches,
+		array $state,
+		bool &$conflict,
+	): array
+	{
+		$out = ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1];
+		foreach($branches as $sequence)
+		{
+			$exit = self::walkSequence($sequence, $state, $conflict);
+			$out['open'] |= $exit['open'];
+			$out['chain'] |= $exit['chain'];
+			$out['choices'] = max($out['choices'], $exit['choices']);
+		}
+		
+		return $out;
+	}
+	
+	/**
+	 * An unbounded item meeting `open` is the conflict, and so is a run of
+	 * overlapping small counts past BOUNDED_CHOICES_MAX. An optional or
+	 * zero-width item leaves both runs open; a required item ends a run
+	 * only when that run cannot swallow the item's bytes
+	 *
+	 * @param list<array> $sequence
+	 * @param array{open: string, chain: string, choices: int} $state
+	 * @return array{open: string, chain: string, choices: int}
+	 */
+	protected static function walkSequence(
+		array $sequence,
+		array $state,
+		bool &$conflict,
+	): array
+	{
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				continue;
+			}
+			
+			// a group that runs once (or not at all) is followed inside
+			if($item['type'] === 'group' && $item['max'] !== null && $item['max'] <= 1)
+			{
+				$inner = self::walkAlternation($item['branches'], $state, $conflict);
+				if($item['min'] === 0 || $item['nullable'])
+				{
+					$inner['open'] |= $state['open'];
+					$inner['chain'] |= $state['chain'];
+					$inner['choices'] = max($inner['choices'], $state['choices']);
+				}
+				// and is a choice itself: one way per branch, one more when it may
+				// be skipped — forty `(?:x)?` before a `y` are 2^40 ways on a near-miss
+				$ways = count($item['branches']) + ($item['min'] === 0 ? 1 : 0);
+				if($ways > 1)
+				{
+					$inner = self::counted($inner, $item['set'], $ways, $item['min'] > 0 && $item['nullable'] === false, $conflict);
+				}
+				$state = $inner;
+				
+				continue;
+			}
+			
+			$set = $item['set'];
+			$required = $item['min'] > 0 && $item['nullable'] === false;
+			$overlapsOpen = self::intersects($state['open'], $set);
+			
+			if($item['max'] === null)
+			{
+				if($overlapsOpen)
+				{
+					$conflict = true;
+				}
+				// an optional one keeps the earlier runs in reach; a required one is the only run left
+				$state['open'] = $item['min'] === 0 ? $state['open'] | $set : $set;
+			}
+			elseif($required && $overlapsOpen === false)
+			{
+				// a required byte the open run cannot swallow ends it
+				$state['open'] = str_repeat("\0", 256);
+			}
+			
+			// an unbounded one weighs LARGE_COUNT in the counts' run, so
+			// `\w{1,15}\w{1,15}\w+` (225 × 16) is a conflict while `\w+\d{0,3}`
+			// (16 × 4) is not — the two unbounded ones meeting each other are
+			// `open`'s business
+			$state = self::counted($state, $set, $item['max'] === null ? self::LARGE_COUNT : $item['max'] - $item['min'] + 1, $required, $conflict);
+		}
+		
+		return $state;
+	}
+	
+	/**
+	 * The counts' run after one more item with $choices ways through it: an
+	 * item with a choice multiplies the run it overlaps or starts one, past
+	 * BOUNDED_CHOICES_MAX the conflict; a required item the run cannot
+	 * swallow ends it
+	 *
+	 * @param array{open: string, chain: string, choices: int} $state
+	 * @return array{open: string, chain: string, choices: int}
+	 */
+	protected static function counted(
+		array $state,
+		string $set,
+		int $choices,
+		bool $required,
+		bool &$conflict,
+	): array
+	{
+		$overlapsChain = self::intersects($state['chain'], $set);
+		if($choices > 1)
+		{
+			if($overlapsChain)
+			{
+				$state['choices']*= $choices;
+				$state['chain'] |= $set;
+			}
+			elseif($required)
+			{
+				$state['chain'] = $set;
+				$state['choices'] = $choices;
+			}
+			else
+			{
+				$state['chain'] |= $set;
+				$state['choices'] = max($state['choices'], $choices);
+			}
+			if($state['choices'] > self::BOUNDED_CHOICES_MAX)
+			{
+				$conflict = true;
+			}
+		}
+		elseif($required && $overlapsChain === false)
+		{
+			$state['chain'] = str_repeat("\0", 256);
+			$state['choices'] = 1;
+		}
+		
+		return $state;
+	}
+	
+	/** whether two byte sets (256 bytes of "\0" or "\1") share a byte */
+	protected static function intersects(
+		string $a,
+		string $b,
+	): bool
+	{
+		return str_contains($a & $b, "\1");
+	}
+	
+	/**
+	 * branches := sequence ('|' sequence)* — null when the pattern is not
+	 * one this parser follows
+	 *
+	 * @return list<list<array>>|null
+	 */
+	protected static function parseAlternation(
+		string $value,
+		int &$at,
+		bool $ci,
+	): ?array
+	{
+		$branches = [];
+		while(true)
+		{
+			$sequence = self::parseSequence($value, $at, $ci);
+			if($sequence === null)
+			{
+				return null;
+			}
+			$branches[] = $sequence;
+			if(($value[$at] ?? '') !== '|')
+			{
+				return $branches;
+			}
+			$at++;
+		}
+	}
+	
+	/**
+	 * Items up to a `|`, a `)` or the end: each a byte set (or a group, or a
+	 * zero-width assertion) with its quantifier's min and max (null = no max)
+	 *
+	 * @return list<array>|null
+	 */
+	protected static function parseSequence(
+		string $value,
+		int &$at,
+		bool $ci,
+	): ?array
+	{
+		$items = [];
+		$n = strlen($value);
+		while($at < $n && $value[$at] !== '|' && $value[$at] !== ')')
+		{
+			$char = $value[$at];
+			if($char === '^' || $char === '$')
+			{
+				$items[] = ['type' => 'zero'];
+				$at++;
+				
+				continue;
+			}
+			if($char === '(')
+			{
+				$at++;
+				// only `(?:` and `(?<name>` are followed; any other `(?` construct is not
+				if(($value[$at] ?? '') === '?')
+				{
+					if(($value[$at + 1] ?? '') === ':')
+					{
+						$at+= 2;
+					}
+					elseif(preg_match('~\G\?<[A-Za-z_]\w*>~', $value, $match, 0, $at) === 1)
+					{
+						$at+= strlen($match[0]);
+					}
+					else
+					{
+						return null;
+					}
+				}
+				$branches = self::parseAlternation($value, $at, $ci);
+				if($branches === null || ($value[$at] ?? '') !== ')')
+				{
+					return null;
+				}
+				$at++;
+				$item = ['type' => 'group', 'branches' => $branches, 'set' => self::unionOf($branches), 'nullable' => self::nullableOf($branches)];
+			}
+			else
+			{
+				$set = self::parseAtom($value, $at, $ci);
+				// `\b`, `\B`: zero-width, and no quantifier is read after them
+				if($set === null)
+				{
+					$items[] = ['type' => 'zero'];
+					
+					continue;
+				}
+				$item = ['type' => 'set', 'set' => $set, 'nullable' => false];
+			}
+			
+			[$min, $max] = self::parseQuantifier($value, $at);
+			$item['min'] = $min;
+			$item['max'] = $max;
+			$item['nullable'] = $item['nullable'] || $min === 0;
+			$items[] = $item;
+		}
+		
+		return $items;
+	}
+	
+	/**
+	 * Whether a count's max makes it unbounded for the dialect's purposes:
+	 * none at all, or LARGE_COUNT and above
+	 */
+	protected static function isUnboundedMax(
+		?int $max,
+	): bool
+	{
+		return $max === null || $max >= self::LARGE_COUNT;
+	}
+	
+	/**
+	 * `* + ? {n} {n,} {n,m}`, a lazy `?` after any of them; [1, 1] when
+	 * none follows (a `{` that is no count is a literal, read as an atom)
+	 *
+	 * @return array{0: int, 1: int|null}
+	 */
+	protected static function parseQuantifier(
+		string $value,
+		int &$at,
+	): array
+	{
+		$char = $value[$at] ?? '';
+		$quantifier = match($char)
+		{
+			'*' => [0, null],
+			'+' => [1, null],
+			'?' => [0, 1],
+			default => null,
+		};
+		if($quantifier !== null)
+		{
+			$at++;
+		}
+		elseif($char === '{' && preg_match('~\G\{(\d+)(,(\d*))?\}~', $value, $match, 0, $at) === 1)
+		{
+			$at+= strlen($match[0]);
+			$min = (int)$match[1];
+			$max = ($match[3] ?? '') === '' ? null : (int)$match[3];
+			// a large count backtracks like an unbounded one: read as one
+			$quantifier = isset($match[2]) === false
+				? [$min, $min]
+				: [$min, self::isUnboundedMax($max) ? null : $max];
+		}
+		else
+		{
+			return [1, 1];
+		}
+		if(($value[$at] ?? '') === '?')
+		{
+			$at++;
+		}
+		
+		return $quantifier;
+	}
+	
+	/**
+	 * One atom's byte set: a literal, `.`, an escape or a class. Null for a
+	 * zero-width escape (`\b`, `\B`)
+	 */
+	protected static function parseAtom(
+		string $value,
+		int &$at,
+		bool $ci,
+	): ?string
+	{
+		$char = $value[$at];
+		if($char === '.')
+		{
+			$at++;
+			// every byte but the newline: no `s` flag
+			$set = str_repeat("\1", 256);
+			$set[10] = "\0";
+			
+			return $set;
+		}
+		if($char === '[')
+		{
+			return self::fold(self::parseClass($value, $at), $ci);
+		}
+		if($char === '\\')
+		{
+			$escape = $value[$at + 1] ?? '';
+			if($escape === 'b' || $escape === 'B')
+			{
+				$at+= 2;
+				
+				return null;
+			}
+			
+			return self::fold(self::parseEscape($value, $at), $ci);
+		}
+		$at++;
+		
+		return self::fold(self::setOf([ord($char)]), $ci);
+	}
+	
+	/**
+	 * An escape at $at (the backslash) as its byte set; a shorthand class
+	 * is ASCII as the dialect pins it, plus 0xA0 for `\s` (JavaScript's
+	 * reading — the wider set is the conservative one)
+	 */
+	protected static function parseEscape(
+		string $value,
+		int &$at,
+	): string
+	{
+		$escape = $value[$at + 1] ?? '';
+		$at+= 2;
+		$all = str_repeat("\1", 256);
+		
+		$digits = self::setOf(self::range(48, 57));
+		$word = self::setOf([...self::range(48, 57), ...self::range(65, 90), ...self::range(97, 122), 95]);
+		$space = self::setOf([9, 10, 11, 12, 13, 32, 160]);
+		
+		switch($escape)
+		{
+			case 'd':
+				return $digits;
+			case 'D':
+				return $all ^ $digits;
+			case 'w':
+				return $word;
+			case 'W':
+				return $all ^ $word;
+			case 's':
+				return $space;
+			case 'S':
+				// the complement of PCRE's \s: 0xA0 stays in, the wider reading
+				return $all ^ self::setOf([9, 10, 11, 12, 13, 32]);
+			case 'n':
+				return self::setOf([10]);
+			case 'r':
+				return self::setOf([13]);
+			case 't':
+				return self::setOf([9]);
+			case 'f':
+				return self::setOf([12]);
+			case 'v':
+				return self::setOf([11]);
+			case '0':
+				return self::setOf([0]);
+			case 'x':
+				if(preg_match('~\G[0-9A-Fa-f]{2}~', $value, $match, 0, $at) === 1)
+				{
+					$at+= 2;
+					
+					return self::setOf([(int)hexdec($match[0])]);
+				}
+				
+				return $all;
+			case '':
+				return $all;
+		}
+		
+		// an escaped punctuation mark is itself; any other letter is read
+		// as every byte rather than guessed at
+		return preg_match('~[A-Za-z0-9]~', $escape) === 1 ? $all : self::setOf([ord($escape)]);
+	}
+	
+	/**
+	 * A class at $at (the `[`) as its byte set — negation, ranges, escapes
+	 * and shorthands inside. A range with an escape at either end is read
+	 * as every byte rather than guessed at; $at always lands past the `]`
+	 */
+	protected static function parseClass(
+		string $value,
+		int &$at,
+	): string
+	{
+		$all = str_repeat("\1", 256);
+		$n = strlen($value);
+		$i = $at + 1;
+		$negated = ($value[$i] ?? '') === '^';
+		if($negated)
+		{
+			$i++;
+		}
+		$set = str_repeat("\0", 256);
+		$odd = false;
+		$first = true;
+		// a `]` first in the class is a literal, not its end
+		while($i < $n && ($value[$i] !== ']' || $first))
+		{
+			$first = false;
+			if($value[$i] === '\\')
+			{
+				$set |= self::parseEscape($value, $i);
+				// `\x00-\x1f`: a range from an escape
+				if(($value[$i] ?? '') === '-' && ($value[$i + 1] ?? ']') !== ']')
+				{
+					$odd = true;
+				}
+				
+				continue;
+			}
+			if(($value[$i + 1] ?? '') === '-' && ($value[$i + 2] ?? ']') !== ']')
+			{
+				$low = ord($value[$i]);
+				if($value[$i + 2] === '\\')
+				{
+					$odd = true;
+					$i+= 2;
+					
+					continue;
+				}
+				$high = ord($value[$i + 2]);
+				// a reversed range does not compile anyway; read as every byte
+				$set |= $high < $low ? $all : self::setOf(self::range($low, $high));
+				$i+= 3;
+				
+				continue;
+			}
+			$set |= self::setOf([ord($value[$i])]);
+			$i++;
+		}
+		$at = $i + 1;
+		if($odd)
+		{
+			return $all;
+		}
+		
+		return $negated ? $all ^ $set : $set;
+	}
+	
+	/** a group's bytes: everything any item in any branch could match */
+	protected static function unionOf(
+		array $branches,
+	): string
+	{
+		$set = str_repeat("\0", 256);
+		foreach($branches as $sequence)
+		{
+			foreach($sequence as $item)
+			{
+				if($item['type'] !== 'zero')
+				{
+					$set |= $item['set'];
+				}
+			}
+		}
+		
+		return $set;
+	}
+	
+	/** whether a group can match the empty string — one branch of nullable items is enough */
+	protected static function nullableOf(
+		array $branches,
+	): bool
+	{
+		foreach($branches as $sequence)
+		{
+			$nullable = true;
+			foreach($sequence as $item)
+			{
+				if($item['type'] !== 'zero' && $item['nullable'] === false)
+				{
+					$nullable = false;
+				}
+			}
+			if($nullable)
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/** a set with both cases of every letter in it, when the rule folds case */
+	protected static function fold(
+		string $set,
+		bool $ci,
+	): string
+	{
+		if($ci === false)
+		{
+			return $set;
+		}
+		for($byte = 65; $byte <= 90; $byte++)
+		{
+			if($set[$byte] === "\1" || $set[$byte + 32] === "\1")
+			{
+				$set[$byte] = "\1";
+				$set[$byte + 32] = "\1";
+			}
+		}
+		
+		return $set;
+	}
+	
+	/**
+	 * @param list<int> $bytes
+	 */
+	protected static function setOf(
+		array $bytes,
+	): string
+	{
+		$set = str_repeat("\0", 256);
+		foreach($bytes as $byte)
+		{
+			$set[$byte & 0xFF] = "\1";
+		}
+		
+		return $set;
+	}
+	
+	/**
+	 * @return list<int>
+	 */
+	protected static function range(
+		int $low,
+		int $high,
+	): array
+	{
+		$bytes = [];
+		for($byte = $low; $byte <= $high; $byte++)
+		{
+			$bytes[] = $byte;
+		}
+		
+		return $bytes;
 	}
 }
 
@@ -2283,7 +3372,7 @@ final class Kernel
 	public const HEADER_PLATFORMS = 'X-Shield-Platforms';
 	
 	public const PLATFORM_CORE = 'core';
-
+	
 	/** the rule the counting's heartbeat is an `entry` of, once per request it ran on: rule 0, the threat addresses', whose evidence nothing else counts */
 	public const HEARTBEAT = Ruleset::THREAT_RULE;
 	
@@ -3980,7 +5069,7 @@ final class Kernel
 	 * value has not escaped itself (after an even run of backslashes) gets
 	 * one, so it cannot close the delimiter
 	 */
-	protected static function regexPattern(
+	public static function regexPattern(
 		string $value,
 		bool $ci,
 	): string
