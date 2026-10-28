@@ -10,6 +10,7 @@ use Ovos\Test\Internal;
 use function add_action;
 use function count;
 use function str_contains;
+use function wp_shim_reset;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -60,5 +61,33 @@ class Database extends Test
 			&& $findings[0]['path'] === 'options/cron/gone_plugin_cleanup'
 			&& isset($findings[0]['mtime']) === false
 			&& str_contains($findings[0]['detail'], 'hourly, next 2026-10-20 12:40');
+	}
+	
+	/**
+	 * RULE: on a network a plugin activated network-wide is read from the
+	 * network's options, where activate_plugin() writes it, so one whose path
+	 * leaves the plugins directory is an active_plugin_missing finding like a
+	 * site's own. Falsify: read active_sitewide_plugins with get_option() —
+	 * the network's loader is never seen.
+	 */
+	public function aNetworkActivePluginIsCheckedLikeTheSitesOwn(): bool
+	{
+		$GLOBALS['wp']['multisite'] = true;
+		$GLOBALS['wp']['site_options']['active_sitewide_plugins'] = ['../uploads/loader.php' => 1_792_500_000];
+		
+		$database = new class extends PluginDatabase
+		{
+			public function activeFindings(): array
+			{
+				$stats = [];
+				
+				return $this->activePlugins($stats);
+			}
+		};
+		$findings = $database->activeFindings();
+		
+		return count($findings) === 1
+			&& $findings[0]['detector'] === 'active_plugin_missing'
+			&& $findings[0]['path'] === 'options/active_plugins/../uploads/loader.php';
 	}
 }

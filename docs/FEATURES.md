@@ -7,6 +7,7 @@ what codesafe does with it. Read it when a switch's one-line description is
 not enough.
 
 - [Connect](#connect)
+- [Not-found requests](#not-found-requests)
 - [Traffic rollups](#traffic-rollups)
 - [Software inventory](#software-inventory)
 - [Auto-update on codesafe's word](#auto-update-on-codesafes-word)
@@ -49,6 +50,53 @@ Connect needs a codesafe that has the `#/connect` page and the
 `/api/v1/connect/exchange` door; with an older one, paste the project's keys
 into the fields below the button instead.
 
+## Not-found requests
+
+With *Report 404s* on (the default; `CODESAFE_REPORT_404`), three kinds of
+request for what this site does not have are reported as **access events**
+(`kind: not_found`), apart from errors and never turned into issues:
+
+- **Pages** WordPress resolved to a 404 — the path as the message, its query
+  stripped. Static assets (a broken image, a stylesheet, a font) are noise
+  and are not reported.
+- **REST routes** the REST server has no handler for — WordPress's own
+  `rest_no_route` answer, for an unknown path or a known one asked with a
+  method it does not serve. The row names the route under the site's REST
+  prefix (`404 Not Found: /wp-json/foo/v1/bar`) whatever spelling the request
+  used, so `/wp-json/…` and `?rest_route=` are one group while the row's
+  address keeps what was asked; `extra.namespace` names the registered
+  namespace the route falls under. Empty says no such plugin here; a name
+  says the plugin is here and that route is not (another version?). Another
+  404 of a route that exists — a post id that does not — is no miss, and a
+  sub-request inside a batch or an `_embed` is not reported. A miss asked
+  with `_envelope`, which WordPress answers 200 with the 404 inside, is a
+  row too (status 200, as answered); the rollups count it as an answered
+  request.
+- **admin-ajax actions** nothing handles — admin-ajax.php runs `admin_init`,
+  every plugin's hooks with it, and then asks whether anything handles the
+  action for this caller; when nothing does it answers `0` with status 400
+  (an empty or non-scalar action is refused before `admin_init` and names
+  nothing). The row keeps the one query
+  parameter that names what was asked for, `404 Not Found:
+  /wp-admin/admin-ajax.php?action=<action>` (the action cut to 64 characters,
+  nothing else of the query); its status is WordPress's 400, and
+  `extra.handler` says `none` — nothing handles the action, the plugin is not
+  here — or `signed_in`: the action exists for signed-in users only and an
+  anonymous caller asked for it, so the plugin IS here. The Shield's or a
+  firewall's 403, or a handler's own answer, is no miss.
+
+One budget serves the three: 30 reports a minute, so a hard scan cannot turn
+the reporter into the flood it surfaces — the [traffic
+rollups](#traffic-rollups) carry the full counts, these rows are the
+samples. The site's box and the project's `report_404` switch in codesafe
+both have to be on.
+
+What codesafe does with them: they feed the attack waves and the offender
+bar like any probe, and the CVE lane's PROBED count reads them —
+`admin-ajax.php?action=<name>` for an ajax entry point, the namespace for a
+REST one — so a vulnerability whose entry point a scanner is hunting reads as
+probed on this site.
+
 ## Traffic rollups
 
 Error reports alone have no denominator: "37 requests for pages this site
@@ -56,7 +104,8 @@ does not serve" reads very differently on 50 000 requests a minute than on
 200. With rollups enabled, the plugin counts every request WordPress handles
 into per-minute counters — request total, split by response status, HTTP
 method, the *page type* WordPress resolved (front page, `singular/{post_type}`,
-`archive/{taxonomy}`, search, login, admin, REST, …) and logged-in state —
+`archive/{taxonomy}`, search, login, admin, REST per registered namespace,
+admin-ajax per registered action, …) and logged-in state —
 and ships each completed minute as **one** small POST to codesafe. A
 request answered 404 counts only as "matched nothing", which is exactly the
 scanner-probe signal codesafe's attack detection reads as a rate.
@@ -77,7 +126,12 @@ the alarm judges a blocking rule by. Counts per rule id, nothing else.
 What deliberately never travels: URLs, query strings, IP addresses, user
 agents, cookies, or anything else request-derived — the counter names come
 from a closed vocabulary WordPress itself defines, so the payload is
-structurally incapable of carrying visitor data.
+structurally incapable of carrying visitor data. A REST namespace or an
+admin-ajax action enters a counter only when this site registered it
+(`/rest/wp/v2`, `/admin/ajax/heartbeat`); a request for one it did not counts
+as "matched nothing", like a 404 page. At most 40 distinct names of those two
+families count in a minute, the rest under `/rest` and `/admin/ajax`: APCu is
+finite, and a full one would undercount every counter.
 
 It runs on **two switches** (either one off keeps the feature inert):
 
@@ -534,7 +588,26 @@ wordpress.org's list for that root know it, with the md5 **as it ran**:
 | under `wp-admin` / `wp-includes`, not in the core list / md5 differs | `executed_core_foreign` / `executed_core_modified` | urgent |
 | in a wp.org plugin, not in its list / md5 differs | `executed_plugin_foreign` / `executed_plugin_modified` | urgent |
 | a premium or custom plugin, a single-file plugin, a theme, a must-use plugin | `executed_unverified` | info, once |
+| inside a plugin-owned data directory (`w3tc-config`, `wflogs`, …) whose plugin is not installed | `executed_leftover` | urgent when code ran; info, once, when it stops before any code runs |
+| in a `plugins/` directory that is no installed plugin | `executed_leftover` | high when code ran; info, once, when it stops before any code runs |
+| a shipped file of a plugin active on no site, or any file of such a plugin wordpress.org has no list for | `executed_inactive` | info, once |
+| a theme no site runs (a theme registered a directory deep, `vendor/mytheme`, is matched as a whole) | `executed_inactive` | info, once |
 | recorded, but gone by the time the judge looks | `executed_vanished` | urgent |
+
+WordPress does not load a plugin or a theme no site runs, but the web
+server still serves its files to whoever asks for them by name — which is
+how a scanner reaches the vulnerable file of a plugin someone only
+deactivated, or of one uninstalled with its data directory left behind. The
+detail names the place and its owner, and so what to delete (`in wflogs/
+(wordfence, not installed)`, `no installed plugin owns plugins/js_composer`).
+Code that ran in a data directory stays urgent: the directory's name says
+whose it was, not who put the file there — `wflogs/shell.php` on a site
+without Wordfence is a shell first. A foreign or modified file of a plugin
+active on no site stays urgent and says `not active on any site`. On a
+multisite network *active* means network-active or active on any site, read
+for up to 100 sites; past that the watch cannot know, and calls nothing
+inactive. Network-active is read for the current network only, while the
+sites of every network are walked.
 
 Two answers come before the table, anywhere under `wp-content`. A *silence is
 golden* stub — an opener, comments, an optional closer, judged by PHP's own

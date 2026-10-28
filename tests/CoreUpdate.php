@@ -306,7 +306,7 @@ class CoreUpdate extends Test
 		$cron->here = true;
 		$cron->register();
 		
-		return $quiet && $GLOBALS['wp']['hooked'] === [['allow_minor_auto_core_updates', [$cron, 'allowMinor'], PHP_INT_MAX]];
+		return $quiet && $GLOBALS['wp']['hooked'] === [['allow_minor_auto_core_updates', [$cron, 'allowMinor'], PHP_INT_MAX, 1]];
 	}
 	
 	/**

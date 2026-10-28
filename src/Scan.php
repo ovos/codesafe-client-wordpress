@@ -8,7 +8,10 @@ use Ovos\Codesafe\Shield\Adapter;
 use Ovos\Codesafe\Shield\Prepend;
 
 use function apply_filters;
+use function array_filter;
 use function array_pop;
+use function array_unique;
+use function array_values;
 use function basename;
 use function bin2hex;
 use function class_exists;
@@ -23,10 +26,14 @@ use function fileperms;
 use function fopen;
 use function fread;
 use function function_exists;
+use function get_blog_option;
 use function get_bloginfo;
+use function get_current_blog_id;
 use function get_locale;
 use function get_option;
 use function get_plugins;
+use function get_site_option;
+use function get_sites;
 use function get_theme_root;
 use function gmdate;
 use function home_url;
@@ -153,6 +160,9 @@ class Scan
 	protected const MAX_PATH = 512;
 	
 	public const MAX_DETAIL = 160;
+	
+	/** sites activeAnywhere() reads on a network; past them "active" is not knowable */
+	public const SITES_MAX = 100;
 	
 	protected const MAX_SKIPPED = 50;
 	
@@ -2027,19 +2037,48 @@ class Scan
 	}
 	
 	/**
+	 * The owners of a plugin-owned data directory under wp-content when none
+	 * of them is installed; null when the name is no such directory or an
+	 * owner is installed. The executed-file watch asks it for a file that ran
+	 * inside one: what software the site no longer runs left behind
+	 *
+	 * @param array<string, string> $roots the area roots the caller judges against (roots())
+	 * @return ?list<string>
+	 */
+	public function writerOwners(
+		string $name,
+		array $roots,
+	): ?array
+	{
+		$owners = self::WRITER_DIRS[$name] ?? null;
+		
+		if($owners === null || $this->installedOwner($owners, $roots) !== null)
+		{
+			return null;
+		}
+		
+		return $owners;
+	}
+	
+	/**
 	 * The first installed owner of a plugin-written path — plugin slugs, or
-	 * `theme:<dir>` — as a label, or null
+	 * `theme:<dir>` — as a label, or null; against the pass's roots unless
+	 * the caller hands its own
 	 *
 	 * @param string[] $owners
+	 * @param ?array<string, string> $roots
 	 */
 	protected function installedOwner(
 		array $owners,
+		?array $roots = null,
 	): ?string
 	{
+		$roots ??= $this->roots;
+		
 		foreach($owners as $owner)
 		{
 			[$type, $slug] = str_contains($owner, ':') ? explode(':', $owner, 2) : ['plugin', $owner];
-			$root = $type === 'theme' ? $this->roots['themes'] : $this->roots['plugins'];
+			$root = $type === 'theme' ? $roots['themes'] : $roots['plugins'];
 			$installed = $this->installedSlugs($root)[strtolower($slug)] ?? null;
 			
 			if($slug !== '' && $installed !== null)
@@ -2455,22 +2494,88 @@ class Scan
 	
 	/**
 	 * The active plugins' slugs — directory names, or the file name of a
-	 * single-file plugin — network-activated ones included
+	 * single-file plugin — network-activated ones included. Those are the
+	 * network's: activate_plugin() writes them with update_site_option(),
+	 * into sitemeta, where the site's own get_option() never looks
 	 *
 	 * @return list<string>
 	 */
-	protected function activeSlugs(): array
+	public function activeSlugs(): array
 	{
 		$files = (array)get_option('active_plugins', []);
 		
 		if(function_exists('is_multisite') && is_multisite())
 		{
-			foreach((array)get_option('active_sitewide_plugins', []) as $file => $time)
+			foreach((array)get_site_option('active_sitewide_plugins', []) as $file => $time)
 			{
 				$files[] = $file;
 			}
 		}
 		
+		return self::slugsOf($files);
+	}
+	
+	/**
+	 * What the site runs: the plugins active on this site or network-wide,
+	 * and on a network on any of its sites, by slug as activeSlugs()
+	 * derives them; the themes as each site's stylesheet and template
+	 * OPTIONS — get_stylesheet() is a per-request filter, the option is what
+	 * the site runs. Null past SITES_MAX sites: not knowable at a bounded
+	 * cost, and a plugin called not active must never be a guess. The
+	 * network-active row is the current network's; the sites are every
+	 * network's
+	 *
+	 * @return ?array{plugins: list<string>, themes: list<string>}
+	 */
+	public function activeAnywhere(): ?array
+	{
+		$plugins = $this->activeSlugs();
+		$themes = [(string)get_option('stylesheet', ''), (string)get_option('template', '')];
+		
+		if(function_exists('is_multisite') && is_multisite())
+		{
+			// one more than the cap asked for, so a network past it reads as one
+			$sites = (array)get_sites(['fields' => 'ids', 'number' => self::SITES_MAX + 1]);
+			
+			if(count($sites) > self::SITES_MAX)
+			{
+				return null;
+			}
+			
+			$current = (int)get_current_blog_id();
+			
+			foreach($sites as $site)
+			{
+				$site = (int)$site;
+				
+				if($site === $current)
+				{
+					continue;
+				}
+				
+				$plugins = [...$plugins, ...self::slugsOf((array)get_blog_option($site, 'active_plugins', []))];
+				$themes[] = (string)get_blog_option($site, 'stylesheet', '');
+				$themes[] = (string)get_blog_option($site, 'template', '');
+			}
+		}
+		
+		return [
+			'plugins' => array_values(array_unique($plugins)),
+			'themes' => array_values(array_unique(array_filter($themes, static fn(string $theme): bool => $theme !== ''))),
+		];
+	}
+	
+	/**
+	 * Plugin files as WordPress lists them active (`akismet/akismet.php`,
+	 * `hello.php`) as slugs: the directory, or a single file's name
+	 *
+	 * @param array<mixed> $files
+	 * @return list<string>
+	 */
+	protected static function slugsOf(
+		array $files,
+	): array
+	{
 		$slugs = [];
 		
 		foreach($files as $file)

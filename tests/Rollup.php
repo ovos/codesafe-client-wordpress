@@ -9,6 +9,7 @@ use Ovos\Codesafe\Rollup as CodesafeRollup;
 use Ovos\Test;
 use Ovos\Test\Exception\SkipException;
 
+use function add_action;
 use function apcu_delete;
 use function apcu_fetch;
 use function apcu_store;
@@ -17,6 +18,9 @@ use function count;
 use function get_option;
 use function intdiv;
 use function preg_quote;
+use function str_repeat;
+use function strlen;
+use function substr;
 use function time;
 use function wp_shim_reset;
 
@@ -179,6 +183,140 @@ class Rollup extends Test
 		return count($sent) === 1 && $sent[0]['minute'] === $minute - 3;
 	}
 	
+	/**
+	 * RULE: an answered REST request counts under the longest namespace the
+	 * site registered that its route falls under — the namespace itself or a
+	 * path below it, matched whatever its case and counted lowercase — and
+	 * under `/rest` for the index, a route no namespace holds, a namespace
+	 * that only shares a prefix, or one outside the token shape. Falsify:
+	 * let the shortest namespace win — wc/store/v1 counts as wc; test the
+	 * prefix without its slash — /wp/v2x counts as wp/v2; a token without
+	 * `/` — every namespace with a version counts as /rest.
+	 */
+	public function theRouteOfAnAnsweredRestRequestIsItsRegisteredNamespace(): bool
+	{
+		$registered = ['wp/v2', 'foo/v1'];
+		$long = str_repeat('n', 62) . '/v1';
+		
+		return CodesafeRollup::restRouteName('/wp/v2/posts', $registered) === '/rest/wp/v2'
+			&& CodesafeRollup::restRouteName('/foo/v1', $registered) === '/rest/foo/v1'
+			&& CodesafeRollup::restRouteName('/', $registered) === '/rest'
+			&& CodesafeRollup::restRouteName('/nothing/v1/x', $registered) === '/rest'
+			&& CodesafeRollup::restRouteName('/wp/v2x/y', ['wp/v2']) === '/rest'
+			&& CodesafeRollup::restRouteName('/WP/V2/posts', ['WP/V2']) === '/rest/wp/v2'
+			&& CodesafeRollup::restRouteName('/bad name/v1/x', ['bad name/v1']) === '/rest'
+			&& CodesafeRollup::restRouteName('/wc/store/v1/cart', ['wc', 'wc/store/v1']) === '/rest/wc/store/v1'
+			&& CodesafeRollup::restRouteName('/wc/store/v1/cart', ['wc/store/v1', 'wc']) === '/rest/wc/store/v1'
+			&& strlen($long) === 65
+			&& CodesafeRollup::restRouteName('/' . $long . '/x', [$long]) === '/rest';
+	}
+	
+	/**
+	 * RULE: an admin-ajax request counts under its action when a handler
+	 * answers it for the caller, lowercased; one nothing handles that core
+	 * refused with 400 matched nothing this site serves — __unmatched, an
+	 * empty action too; anything else, or an action outside the token
+	 * shape, counts as `/admin/ajax`. Falsify: count an unhandled 400 under
+	 * `/admin/ajax` — the probe signal is lost; keep the action's case.
+	 */
+	public function theRouteOfAnAjaxRequestIsItsRegisteredAction(): bool
+	{
+		return CodesafeRollup::ajaxRouteName('zz_upload', true, 200) === '/admin/ajax/zz_upload'
+			&& CodesafeRollup::ajaxRouteName('My Action', true, 200) === '/admin/ajax'
+			&& CodesafeRollup::ajaxRouteName('zz', false, 400) === '__unmatched'
+			&& CodesafeRollup::ajaxRouteName('zz', false, 200) === '/admin/ajax'
+			&& CodesafeRollup::ajaxRouteName('', false, 400) === '__unmatched'
+			&& CodesafeRollup::ajaxRouteName('ZZ', true, 200) === '/admin/ajax/zz'
+			&& CodesafeRollup::ajaxRouteName(str_repeat('a', 65), true, 200) === '/admin/ajax';
+	}
+	
+	/**
+	 * RULE: the route of a REST request is read off its route and the
+	 * server's namespaces, of an admin-ajax request off its action and who
+	 * handles it for this caller — a nopriv handler answers an anonymous
+	 * caller only — and a 404 is __unmatched whatever either says. Another
+	 * endpoint that defines DOING_AJAX (WooCommerce's wc-ajax) counts in the
+	 * family, its 400 no miss. Falsify: leave the REST branch at `/rest`; let
+	 * the ajax branch ignore the handler or the caller; drop the pagenow
+	 * guard — wc-ajax's 400 reads __unmatched.
+	 */
+	public function routeForReadsTheRestAndAjaxSurfaces(): bool
+	{
+		$rollup = $this->rollup();
+		$rollup->rest = true;
+		$rollup->route = '/wp/v2/posts';
+		$rollup->namespaces = ['wp/v2'];
+		$rest = $rollup->routeNow(200);
+		$missed = $rollup->routeNow(404);
+		$rollup->rest = false;
+		$rollup->ajax = true;
+		$GLOBALS['pagenow'] = 'index.php';
+		$_REQUEST = ['action' => 'zz'];
+		$elsewhere = $rollup->routeNow(400);
+		$GLOBALS['pagenow'] = 'admin-ajax.php';
+		$unhandled = $rollup->routeNow(400);
+		add_action('wp_ajax_nopriv_zz', 'strlen');
+		$anonymous = $rollup->routeNow(400);
+		$GLOBALS['pagenow'] = 'index.php';
+		$handledElsewhere = $rollup->routeNow(200);
+		$GLOBALS['pagenow'] = 'admin-ajax.php';
+		$rollup->signedIn = true;
+		$signedIn = $rollup->routeNow(400);
+		$_REQUEST = [];
+		unset($GLOBALS['pagenow']);
+		
+		return $rest === '/rest/wp/v2'
+			&& $missed === '__unmatched'
+			&& $elsewhere === '/admin/ajax'
+			&& $unhandled === '__unmatched'
+			&& $anonymous === '/admin/ajax/zz'
+			&& $handledElsewhere === '/admin/ajax'
+			&& $signedIn === '__unmatched';
+	}
+	
+	/**
+	 * RULE: at most ROUTE_NAMES_MAX distinct REST namespace and ajax action
+	 * routes count in one minute, the rest under their family; a name
+	 * already counted keeps counting without taking another place; the
+	 * fixed vocabulary is never capped. Falsify: cap every route — the 41st
+	 * post type folds; drop the apcu_exists() test — a second hit takes a
+	 * place; write `>=` — the 40th name folds.
+	 */
+	public function distinctRouteNamesAreCappedPerMinute(): bool
+	{
+		$this->needsApcu();
+		$rollup = $this->rollup();
+		$minute = 29_000_000;
+		
+		for($i = 1; $i <= CodesafeRollup::ROUTE_NAMES_MAX + 1; $i++)
+		{
+			$rollup->countNow($minute, 200, '/admin/ajax/a' . $i);
+		}
+		$names = $rollup->fields($minute);
+		$rollup->countNow($minute, 200, '/admin/ajax/a1');
+		$again = $rollup->fields($minute);
+		for($i = 1; $i <= CodesafeRollup::ROUTE_NAMES_MAX + 1; $i++)
+		{
+			$rollup->countNow($minute, 200, '/singular/t' . $i);
+		}
+		$rollup->countNow($minute, 200, '/rest/x/v1');
+		$fixed = $rollup->fields($minute);
+		$rollup->clear();
+		
+		return CodesafeRollup::ROUTE_NAMES_MAX === 40
+			&& ($names['r:/admin/ajax/a1'] ?? 0) === 1
+			&& ($names['r:/admin/ajax/a40'] ?? 0) === 1
+			&& isset($names['r:/admin/ajax/a41']) === false
+			&& ($names['r:/admin/ajax'] ?? 0) === 1
+			&& ($names['rn'] ?? 0) === 41
+			&& ($again['r:/admin/ajax/a1'] ?? 0) === 2
+			&& ($again['rn'] ?? 0) === 41
+			&& ($fixed['r:/singular/t41'] ?? 0) === 1
+			&& ($fixed['r:/rest'] ?? 0) === 1
+			&& isset($fixed['r:/rest/x/v1']) === false
+			&& isset(CodesafeRollup::assemble($minute, $fixed)['rn']) === false;
+	}
+	
 	/** APCu holds the counters and the refusal; without it these rules are moot */
 	protected function needsApcu(): void
 	{
@@ -204,6 +342,17 @@ class Rollup extends Test
 		{
 			/** @var list<array<string, mixed>> */
 			public array $sent = [];
+			
+			/** the surfaces routeFor() reads: a REST request, its route and the server's namespaces, an ajax one, the caller */
+			public bool $rest = false;
+			
+			public string $route = '/';
+			
+			public array $namespaces = [];
+			
+			public bool $ajax = false;
+			
+			public bool $signedIn = false;
 			
 			public function __construct(
 				Config $config,
@@ -234,6 +383,68 @@ class Rollup extends Test
 			): void
 			{
 				$this->flush($minute);
+			}
+			
+			public function routeNow(
+				int|false $status,
+			): string
+			{
+				return $this->routeFor($status);
+			}
+			
+			/** one GET request counted into a minute */
+			public function countNow(
+				int $minute,
+				int|false $status,
+				string $route,
+			): void
+			{
+				$this->count($minute, $status, 'GET', $route, null);
+			}
+			
+			/**
+			 * A minute's counters by field
+			 *
+			 * @return array<string, int>
+			 */
+			public function fields(
+				int $minute,
+			): array
+			{
+				$prefix = $this->prefix() . $minute . ':';
+				$fields = [];
+				
+				foreach(new APCUIterator('~^' . preg_quote($prefix, '~') . '~') as $entry)
+				{
+					$fields[substr((string)$entry['key'], strlen($prefix))] = (int)$entry['value'];
+				}
+				
+				return $fields;
+			}
+			
+			protected function isRest(): bool
+			{
+				return $this->rest;
+			}
+			
+			protected function isAjax(): bool
+			{
+				return $this->ajax;
+			}
+			
+			protected function restRoute(): string
+			{
+				return $this->route;
+			}
+			
+			protected function namespaces(): array
+			{
+				return $this->namespaces;
+			}
+			
+			protected function signedIn(): bool
+			{
+				return $this->signedIn;
 			}
 			
 			/** every key under this site's prefix gone */
