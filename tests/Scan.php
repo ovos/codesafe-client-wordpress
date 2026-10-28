@@ -19,6 +19,7 @@ use function in_array;
 use function is_dir;
 use function md5;
 use function mkdir;
+use function range;
 use function realpath;
 use function rmdir;
 use function scandir;
@@ -27,6 +28,7 @@ use function sys_get_temp_dir;
 use function time;
 use function uniqid;
 use function unlink;
+use function wp_shim_reset;
 
 use const DIRECTORY_SEPARATOR;
 use const FILE_APPEND;
@@ -504,5 +506,64 @@ class Scan extends Test
 		
 		return $this->verdict($owned, 'aios-bootstrap.php') === 'root_php_owned info'
 			&& $this->verdict($stranger, 'aios-bootstrap.php') === 'root_php urgent';
+	}
+	
+	/**
+	 * RULE: on a network the plugins activated network-wide are active —
+	 * read from the network's options, where activate_plugin() writes them —
+	 * beside the site's own; a single site never loads that row, so a stale
+	 * one there counts for nothing. Falsify: read it with get_option() — the
+	 * network-active plugin is invisible; drop the multisite test — a single
+	 * site's stale row reads as active.
+	 */
+	public function networkActivePluginsCountAsActive(): bool
+	{
+		$GLOBALS['wp']['multisite'] = true;
+		$GLOBALS['wp']['site_options']['active_sitewide_plugins'] = ['wordfence/wordfence.php' => 1];
+		$GLOBALS['wp']['options']['active_plugins'] = ['akismet/akismet.php', 'hello.php'];
+		$network = $this->scanner($this->noStore())->activeSlugs();
+		$GLOBALS['wp']['multisite'] = false;
+		$GLOBALS['wp']['options']['active_sitewide_plugins'] = ['wordfence/wordfence.php' => 1];
+		$single = $this->scanner($this->noStore())->activeSlugs();
+		
+		return $network === ['akismet', 'hello', 'wordfence']
+			&& $single === ['akismet', 'hello'];
+	}
+	
+	/**
+	 * RULE: what runs anywhere on a network is every site's active plugins
+	 * and its stylesheet and template options, each name once; a network of
+	 * more sites than SITES_MAX cannot be read at a bounded cost and answers
+	 * null; a single site reads its own options and never asks for sites.
+	 * Falsify: ask for SITES_MAX sites — 101 read like 100; read the
+	 * stylesheet alone — a parent theme reads as not run.
+	 */
+	public function activeAnywhereReadsEverySiteUpToTheCap(): bool
+	{
+		$GLOBALS['wp']['multisite'] = true;
+		$GLOBALS['wp']['options']['stylesheet'] = 'own';
+		$GLOBALS['wp']['options']['template'] = 'own';
+		$GLOBALS['wp']['sites'] = [1, 2, 3];
+		$GLOBALS['wp']['blog_options'] = [
+			2 => ['active_plugins' => ['akismet/akismet.php']],
+			3 => ['stylesheet' => 'child', 'template' => 'parent'],
+		];
+		$scan = $this->scanner($this->noStore());
+		$network = $scan->activeAnywhere();
+		$asked = $GLOBALS['wp']['sites_asked'][0]['number'] ?? 0;
+		$GLOBALS['wp']['sites'] = range(1, PluginScan::SITES_MAX + 1);
+		$past = $scan->activeAnywhere();
+		$GLOBALS['wp']['sites'] = range(1, PluginScan::SITES_MAX);
+		$at = $scan->activeAnywhere();
+		$GLOBALS['wp']['multisite'] = false;
+		$GLOBALS['wp']['sites_asked'] = [];
+		$single = $scan->activeAnywhere();
+		
+		return $network === ['plugins' => ['akismet'], 'themes' => ['own', 'child', 'parent']]
+			&& $asked === PluginScan::SITES_MAX + 1
+			&& $past === null
+			&& $at !== null
+			&& $single === ['plugins' => [], 'themes' => ['own']]
+			&& $GLOBALS['wp']['sites_asked'] === [];
 	}
 }

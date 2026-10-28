@@ -9,6 +9,7 @@ use Ovos\Codesafe\Shield\Prepend;
 use Throwable;
 
 use function add_option;
+use function array_key_exists;
 use function basename;
 use function bin2hex;
 use function count;
@@ -23,6 +24,7 @@ use function get_bloginfo;
 use function get_locale;
 use function get_option;
 use function gmdate;
+use function implode;
 use function in_array;
 use function is_array;
 use function is_dir;
@@ -80,6 +82,13 @@ use const PHP_VERSION;
  * here deletes, quarantines or refuses: a finding is a place to look. Executed
  * is a stronger fact than present — where the scan says high for a plugin's
  * foreign file, this proposes urgent. The console decides.
+ *
+ * A file that ran inside a directory no installed software owns — a plugin's
+ * data directory, a plugins/ directory get_plugins() does not list — is a
+ * leftover, worded by the place: the directory's name says whose it was, not
+ * who put the file there, so code that ran in a data directory stays urgent.
+ * A file of a plugin or theme no site runs that ran directly is said in
+ * words: WordPress does not load it, the web server still serves it.
  */
 class Entries
 {
@@ -120,10 +129,20 @@ class Entries
 		'executed_plugin_foreign' => 'a file in a wp.org plugin that its release never shipped ran',
 		'executed_plugin_modified' => 'a plugin file differing from what wordpress.org shipped ran',
 		'executed_unverified' => 'a file no list vouches for ran',
+		'executed_leftover' => 'a file ran inside a directory of software the site does not run',
+		'executed_inactive' => 'a file of a plugin or theme active on no site ran directly',
 		'executed_vanished' => 'a file ran and is gone since',
 	];
 	
 	protected int $fetches = 0;
+	
+	/**
+	 * What the site runs (Scan::activeAnywhere()), read once per drain on
+	 * the first plugin or theme file judged; false when it cannot be known
+	 *
+	 * @var array{plugins: list<string>, themes: list<string>}|false|null
+	 */
+	protected array|false|null $active = null;
 	
 	public function __construct(
 		protected Config $config,
@@ -318,6 +337,7 @@ class Entries
 	{
 		$begun = microtime(true);
 		$this->fetches = 0;
+		$this->active = null;
 		$roots = $this->scan()->roots();
 		$versions = null;
 		$rows = [];
@@ -457,6 +477,12 @@ class Entries
 				return $this->judgeCore($relative, $file, $area, $path, $record);
 				
 			case 'themes':
+				// a theme no site runs: WordPress never loads it, the web server still serves its files
+				if(str_contains($path, '/') && $this->inactive('theme', $path))
+				{
+					return $this->finding('executed_inactive', Scan::TIER_INFO, $area, $path, $record, 'a theme the site does not run — no list vouches for it', true);
+				}
+				
 				// no list vouches for a theme (wp.org has no theme checksums)
 				return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'a theme file — no list vouches for it', true);
 				
@@ -471,6 +497,17 @@ class Entries
 				{
 					// must-use plugins are custom code by definition
 					return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'a must-use plugin — no list vouches for it', true);
+				}
+				
+				// inside a plugin's data directory whose plugin is not installed: the name says
+				// whose the directory was, not who wrote the file, so code that ran is urgent
+				$slash = strpos($path, '/');
+				$owners = $slash === false ? null : $this->scan()->writerOwners(substr($path, 0, $slash), $roots);
+				
+				if($owners !== null)
+				{
+					return $this->leftover($area, $path, $file, $record, Scan::TIER_URGENT,
+						'in ' . substr($path, 0, $slash) . '/ (' . implode(' or ', $owners) . (count($owners) > 1 ? ', none installed)' : ', not installed)'));
 				}
 				
 				// a plugin's data file under a PHP name (W3 Total Cache's config): the scan lists it as inert too
@@ -530,7 +567,9 @@ class Entries
 	 * A file inside a plugin directory against the plugin's wp.org list —
 	 * judged on the md5 the layer took AS IT RAN, so a file restored after
 	 * use is still the modified one that ran. No list (a premium or custom
-	 * plugin, a single-file plugin): unverified, once
+	 * plugin, a single-file plugin): unverified, once. A directory no
+	 * installed plugin owns is a leftover; a file of a plugin active on no
+	 * site that ran is said in words, its foreign or modified file stays urgent
 	 *
 	 * @return array{finding: ?array, learn: bool, wait: bool}
 	 */
@@ -552,11 +591,24 @@ class Entries
 		$slug = substr($path, 0, $slash);
 		$key = substr($path, $slash + 1);
 		$versions ??= $this->scan()->pluginVersions();
-		$version = (string)($versions[$slug] ?? '');
+		
+		// an empty list is get_plugins() unavailable, not a site without plugins: this one is installed
+		if($versions === [])
+		{
+			return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'the installed plugins cannot be read', true);
+		}
+		
+		// no key is no installed plugin; a key with '' is one whose header names no version
+		if(array_key_exists($slug, $versions) === false)
+		{
+			return $this->leftover($area, $path, $file, $record, Scan::TIER_HIGH, 'no installed plugin owns plugins/' . $slug);
+		}
+		
+		$version = (string)$versions[$slug];
 		
 		if($version === '')
 		{
-			return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'not an installed plugin\'s directory', true);
+			return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'no version to look up for ' . $slug, true);
 		}
 		
 		$list = $this->list(fn(): ?array => $this->sums()->plugin($slug, $version), $this->sums()->pluginCached($slug, $version), $waiting);
@@ -566,12 +618,24 @@ class Entries
 			return self::verdict(null, false, true);
 		}
 		
+		$inactive = $this->inactive('plugin', $slug);
+		
 		if($list === null)
 		{
-			return $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'no wordpress.org list for ' . $slug . ' ' . $version, true);
+			return $inactive
+				? $this->finding('executed_inactive', Scan::TIER_INFO, $area, $path, $record, 'not active on any site, no wordpress.org list for ' . $slug . ' ' . $version, true)
+				: $this->finding('executed_unverified', Scan::TIER_INFO, $area, $path, $record, 'no wordpress.org list for ' . $slug . ' ' . $version, true);
 		}
 		
-		return $this->verify($list, $key, $file, 'plugin', $area, $path, $record);
+		$verdict = $this->verify($list, $key, $file, 'plugin', $area, $path, $record, $inactive ? 'not active on any site' : '');
+		
+		// a shipped file is no stranger, but WordPress never loads it: the request asked for it by name
+		if($inactive && $verdict['finding'] === null)
+		{
+			return $this->finding('executed_inactive', Scan::TIER_INFO, $area, $path, $record, 'not active on any site, yet the web server still serves it', true);
+		}
+		
+		return $verdict;
 	}
 	
 	/**
@@ -606,7 +670,9 @@ class Entries
 	
 	/**
 	 * The three verdicts a list gives: not in it (foreign), in it with
-	 * another md5 (modified), in it byte for byte (shipped — learnt)
+	 * another md5 (modified), in it byte for byte (shipped — learnt).
+	 * `$lead` opens a foreign or modified detail, ahead of the words the
+	 * detail cap would cut first
 	 *
 	 * @param array<string, string|list<string>> $list
 	 * @return array{finding: ?array, learn: bool, wait: bool}
@@ -619,11 +685,14 @@ class Entries
 		string $area,
 		string $path,
 		array $record,
+		string $lead = '',
 	): array
 	{
+		$lead = $lead !== '' ? $lead . ' · ' : '';
+		
 		if(isset($list[$key]) === false)
 		{
-			return $this->finding('executed_' . $kind . '_foreign', Scan::TIER_URGENT, $area, $path, $record, 'not in the wordpress.org list for this version');
+			return $this->finding('executed_' . $kind . '_foreign', Scan::TIER_URGENT, $area, $path, $record, $lead . 'not in the wordpress.org list for this version');
 		}
 		
 		if(Checksums::matches($list, $key, $this->ranMd5($file, $record)))
@@ -631,7 +700,75 @@ class Entries
 			return self::verdict(null, true);
 		}
 		
-		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record, 'md5 as it ran differs from the wordpress.org list for this version');
+		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record, $lead . 'md5 as it ran differs from the wordpress.org list for this version');
+	}
+	
+	/**
+	 * A file that ran inside a directory no installed software owns, worded by
+	 * the place: $tier when its code ran, info and learnt when PHP stops
+	 * before any of it runs (a config or a log under a PHP name)
+	 *
+	 * @return array{finding: ?array, learn: bool, wait: bool}
+	 */
+	protected function leftover(
+		string $area,
+		string $path,
+		string $file,
+		array $record,
+		string $tier,
+		string $place,
+	): array
+	{
+		return $this->ranInert($file, $record)
+			? $this->finding('executed_leftover', Scan::TIER_INFO, $area, $path, $record, $place . ' · stops before any code runs', true)
+			: $this->finding('executed_leftover', $tier, $area, $path, $record, $place . ' · code ran');
+	}
+	
+	/**
+	 * Whether a plugin (`$name` its slug) or a theme (`$name` the file's path
+	 * under the themes root) runs on no site: a theme runs when its
+	 * directory leads the path, one level deep or more (`vendor/mytheme`, as
+	 * search_theme_directories() registers a theme in a subdirectory). False
+	 * when that cannot be known, so a guess never reads as not active
+	 */
+	protected function inactive(
+		string $kind,
+		string $name,
+	): bool
+	{
+		$active = $this->activeAnywhere();
+		
+		if($active === null)
+		{
+			return false;
+		}
+		
+		if($kind !== 'theme')
+		{
+			return in_array($name, $active['plugins'], true) === false;
+		}
+		
+		foreach($active['themes'] as $theme)
+		{
+			if(str_starts_with($name, $theme . '/'))
+			{
+				return false;
+			}
+		}
+		
+		return true;
+	}
+	
+	/**
+	 * What the site runs, read once per drain
+	 *
+	 * @return ?array{plugins: list<string>, themes: list<string>}
+	 */
+	protected function activeAnywhere(): ?array
+	{
+		$this->active ??= $this->scan()->activeAnywhere() ?? false;
+		
+		return $this->active === false ? null : $this->active;
 	}
 	
 	/**

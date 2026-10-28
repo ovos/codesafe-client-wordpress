@@ -23,14 +23,21 @@ use function curl_setopt_array;
 use function defined;
 use function error_get_last;
 use function error_reporting;
+use function fastcgi_finish_request;
 use function file_get_contents;
 use function function_exists;
+use function get_current_user_id;
+use function get_stylesheet;
+use function get_theme_root;
+use function get_transient;
 use function gmdate;
+use function home_url;
 use function http_response_code;
 use function in_array;
 use function is_array;
 use function is_int;
 use function is_string;
+use function is_wp_error;
 use function json_decode;
 use function json_encode;
 use function max;
@@ -39,9 +46,11 @@ use function min;
 use function preg_match;
 use function register_shutdown_function;
 use function rtrim;
+use function sanitize_text_field;
 use function session_id;
 use function session_status;
 use function set_error_handler;
+use function set_transient;
 use function spl_object_id;
 use function sprintf;
 use function str_replace;
@@ -54,13 +63,43 @@ use function substr;
 use function time;
 use function trim;
 use function usleep;
+use function wp_get_upload_dir;
+use function wp_parse_url;
+use function wp_remote_post;
+use function wp_remote_retrieve_body;
+use function wp_remote_retrieve_response_code;
+use function wp_unslash;
 
+use const ABSPATH;
+use const CURLINFO_RESPONSE_CODE;
+use const CURLINFO_SIZE_UPLOAD_T;
+use const CURLOPT_CONNECTTIMEOUT_MS;
+use const CURLOPT_HTTPHEADER;
+use const CURLOPT_NOSIGNAL;
+use const CURLOPT_POST;
+use const CURLOPT_POSTFIELDS;
 use const CURLOPT_PROTOCOLS;
 use const CURLOPT_REDIR_PROTOCOLS;
+use const CURLOPT_RETURNTRANSFER;
+use const CURLOPT_SSL_VERIFYHOST;
+use const CURLOPT_SSL_VERIFYPEER;
+use const CURLOPT_TIMEOUT_MS;
 use const CURLPROTO_HTTP;
 use const CURLPROTO_HTTPS;
+use const DAY_IN_SECONDS;
+use const E_COMPILE_ERROR;
+use const E_CORE_ERROR;
+use const E_ERROR;
+use const E_PARSE;
+use const E_RECOVERABLE_ERROR;
+use const JSON_INVALID_UTF8_SUBSTITUTE;
+use const JSON_PARTIAL_OUTPUT_ON_ERROR;
+use const PHP_SAPI;
 use const PHP_SESSION_ACTIVE;
 use const PHP_URL_HOST;
+use const WPMU_PLUGIN_DIR;
+use const WP_CONTENT_DIR;
+use const WP_PLUGIN_DIR;
 
 /**
  * Reports collected errors to a central ovos/console instance —
@@ -341,11 +380,14 @@ class Sender
 	 * unless report_404 is enabled here. The path (query stripped and scrubbed
 	 * with the request patterns) is the message so distinct probes stay distinct
 	 * while one hammered path folds together; the report ships from the shutdown
-	 * flush like any other.
+	 * flush like any other. $keepQuery keeps the query: the one caller that does
+	 * is the admin-ajax miss, whose path names nothing and whose `action`
+	 * parameter is the resource asked for.
 	 */
 	public function capture404(
 		string $path = '',
 		array $extra = [],
+		bool $keepQuery = false,
 	): void
 	{
 		if($this->config->report404() === false
@@ -362,7 +404,7 @@ class Sender
 				? Redactor::scrubUrl(Redactor::rawUrl($path), identities: false)
 				: $this->url('REQUEST_URI');
 			
-			$mark = strpos($path, '?');
+			$mark = $keepQuery ? false : strpos($path, '?');
 			if($mark !== false)
 			{
 				$path = substr($path, 0, $mark);

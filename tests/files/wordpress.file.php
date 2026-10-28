@@ -45,7 +45,7 @@ function wp_shim_reset(): void
 		'options' => [],
 		// apply_filters() callbacks, by hook name
 		'filters' => [],
-		// add_filter() and add_action() calls in order: [hook, callback, priority] — recorded, never run
+		// add_filter() and add_action() calls in order: [hook, callback, priority, accepted args] — recorded, never run
 		'hooked' => [],
 		// the accounts get_user_by() finds: login => [ID, email, capabilities]
 		'users' => [],
@@ -79,6 +79,16 @@ function wp_shim_reset(): void
 		'doing_cron' => false,
 		'admin' => false,
 		'cron' => [],
+		// is_404(), wp_doing_ajax(), is_user_logged_in(), and the namespaces rest_get_server() registered
+		'is_404' => false,
+		'doing_ajax' => false,
+		'logged_in' => false,
+		'rest_namespaces' => [],
+		// a network's sites: the ids get_sites() finds, every args it was asked with,
+		// and get_blog_option() by site id (before main_options)
+		'sites' => [],
+		'sites_asked' => [],
+		'blog_options' => [],
 	];
 	// WordPress's own: whether the login cookie settled the current user (rest_cookie_collect_status())
 	unset($GLOBALS['wp_rest_auth_cookie'], $GLOBALS['pagenow']);
@@ -171,14 +181,14 @@ function add_filter(
 	mixed ...$arguments,
 ): void
 {
-	$GLOBALS['wp']['hooked'][] = [$arguments[0] ?? '', $arguments[1] ?? null, $arguments[2] ?? 10];
+	$GLOBALS['wp']['hooked'][] = [$arguments[0] ?? '', $arguments[1] ?? null, $arguments[2] ?? 10, $arguments[3] ?? 1];
 }
 
 function add_action(
 	mixed ...$arguments,
 ): void
 {
-	$GLOBALS['wp']['hooked'][] = [$arguments[0] ?? '', $arguments[1] ?? null, $arguments[2] ?? 10];
+	$GLOBALS['wp']['hooked'][] = [$arguments[0] ?? '', $arguments[1] ?? null, $arguments[2] ?? 10, $arguments[3] ?? 1];
 }
 
 // whether anything was hooked by that name, as add_action() recorded it
@@ -194,7 +204,7 @@ function has_action(
 			return true;
 		}
 	}
-
+	
 	return false;
 }
 
@@ -295,7 +305,23 @@ function get_blog_option(
 	mixed $default = false,
 ): mixed
 {
-	return $GLOBALS['wp']['main_options'][$name] ?? $default;
+	return $GLOBALS['wp']['blog_options'][$id][$name] ?? $GLOBALS['wp']['main_options'][$name] ?? $default;
+}
+
+function get_current_blog_id(): int
+{
+	return 1;
+}
+
+/** the network's site ids, cut to `number` as core cuts them (0 = every site) */
+function get_sites(
+	array $args = [],
+): array
+{
+	$GLOBALS['wp']['sites_asked'][] = $args;
+	$number = (int)($args['number'] ?? 100);
+	
+	return $number > 0 ? array_slice($GLOBALS['wp']['sites'], 0, $number) : $GLOBALS['wp']['sites'];
 }
 
 function is_wp_error(
@@ -544,6 +570,77 @@ function current_user_can(
 function rest_get_url_prefix(): string
 {
 	return apply_filters('rest_url_prefix', 'wp-json');
+}
+
+/** the REST server: its registered namespaces, from the shim's state */
+class WP_REST_Server
+{
+	public function get_namespaces(): array
+	{
+		return $GLOBALS['wp']['rest_namespaces'];
+	}
+}
+
+function rest_get_server(): WP_REST_Server
+{
+	return new WP_REST_Server();
+}
+
+/** the answer serve_request() hands rest_pre_serve_request: its data and its status */
+class WP_REST_Response
+{
+	public function __construct(
+		protected mixed $data = null,
+		protected int $status = 200,
+	)
+	{
+	}
+	
+	public function get_status(): int
+	{
+		return $this->status;
+	}
+	
+	public function get_data(): mixed
+	{
+		return $this->data;
+	}
+}
+
+/** a REST request's method and route, as rest_api_loaded() built it */
+class WP_REST_Request
+{
+	public function __construct(
+		protected string $method = 'GET',
+		protected string $route = '/',
+	)
+	{
+	}
+	
+	public function get_route(): string
+	{
+		return $this->route;
+	}
+	
+	public function get_method(): string
+	{
+		return $this->method;
+	}
+}
+
+function is_404(): bool
+{
+	return $GLOBALS['wp']['is_404'];
+}
+
+function wp_doing_ajax(): bool
+{
+	return $GLOBALS['wp']['doing_ajax'];
+}
+
+function is_user_logged_in(): bool
+{
+	return $GLOBALS['wp']['logged_in'];
 }
 
 /** the site's name and the core version, the two the plugin reads */

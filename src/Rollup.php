@@ -11,6 +11,7 @@ use function apcu_add;
 use function apcu_delete;
 use function apcu_enabled;
 use function apcu_entry;
+use function apcu_exists;
 use function apcu_fetch;
 use function apcu_inc;
 use function apcu_store;
@@ -23,17 +24,39 @@ use function curl_init;
 use function curl_setopt_array;
 use function defined;
 use function delete_option;
+use function did_action;
+use function fastcgi_finish_request;
 use function function_exists;
 use function get_option;
+use function get_post_type;
+use function get_queried_object;
+use function get_query_var;
 use function gethostname;
 use function getmypid;
 use function headers_list;
 use function http_response_code;
 use function in_array;
 use function intdiv;
+use function is_404;
+use function is_admin;
+use function is_archive;
 use function is_array;
+use function is_author;
+use function is_category;
+use function is_date;
+use function is_feed;
+use function is_front_page;
+use function is_home;
 use function is_int;
+use function is_login;
+use function is_object;
+use function is_post_type_archive;
+use function is_search;
+use function is_singular;
 use function is_string;
+use function is_tag;
+use function is_tax;
+use function is_user_logged_in;
 use function json_decode;
 use function json_encode;
 use function ksort;
@@ -44,17 +67,37 @@ use function preg_quote;
 use function preg_replace;
 use function register_shutdown_function;
 use function reset;
+use function rest_get_server;
+use function rtrim;
+use function str_starts_with;
+use function strlen;
 use function strrpos;
+use function strtolower;
 use function substr;
 use function time;
 use function update_option;
+use function wp_doing_ajax;
+use function wp_doing_cron;
 
 use const CURLINFO_RESPONSE_CODE;
+use const CURLOPT_CONNECTTIMEOUT_MS;
+use const CURLOPT_HTTPHEADER;
+use const CURLOPT_NOSIGNAL;
+use const CURLOPT_POST;
+use const CURLOPT_POSTFIELDS;
 use const CURLOPT_PROTOCOLS;
 use const CURLOPT_REDIR_PROTOCOLS;
+use const CURLOPT_RETURNTRANSFER;
+use const CURLOPT_SSL_VERIFYHOST;
+use const CURLOPT_SSL_VERIFYPEER;
+use const CURLOPT_TIMEOUT_MS;
 use const CURLPROTO_HTTP;
 use const CURLPROTO_HTTPS;
+use const JSON_INVALID_UTF8_SUBSTITUTE;
+use const JSON_PARTIAL_OUTPUT_ON_ERROR;
 use const PHP_SAPI;
+use const REST_REQUEST;
+use const XMLRPC_REQUEST;
 
 /**
  * Per-minute traffic rollup accumulator — the console's DENOMINATOR layer,
@@ -84,7 +127,14 @@ use const PHP_SAPI;
  * front-page, singular/{post_type}, archive/{taxonomy}, search, login,
  * rest, admin — all names WordPress itself defines; a request answered 404
  * counts only __unmatched, which is exactly the probe signal the console
- * wants. A raw URI must never reach a field name.
+ * wants. A raw URI must never reach a field name. A REST namespace and an
+ * admin-ajax action enter a counter only when this site registered them
+ * (`/rest/wp/v2`, `/admin/ajax/heartbeat`); a request for one it did not
+ * register counts __unmatched — admin-ajax answers it 400, not 404. Those
+ * two families are capped at ROUTE_NAMES_MAX distinct names a minute, the
+ * rest counting under `/rest` and `/admin/ajax`: every distinct route costs
+ * up to 16 APCu keys for an hour, APCu is finite, and a full APCu fails
+ * every apcu_inc() silently — the undercount this class must never produce.
  *
  * Page-cache plugins that serve hits before WordPress boots bypass this
  * entirely (cached traffic is uncounted) — the same caveat every front
@@ -157,6 +207,15 @@ class Rollup
 	public const DURATION_SPLIT = [5, 10];
 	
 	public const DURATION_FINE_PARTS = 3;
+	
+	/** distinct REST namespace and ajax action routes a minute — codesafe's own cap on route fields */
+	public const ROUTE_NAMES_MAX = 40;
+	
+	/** the REST family's own name, and the parent of `/rest/<namespace>` */
+	public const REST_FAMILY = '/rest';
+	
+	/** the admin-ajax family's own name, and the parent of `/admin/ajax/<action>` */
+	public const AJAX_FAMILY = '/admin/ajax';
 	
 	/**
 	 * APCu key prefix, site-scoped lazily — see prefix()
@@ -312,14 +371,23 @@ class Rollup
 			return '/xmlrpc';
 		}
 		
-		if(defined('REST_REQUEST') && REST_REQUEST)
+		if($this->isRest())
 		{
-			return '/rest';
+			return self::restRouteName($this->restRoute(), $this->namespaces());
 		}
 		
-		if(function_exists('wp_doing_ajax') && wp_doing_ajax())
+		if($this->isAjax())
 		{
-			return '/admin/ajax';
+			// another endpoint that defines DOING_AJAX (WooCommerce's wc-ajax) answers by
+			// rules of its own: no wp_ajax_ handler speaks for it, its 400 is no miss
+			if(($GLOBALS['pagenow'] ?? '') !== 'admin-ajax.php')
+			{
+				return self::AJAX_FAMILY;
+			}
+			
+			$action = NotFound::ajaxAction($_REQUEST);
+			
+			return self::ajaxRouteName($action, $action !== '' && NotFound::ajaxHandler($action, $this->signedIn()) === null, $status);
 		}
 		
 		if(function_exists('wp_doing_cron') && wp_doing_cron())
@@ -420,6 +488,106 @@ class Rollup
 		}
 		
 		return '__other';
+	}
+	
+	/** whether this request is the REST API's (rest_api_loaded() defines REST_REQUEST) */
+	protected function isRest(): bool
+	{
+		return defined('REST_REQUEST') && REST_REQUEST;
+	}
+	
+	/** whether this request is admin-ajax's, or another that says it is */
+	protected function isAjax(): bool
+	{
+		return function_exists('wp_doing_ajax') && wp_doing_ajax();
+	}
+	
+	/**
+	 * The route the REST server was asked for, as rest_api_loaded() reads it
+	 * into the rest_route query var — untrailed, '/' for the index
+	 */
+	protected function restRoute(): string
+	{
+		$wp = $GLOBALS['wp'] ?? null;
+		$route = is_object($wp) && is_array($wp->query_vars ?? null) ? $wp->query_vars['rest_route'] ?? '' : '';
+		$route = is_string($route) ? rtrim($route, '/') : '';
+		
+		return $route === '' ? '/' : $route;
+	}
+	
+	/** the REST server's registered namespaces, none outside a REST request */
+	protected function namespaces(): array
+	{
+		return function_exists('rest_get_server') ? (array)rest_get_server()->get_namespaces() : [];
+	}
+	
+	protected function signedIn(): bool
+	{
+		return function_exists('is_user_logged_in') && is_user_logged_in();
+	}
+	
+	/**
+	 * An answered REST request's route: `/rest/<namespace>` for the longest
+	 * registered namespace its route falls under (NotFound::namespaceOf()),
+	 * `/rest` for the index or a namespace outside the token shape. Never
+	 * the request's own words: the namespace is the one the site registered
+	 *
+	 * @param list<string> $namespaces
+	 */
+	public static function restRouteName(
+		string $route,
+		array $namespaces,
+	): string
+	{
+		$token = self::namespaceToken(NotFound::namespaceOf($route, $namespaces));
+		
+		return $token !== '' ? self::REST_FAMILY . '/' . $token : self::REST_FAMILY;
+	}
+	
+	/**
+	 * An admin-ajax request's route: `/admin/ajax/<action>` when a handler
+	 * answers the action for this caller; __unmatched when none does and
+	 * core refused it with 400 — it matched nothing this site serves, the
+	 * probe signal a 404 page is; `/admin/ajax` for everything else (an
+	 * action outside the token shape, a plugin that answered on admin_init)
+	 */
+	public static function ajaxRouteName(
+		string $action,
+		bool $handled,
+		int|false $status,
+	): string
+	{
+		if($handled === false)
+		{
+			return $status === 400 ? '__unmatched' : self::AJAX_FAMILY;
+		}
+		
+		$token = self::actionToken($action);
+		
+		return $token !== '' ? self::AJAX_FAMILY . '/' . $token : self::AJAX_FAMILY;
+	}
+	
+	/**
+	 * A registered REST namespace in the route-token shape — lowercase
+	 * segments of [a-z0-9._-] joined by `/`, at most 64 — or ''
+	 */
+	public static function namespaceToken(
+		string $name,
+	): string
+	{
+		$name = strtolower($name);
+		
+		return strlen($name) <= 64 && preg_match('~^[a-z0-9._-]+(?:/[a-z0-9._-]+)*$~', $name) === 1 ? $name : '';
+	}
+	
+	/** a registered ajax action in the route-token shape — [a-z0-9_-], 1 to 64, lowercase — or '' */
+	public static function actionToken(
+		string $name,
+	): string
+	{
+		$name = strtolower($name);
+		
+		return preg_match('~^[a-z0-9_-]{1,64}$~', $name) === 1 ? $name : '';
 	}
 	
 	/**
@@ -697,6 +865,12 @@ class Rollup
 		?float $durationMs = null,
 	): void
 	{
+		// a REST namespace or an ajax action past the minute's cap counts under its family
+		if(str_starts_with($route, self::REST_FAMILY . '/') || str_starts_with($route, self::AJAX_FAMILY . '/'))
+		{
+			$route = $this->capped($minute, $route);
+		}
+		
 		$fields = ['requests'];
 		
 		if(is_int($status) && $status >= 100 && $status <= 599)
@@ -732,6 +906,35 @@ class Rollup
 		{
 			apcu_inc($this->prefix() . $minute . ':' . $field, 1, $ok, self::COUNTER_TTL);
 		}
+	}
+	
+	/**
+	 * A REST namespace or ajax action route as it may count this minute: a
+	 * name already counted keeps counting; a new one takes one of the
+	 * minute's ROUTE_NAMES_MAX places (the `rn` field, which assemble()
+	 * ignores and the flush deletes with the minute), and past them it
+	 * counts under its family name
+	 */
+	protected function capped(
+		int $minute,
+		string $route,
+	): string
+	{
+		$key = $this->prefix() . $minute . ':';
+		
+		if(apcu_exists($key . 'r:' . $route))
+		{
+			return $route;
+		}
+		
+		$ok = false;
+		
+		if((int)apcu_inc($key . 'rn', 1, $ok, self::COUNTER_TTL) > self::ROUTE_NAMES_MAX)
+		{
+			return str_starts_with($route, self::REST_FAMILY . '/') ? self::REST_FAMILY : self::AJAX_FAMILY;
+		}
+		
+		return $route;
 	}
 	
 	/**

@@ -9,23 +9,22 @@ use WP_Session_Tokens;
 
 use function _get_cron_array;
 use function array_fill;
-use function array_key_exists;
 use function class_exists;
+use function constant;
 use function count;
 use function defined;
 use function function_exists;
 use function get_option;
+use function get_site_option;
 use function get_users;
+use function gmdate;
 use function has_action;
 use function home_url;
 use function implode;
-use function in_array;
 use function is_array;
 use function is_file;
-use function is_int;
 use function is_multisite;
-use function is_numeric;
-use function is_scalar;
+use function is_object;
 use function is_string;
 use function max;
 use function min;
@@ -36,13 +35,15 @@ use function rtrim;
 use function str_contains;
 use function str_ends_with;
 use function str_replace;
+use function str_starts_with;
+use function strlen;
 use function strtolower;
 use function strtotime;
 use function substr;
-use function time;
 use function wp_parse_url;
 
 use const PHP_URL_HOST;
+use const PREG_SET_ORDER;
 
 /**
  * The database half of the integrity scan (docs/plans/wordpress-integrity-scan.md,
@@ -240,9 +241,10 @@ class Database
 		$root = defined('WP_PLUGIN_DIR') ? rtrim(str_replace('\\', '/', (string)WP_PLUGIN_DIR), '/') : '';
 		$active = (array)get_option('active_plugins', []);
 		
+		// network-activated plugins live in sitemeta (update_site_option()), never in the site's options
 		if(function_exists('is_multisite') && is_multisite())
 		{
-			foreach((array)get_option('active_sitewide_plugins', []) as $file => $time)
+			foreach((array)get_site_option('active_sitewide_plugins', []) as $file => $time)
 			{
 				$active[] = $file;
 			}

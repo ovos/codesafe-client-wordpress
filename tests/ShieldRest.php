@@ -274,8 +274,8 @@ class ShieldRest extends Test
 		$GLOBALS['wp']['hooked'] = [];
 		$this->adapter($reports)->judgeRequest($call, Adapter::caller($call[0], [], [], false, true), '203.0.113.9', 'wp-json');
 		
-		return $restHooks === [['rest_pre_dispatch', [$rest, 'judgeAgain'], Adapter::HOOK_PRIORITY], ['shutdown', [$rest, 'settleHeld'], Adapter::HOOK_PRIORITY]]
-			&& $xmlrpcHooks === [['xmlrpc_call', [$xmlrpc, 'judgeAgain'], Adapter::HOOK_PRIORITY], ['shutdown', [$xmlrpc, 'settleHeld'], Adapter::HOOK_PRIORITY]]
+		return $restHooks === [['rest_pre_dispatch', [$rest, 'judgeAgain'], Adapter::HOOK_PRIORITY, 1], ['shutdown', [$rest, 'settleHeld'], Adapter::HOOK_PRIORITY, 1]]
+			&& $xmlrpcHooks === [['xmlrpc_call', [$xmlrpc, 'judgeAgain'], Adapter::HOOK_PRIORITY, 1], ['shutdown', [$xmlrpc, 'settleHeld'], Adapter::HOOK_PRIORITY, 1]]
 			&& $GLOBALS['wp']['hooked'] === [];
 	}
 	
