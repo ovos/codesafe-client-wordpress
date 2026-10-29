@@ -671,7 +671,7 @@ What is sent: the findings ride the integrity-scan report (`POST
 /api/v1/ingest/files`, `scan.mode: entry`, never complete — it saw a queue,
 not the tree, so the console's ledger never reads a missing path as gone from
 it) with the path, size, mtime and a line like *executed 4× · first 25.09.
-03:12 · last 25.09. 03:14 UTC · from 203.0.113.9 · GET*. The console's FILES
+03:12 · last 25.09. 03:14 UTC · from 203.0.113.9 · GET*. The console's INTEGRITY
 ledger, INBOX case, mail and chat digest, removal advice and it-came-back
 logic are the scan's. Beside it, **one security event per foreign file**
 (kind `file_executed`, `extra.source` uploads or unknown, `extra.file`,
@@ -772,9 +772,9 @@ switch, on by default (or `CODESAFE_SCAN`): half a second per request after the 
 went out, one pass per interval (`CODESAFE_SCAN_INTERVAL`, `1` or `7`
 days), the position kept in one option between requests, no WP-Cron, no APCu.
 A completed pass is posted to codesafe's `/api/v1/ingest/files` (the
-SECURITY view's FILES band); an instance without that endpoint answers 404 and
+SECURITY view's INTEGRITY tab); an instance without that endpoint answers 404 and
 the settings page still shows the result, as it does when the project's
-FILES switch is off and codesafe refuses the report.
+INTEGRITY switch is off and codesafe refuses the report.
 
 The tier on a finding is the plugin's proposal. codesafe decides — against
 the project's repository where one is mapped, the attack waves of the same
