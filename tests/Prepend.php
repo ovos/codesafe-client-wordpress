@@ -15,22 +15,29 @@ use ReflectionClass;
 
 use function apcu_enabled;
 use function base64_encode;
+use function basename;
+use function clearstatcache;
 use function count;
 use function dirname;
 use function escapeshellarg;
 use function exec;
+use function fclose;
 use function file_get_contents;
 use function file_put_contents;
 use function filemtime;
 use function function_exists;
+use function getenv;
 use function glob;
 use function implode;
 use function is_dir;
 use function is_file;
 use function is_int;
+use function is_resource;
 use function json_encode;
 use function mkdir;
 use function preg_match;
+use function proc_close;
+use function proc_open;
 use function realpath;
 use function rmdir;
 use function scandir;
@@ -40,9 +47,12 @@ use function str_ends_with;
 use function str_repeat;
 use function str_replace;
 use function str_starts_with;
+use function stream_get_contents;
 use function strlen;
+use function strtoupper;
 use function sys_get_temp_dir;
 use function time;
+use function touch;
 use function uniqid;
 use function unlink;
 use function var_export;
@@ -68,10 +78,13 @@ class Prepend extends Test
 	
 	protected const string PROBE = '/wp-admin/admin-ajax.php?action=x&include=../../etc/passwd';
 	
+	/** a staged core copy as WP_Upgrader::unpack_package() leaves it, below the site root */
+	protected const string STAGED = 'wp-content/upgrade/wordpress-7.1.3-a1b2c3/wordpress/wp-admin/setup-config.php';
+	
 	/** the ruleset's name the consent carries — drawn by writeConsent() when none is given */
 	protected const string RULES_NAME = 'shield-abababababababababababab.json';
 	
-	protected const array ENFORCE = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'entries' => false,
+	protected const array ENFORCE = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'content' => '', 'entries' => false,
 		'rules' => self::RULES_NAME, 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'wp-json'];
 	
 	protected string $dir;
@@ -545,7 +558,8 @@ class Prepend extends Test
 	 */
 	public function legacyStubRunsThisPluginAgainstTheNewStore(): bool
 	{
-		$legacy = $this->dir . DIRECTORY_SEPARATOR . 'old-prepend.php';
+		mkdir($this->dir . DIRECTORY_SEPARATOR . 'ovos-console');
+		$legacy = $this->dir . DIRECTORY_SEPARATOR . 'ovos-console' . DIRECTORY_SEPARATOR . 'prepend.php';
 		$stub = BasePrepend::ensureStub($this->dir, $legacy);
 		$content = (string)file_get_contents($stub);
 		$mtime = filemtime($stub);
@@ -560,6 +574,77 @@ class Prepend extends Test
 			&& filemtime($stub) === $mtime
 			&& BasePrepend::status($this->dir, $legacy, $legacy)['state'] === 'legacy'
 			&& BasePrepend::status($this->dir, $legacy)['state'] === 'other';
+	}
+	
+	/**
+	 * RULE: a new setup gets codesafe-shield.php — named for the product and
+	 * its job — and the two lines the settings page prints name it; no
+	 * prepend.php appears. Falsify: keep the bare prepend.php as the name —
+	 * the directive an operator pastes reads as malware persistence.
+	 */
+	public function aNewSetupWritesTheNamedStub(): bool
+	{
+		$stub = BasePrepend::ensureStub($this->dir);
+		$lines = BasePrepend::lines($this->dir);
+		
+		return basename($stub) === 'codesafe-shield.php' && is_file($stub)
+			&& is_file($this->dir . DIRECTORY_SEPARATOR . 'prepend.php') === false
+			&& str_ends_with($lines['ini'], DIRECTORY_SEPARATOR . 'codesafe-shield.php"')
+			&& str_ends_with($lines['htaccess'], DIRECTORY_SEPARATOR . 'codesafe-shield.php"');
+	}
+	
+	/**
+	 * RULE: a configuration still naming the store's prepend.php is `legacy`
+	 * — live, the file it names reported — and the plugin keeps that file
+	 * current, rewritten when it is out of date and judging against the data
+	 * beside it (`__DIR__`, as the scan expects). Falsify: leave the store's
+	 * own old name out of status() — the site reads `other` and the hello
+	 * says no layer.
+	 */
+	public function aConfigurationNamingTheOldStubKeepsItCurrent(): bool
+	{
+		$old = $this->dir . DIRECTORY_SEPARATOR . 'prepend.php';
+		file_put_contents($old, "<?php\n// ovos codesafe shield prepend v0 — an older plugin's\n");
+		$status = BasePrepend::status($this->dir, $old);
+		$rewritten = BasePrepend::tendOldStub($this->dir, $this->dir, $status);
+		$content = (string)file_get_contents($old);
+		
+		return $status['state'] === 'legacy' && $status['named'] === $old
+			&& BasePrepend::status($this->dir, str_replace('/', '\\', $old))['state'] === 'legacy'
+			&& $rewritten === 'kept'
+			&& str_contains($content, 'shield prepend v' . BasePrepend::STUB_VERSION)
+			&& str_contains($content, 'Prepend::run(__DIR__)');
+	}
+	
+	/**
+	 * RULE: the store's prepend.php is kept current while it is there, whatever
+	 * this request's configuration names — the new stub, nothing, another
+	 * file — and never deleted: another directory's php.ini or .user.ini may
+	 * still name it, and PHP fails every request there once it is gone. A
+	 * file by that name the plugin did not write is left as it is. Falsify:
+	 * tend the old stub only while this request's configuration names it —
+	 * a site that moved the root's line runs wp-admin through a stale stub;
+	 * delete it once the new stub is named — wp-admin fails on a missing
+	 * prepend file; drop the marker check — a host's own file is overwritten.
+	 */
+	public function anOldStubNoLongerNamedIsKeptCurrentNeverDeleted(): bool
+	{
+		$stub = BasePrepend::ensureStub($this->dir);
+		$old = $this->dir . DIRECTORY_SEPARATOR . 'prepend.php';
+		$seen = [];
+		foreach([$stub, '', '/srv/wordfence-waf.php'] as $ini)
+		{
+			file_put_contents($old, "<?php\n// ovos codesafe shield prepend v0 — an older plugin's\n");
+			$seen[] = BasePrepend::tendOldStub($this->dir, $this->dir, BasePrepend::status($this->dir, $ini));
+			$content = is_file($old) ? (string)file_get_contents($old) : '';
+			$seen[] = str_contains($content, 'shield prepend v' . BasePrepend::STUB_VERSION) && str_contains($content, 'Prepend::run(__DIR__)');
+		}
+		file_put_contents($old, "<?php\n// a host's own file\n");
+		$foreign = BasePrepend::tendOldStub($this->dir, $this->dir, BasePrepend::status($this->dir, $stub));
+		
+		return $seen === ['kept', true, 'kept', true, 'kept', true]
+			&& $foreign === '' && file_get_contents($old) === "<?php\n// a host's own file\n"
+			&& is_file($stub);
 	}
 	
 	public function olderStubIsRewritten(): bool
@@ -1059,6 +1144,156 @@ class Prepend extends Test
 			&& BasePrepend::consent($this->dir) === $expected;
 	}
 	
+	// ---- the guard: WordPress's update working directories -------------------
+	
+	/**
+	 * RULE: a script under wp-content/upgrade/ or upgrade-temp-backup/ is
+	 * refused before any rule, measured on its resolved path — a staged core
+	 * copy, a parked plugin, one reached through `..`, the content directory
+	 * spelled in another case — and reported as a shield_block with the
+	 * guard's fixed message and its path below the content directory. A
+	 * plugin's file, upgrade.php beside the directory, a directory merely
+	 * starting with its name, a file outside the site, a missing file and an
+	 * unknown content directory are left to the rules. Falsify: compare the
+	 * top directory as a prefix — upgraded/ is refused; compare with case —
+	 * the content directory spelled in upper case lets the staged copy run.
+	 */
+	public function theGuardRefusesAScriptInTheUpgradeWorkingDirectories(): bool
+	{
+		$root = $this->site();
+		$content = $root . '/wp-content';
+		$consent = ['content' => $content] + self::ENFORCE;
+		$staged = $this->stage($root, self::STAGED);
+		$parked = $this->stage($root, 'wp-content/upgrade-temp-backup/plugins/akismet/akismet.php');
+		$beside = $this->stage($root, 'wp-content/upgrade.php');
+		$prefixed = $this->stage($root, 'wp-content/upgraded/x.php');
+		$guard = static fn(string $script, array $with = []): ?array => BasePrepend::guard(['SCRIPT_FILENAME' => $script], $with + $consent);
+		$refused = $guard($staged);
+		
+		return $refused !== null && $refused['block'] === true
+			&& $refused['report'] === [Verdict::KIND_BLOCK, BasePrepend::GUARD_REFUSED,
+				['guard' => 'upgrade_dir', 'action' => 'upgrade_dir', 'matched' => 'upgrade/wordpress-7.1.3-a1b2c3/wordpress/wp-admin/setup-config.php']]
+			&& ($guard($parked)['report'][2]['matched'] ?? '') === 'upgrade-temp-backup/plugins/akismet/akismet.php'
+			&& ($guard($content . '/plugins/../upgrade/wordpress-7.1.3-a1b2c3/wordpress/wp-admin/setup-config.php')['block'] ?? false) === true
+			&& ($guard($staged, ['content' => strtoupper($content)])['block'] ?? false) === true
+			&& $guard($root . '/wp-content/plugins/some-plugin/file.php') === null
+			&& $guard($beside) === null
+			&& $guard($prefixed) === null
+			&& $guard($this->dir . DIRECTORY_SEPARATOR . 'outside.php') === null
+			&& $guard($content . '/upgrade/gone.php') === null
+			&& $guard($staged, ['content' => '']) === null;
+	}
+	
+	/**
+	 * RULE: the guard meets the consent a rule set to block meets — refused
+	 * with the blocking box ticked, observed (a shield_observe with the
+	 * guard's other fixed message) with it unticked, nothing with detection
+	 * off or the kill constant set. Falsify: refuse without the blocking box
+	 * — a site that only observes turns requests away; or skip the kill
+	 * check — the server's off switch leaves the guard on.
+	 */
+	public function theGuardFollowsTheLayersConsent(): bool
+	{
+		$root = $this->site();
+		$server = ['SCRIPT_FILENAME' => $this->stage($root, self::STAGED)];
+		$consent = ['content' => $root . '/wp-content'] + self::ENFORCE;
+		$observed = BasePrepend::guard($server, ['enforce' => false] + $consent);
+		
+		return $observed !== null && $observed['block'] === false
+			&& $observed['report'][0] === Verdict::KIND_OBSERVE
+			&& $observed['report'][1] === BasePrepend::GUARD_OBSERVED
+			&& BasePrepend::guard($server, ['detect' => false] + $consent) === null
+			&& BasePrepend::guard($server, ['kill' => true] + $consent) === null
+			&& BasePrepend::GUARD_KINDS === ['block' => Verdict::KIND_BLOCK, 'observe' => Verdict::KIND_OBSERVE];
+	}
+	
+	/**
+	 * RULE: the consent carries the content directory the guard measures
+	 * against, and a change of it is written. Falsify: leave `content` out of
+	 * writeConsent() — every guard reads '' and says nothing.
+	 */
+	public function theConsentCarriesTheContentDirectory(): bool
+	{
+		$written = BasePrepend::writeConsent($this->dir, ['content' => '/srv/site/wp-content'] + self::ENFORCE);
+		$read = BasePrepend::consent($this->dir)['content'];
+		$moved = BasePrepend::writeConsent($this->dir, ['content' => '/srv/other/wp-content'] + self::ENFORCE);
+		
+		return $written && $read === '/srv/site/wp-content'
+			&& $moved && BasePrepend::consent($this->dir)['content'] === '/srv/other/wp-content';
+	}
+	
+	/**
+	 * RULE: the plugin hands the layer WP_CONTENT_DIR resolved — `..` and a
+	 * link followed, forward slashes, no trailing one — the spelling the
+	 * guard's realpath of the script is measured against; '' without the
+	 * constant. In a process of its own: the constant would reach every other
+	 * class. Falsify: hand WP_CONTENT_DIR over as written — a content
+	 * directory named through `..` never matches and the guard says nothing.
+	 */
+	public function thePluginHandsTheLayerTheContentDirectoryResolved(): bool
+	{
+		$root = $this->site();
+		$script = $this->dir . DIRECTORY_SEPARATOR . 'content-root.php';
+		$adapter = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Shield' . DIRECTORY_SEPARATOR . 'Adapter.php';
+		file_put_contents($script, "<?php\nrequire " . var_export($adapter, true) . ";\n"
+			. "echo '[', Ovos\\Codesafe\\Shield\\Adapter::contentRoot(), ']';\n"
+			. "define('WP_CONTENT_DIR', " . var_export($root . '/wp-content/plugins/../', true) . ");\n"
+			. "echo '[', Ovos\\Codesafe\\Shield\\Adapter::contentRoot(), ']';\n");
+		$output = [];
+		exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script) . ' 2>&1', $output);
+		
+		return implode('', $output) === '[][' . $root . '/wp-content]';
+	}
+	
+	/**
+	 * RULE: the stub, as PHP's auto_prepend_file runs it, refuses a staged
+	 * script with 403 and X-Shield-Guard before a byte of it runs, and queues
+	 * the shield_block with the refused request's own facts; with the
+	 * blocking box unticked the script runs and the shield_observe is queued
+	 * with the status the request ended with; under the kill constant the
+	 * script runs and nothing is queued; a plugin's file meets no guard.
+	 * Through php-cgi (the CLI never judges). Falsify: drop the guard from
+	 * run() — the staged script prints; drop the refusal — it prints after
+	 * the report; drop the observe's shutdown queue — nothing is reported.
+	 */
+	public function theStubRefusesAStagedScriptAndQueuesTheGuardsReport(): bool
+	{
+		$cgi = $this->cgiBinary();
+		$root = $this->site();
+		$staged = $this->stage($root, self::STAGED, "<?php\necho 'staged ran';\n");
+		$plugin = $this->stage($root, 'wp-content/plugins/some-plugin/run.php', "<?php\necho 'plugin ran';\n");
+		$stub = BasePrepend::ensureStub($this->dir);
+		$uri = '/' . self::STAGED;
+		$consent = ['content' => $root . '/wp-content'] + self::ENFORCE;
+		$run = function(array $with, string $script, string $uri) use ($cgi, $stub, $consent): array
+		{
+			BasePrepend::writeConsent($this->dir, $with + $consent);
+			$output = $this->runCgi($cgi, $stub, $script, $uri);
+			$queued = [];
+			BasePrepend::drain($this->dir, static function(string $kind, string $message, array $extra, array $context) use (&$queued): void
+			{
+				$queued[] = [$kind, $message, $extra, $context];
+			});
+			
+			return [$output, $queued];
+		};
+		[$refused, $blocks] = $run([], $staged, $uri);
+		[$observed, $observes] = $run(['enforce' => false], $staged, $uri);
+		[$killed, $none] = $run(['kill' => true], $staged, $uri);
+		[$plain, $nothing] = $run([], $plugin, '/wp-content/plugins/some-plugin/run.php');
+		
+		return str_contains($refused, 'Status: 403') && str_contains($refused, 'X-Shield-Guard: upgrade_dir')
+			&& str_contains($refused, 'X-Shield-Layer: prepend') && str_contains($refused, 'staged ran') === false
+			&& count($blocks) === 1 && $blocks[0][0] === Verdict::KIND_BLOCK && $blocks[0][1] === BasePrepend::GUARD_REFUSED
+			&& ($blocks[0][2]['guard'] ?? '') === 'upgrade_dir' && ($blocks[0][2]['layer'] ?? '') === 'prepend'
+			&& ($blocks[0][3]['uri'] ?? '') === $uri && ($blocks[0][3]['ip'] ?? '') === '203.0.113.9' && ($blocks[0][3]['status'] ?? 0) === 403
+			&& str_contains($observed, 'staged ran') && str_contains($observed, 'Status: 403') === false
+			&& count($observes) === 1 && $observes[0][0] === Verdict::KIND_OBSERVE && $observes[0][1] === BasePrepend::GUARD_OBSERVED
+			&& ($observes[0][3]['status'] ?? 0) === 200
+			&& str_contains($killed, 'staged ran') && $none === []
+			&& str_contains($plain, 'plugin ran') && $nothing === [];
+	}
+	
 	// ---- helpers --------------------------------------------------------------
 	
 	protected function server(
@@ -1096,6 +1331,72 @@ class Prepend extends Test
 		file_put_contents($this->dir . DIRECTORY_SEPARATOR . 'outside.php', "<?php\n");
 		
 		return str_replace('\\', '/', (string)realpath($root));
+	}
+	
+	/** one file below the site root, made with its directories; its path */
+	protected function stage(
+		string $root,
+		string $relative,
+		string $body = "<?php\n",
+	): string
+	{
+		$path = $root . '/' . $relative;
+		if(is_dir(dirname($path)) === false)
+		{
+			mkdir(dirname($path), 0700, true);
+		}
+		file_put_contents($path, $body);
+		
+		return $path;
+	}
+	
+	/** php-cgi beside this PHP — the SAPI a site's prepend runs in; the test is skipped without one */
+	protected function cgiBinary(): string
+	{
+		$dir = dirname(PHP_BINARY);
+		// Windows ships php-cgi.exe beside php.exe; Debian's packages name it php-cgi8.x beside php8.x
+		foreach([$dir . DIRECTORY_SEPARATOR . 'php-cgi.exe', $dir . DIRECTORY_SEPARATOR . str_replace('php', 'php-cgi', basename(PHP_BINARY)),
+			$dir . DIRECTORY_SEPARATOR . 'php-cgi'] as $candidate)
+		{
+			if(is_file($candidate))
+			{
+				return $candidate;
+			}
+		}
+		
+		throw new SkipException('No php-cgi beside ' . PHP_BINARY . '.');
+	}
+	
+	/**
+	 * One request through php-cgi with the stub as auto_prepend_file and no
+	 * php.ini: what it printed, headers and body
+	 */
+	protected function runCgi(
+		string $cgi,
+		string $stub,
+		string $script,
+		string $uri,
+	): string
+	{
+		$environment = ['GATEWAY_INTERFACE' => 'CGI/1.1', 'SCRIPT_FILENAME' => $script, 'REQUEST_METHOD' => 'GET', 'REQUEST_URI' => $uri,
+			'REMOTE_ADDR' => '203.0.113.9', 'HTTP_USER_AGENT' => 'Mozilla/5.0'];
+		// Windows' own libraries need it in any process
+		if(getenv('SYSTEMROOT') !== false)
+		{
+			$environment['SYSTEMROOT'] = (string)getenv('SYSTEMROOT');
+		}
+		$process = proc_open([$cgi, '-n', '-d', 'cgi.force_redirect=0', '-d', 'auto_prepend_file=' . $stub], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+			$pipes, $this->dir, $environment);
+		if(is_resource($process) === false)
+		{
+			return '';
+		}
+		$output = (string)stream_get_contents($pipes[1]) . (string)stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		proc_close($process);
+		
+		return $output;
 	}
 	
 	/** a temp directory and everything under it */

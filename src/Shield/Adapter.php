@@ -30,7 +30,6 @@ use function constant;
 use function count;
 use function current_user_can;
 use function defined;
-use function dirname;
 use function esc_html__;
 use function file_get_contents;
 use function file_put_contents;
@@ -58,6 +57,7 @@ use function mkdir;
 use function parse_str;
 use function parse_url;
 use function preg_replace;
+use function realpath;
 use function register_shutdown_function;
 use function rest_get_url_prefix;
 use function rtrim;
@@ -763,6 +763,8 @@ final class Adapter
 				'prefix' => self::prefixOf(),
 				// the executed-file watch (Entries) rides the same layer with its own switch
 				'root' => Entries::root(),
+				// the update working directories the layer's guard refuses scripts in lie below it
+				'content' => self::contentRoot(),
 				'entries' => $config->entryWatch() && $connected,
 				// the visitor's address behind a proxy the site trusts (M5)
 				'proxy_header' => $config->trustedProxyHeader(),
@@ -777,14 +779,10 @@ final class Adapter
 			// the stub stays where the operator's configuration names it; it judges
 			// against the data wherever that lives
 			Prepend::ensureStub($dir, $dir === $stubDir ? null : $stubDir . DIRECTORY_SEPARATOR . Prepend::STUB);
-			// a site that ran ovos-console may still point PHP at its stub: that
-			// stub is rewritten to run this plugin, never deleted — PHP fails every
-			// request whose prepend file is gone
-			$legacy = self::legacyStub();
-			if($legacy !== '' && Prepend::status($stubDir, null, $legacy)['state'] === 'legacy' && is_dir(dirname($legacy)))
-			{
-				Prepend::ensureStub($dir, $legacy);
-			}
+			// PHP may still name an older stub — this directory's prepend.php, or
+			// the one ovos-console left: kept running this plugin, never deleted
+			// while named, since PHP fails every request whose prepend file is gone
+			Prepend::tendOldStub($dir, $stubDir, Prepend::status($stubDir, null, self::legacyStub() ?: null));
 			$judges = $connected && $config->shieldDetect() && $config->shieldKill() === false;
 			// the mu-plugin stage (ovos/codesafe docs/plans/shield-auto-deploy.md P7.g):
 			// the judge before the other plugins load, kept while the Shield is on
@@ -824,6 +822,19 @@ final class Adapter
 		return Prepend::status($dir, null, self::legacyStub() ?: null) + ['lines' => Prepend::lines($dir)];
 	}
 	
+	/** WP_CONTENT_DIR resolved, with forward slashes and no trailing one: what the prepend layer's guard measures against; '' when unknown */
+	public static function contentRoot(): string
+	{
+		if(defined('WP_CONTENT_DIR') === false)
+		{
+			return '';
+		}
+		
+		$content = realpath(WP_CONTENT_DIR);
+		
+		return $content === false ? '' : rtrim(str_replace('\\', '/', $content), '/');
+	}
+	
 	/** where ovos-console wrote its prepend stub, wp-content/ovos-console/prepend.php */
 	public static function legacyStub(): string
 	{
@@ -832,7 +843,7 @@ final class Adapter
 			return '';
 		}
 		
-		return rtrim((string)WP_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . self::LEGACY_DIR . DIRECTORY_SEPARATOR . Prepend::STUB;
+		return rtrim((string)WP_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . self::LEGACY_DIR . DIRECTORY_SEPARATOR . Prepend::LEGACY_STUB;
 	}
 	
 	/**

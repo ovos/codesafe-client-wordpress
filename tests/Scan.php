@@ -221,11 +221,13 @@ class Scan extends Test
 	
 	/**
 	 * RULE: the plugin's own store reads as what the plugin writes there — the
-	 * stub beside the data, the legacy directory's stub, a stub naming a
-	 * moved data directory, the data files and the mu-plugin are silent and
-	 * counted verified. One byte appended to the stub or the mu-plugin is
+	 * stub beside the data under both of its names (codesafe-shield.php, and
+	 * the prepend.php a configuration may still name), the legacy
+	 * directory's stub, the stubs naming a moved data directory, the data
+	 * files and the mu-plugin are silent and counted verified. One byte appended to the stub or the mu-plugin is
 	 * URGENT (both run on every request), a data file without its guard is
-	 * HIGH, a stranger in the store stays content_php HIGH. Falsify: judge the
+	 * HIGH, a stranger in the store stays content_php HIGH. Falsify: know the
+	 * stub by one name only (the other reads as a stranger); judge the
 	 * stub by its marker as ensureStub() keeps it (the appended byte passes);
 	 * expect `__DIR__` wherever a stub stands (the moved store's stub reads
 	 * as modified); trust the whole store (the stranger passes).
@@ -239,6 +241,7 @@ class Scan extends Test
 		mkdir($own['store'], 0700, true);
 		mkdir($own['legacy'], 0700, true);
 		Prepend::ensureStub($own['store']);
+		Prepend::ensureStub($own['store'], $own['store'] . '/' . Prepend::STUB_OLD);
 		Prepend::ensureStub($own['store'], $own['legacy'] . '/prepend.php');
 		Prepend::writeConsent($own['store'], $consent);
 		Prepend::writeKnown($own['store'], '7.1.3', '1.0.1', ['wp-admin/admin-ajax.php' => 'core']);
@@ -250,7 +253,8 @@ class Scan extends Test
 		// the data moved by CODESAFE_STORE_DIR: the stub stays and names the new directory
 		$moved = ['store' => $content . '/private/store', 'stub' => $own['stub'], 'legacy' => $own['legacy']];
 		mkdir($moved['store'], 0700, true);
-		Prepend::ensureStub($moved['store'], $own['stub'] . '/prepend.php');
+		Prepend::ensureStub($moved['store'], $own['stub'] . '/' . Prepend::STUB);
+		Prepend::ensureStub($moved['store'], $own['stub'] . '/' . Prepend::STUB_OLD);
 		Prepend::writeConsent($moved['store'], $consent);
 		unlink($own['store'] . '/' . Prepend::CONSENT);
 		unlink($own['store'] . '/' . Prepend::ENTRIES);
@@ -259,23 +263,27 @@ class Scan extends Test
 		
 		$relocated = $this->walk($moved);
 		
-		file_put_contents($own['stub'] . '/prepend.php', "\nsystem(\$_GET['c']);\n", FILE_APPEND);
+		file_put_contents($own['stub'] . '/' . Prepend::STUB, "\nsystem(\$_GET['c']);\n", FILE_APPEND);
+		file_put_contents($own['stub'] . '/' . Prepend::STUB_OLD, "\nsystem(\$_GET['c']);\n", FILE_APPEND);
 		file_put_contents($this->roots['mu'] . '/' . Prepend::MU_PLUGIN, "\n// x\n", FILE_APPEND);
 		$this->write($moved['store'] . '/' . Prepend::CONSENT, (string)file_get_contents($moved['store'] . '/' . Prepend::CONSENT, offset: 15));
 		$this->write($moved['store'] . '/x.php', "<?php system(\$_GET['c']);");
 		
 		$tampered = $this->walk($moved);
 		
-		return $this->verdict($clean, 'ovos-codesafe/prepend.php') === ''
+		return $this->verdict($clean, 'ovos-codesafe/codesafe-shield.php') === ''
+			&& $this->verdict($clean, 'ovos-codesafe/prepend.php') === ''
 			&& $this->verdict($clean, 'ovos-console/prepend.php') === ''
 			&& $this->verdict($clean, 'ovos-codesafe/' . Prepend::CONSENT) === ''
 			&& $this->verdict($clean, 'ovos-codesafe/' . Prepend::ENTRIES) === ''
 			&& $this->verdict($clean, 'ovos-codesafe/index.php') === ''
 			&& $this->verdict($clean, 'mu-plugins/' . Prepend::MU_PLUGIN) === ''
-			&& $clean['areas']['content']['verified'] === 5
+			&& $clean['areas']['content']['verified'] === 6
+			&& $this->verdict($relocated, 'ovos-codesafe/codesafe-shield.php') === ''
 			&& $this->verdict($relocated, 'ovos-codesafe/prepend.php') === ''
 			&& $this->verdict($relocated, 'private/store/' . Prepend::CONSENT) === ''
 			&& $this->verdict($relocated, 'mu-plugins/' . Prepend::MU_PLUGIN) === ''
+			&& $this->verdict($tampered, 'ovos-codesafe/codesafe-shield.php') === 'store_modified urgent'
 			&& $this->verdict($tampered, 'ovos-codesafe/prepend.php') === 'store_modified urgent'
 			&& $this->verdict($tampered, 'mu-plugins/' . Prepend::MU_PLUGIN) === 'store_modified urgent'
 			&& $this->verdict($tampered, 'private/store/' . Prepend::CONSENT) === 'store_modified high'

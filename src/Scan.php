@@ -1150,7 +1150,9 @@ class Scan
 		$store = $this->storePaths()['store'];
 		$content = $size > self::STORE_BYTES ? null : $this->head($path, self::STORE_BYTES);
 		
-		if($name === Prepend::STUB && $content !== null)
+		// the stub by the names it has in this directory: a configuration may still name an earlier one
+		$names = $parent === $this->normalize($this->storePaths()['legacy']) ? [Prepend::LEGACY_STUB] : Prepend::STUB_NAMES;
+		if(in_array($name, $names, true) && $content !== null)
 		{
 			// beside the data the stub runs against __DIR__; elsewhere it names the data's directory
 			$expression = $parent === $this->normalize($store) ? '__DIR__' : var_export($store, true);
@@ -2643,9 +2645,15 @@ class Scan
 	
 	protected function server(): string
 	{
-		$software = isset($_SERVER['SERVER_SOFTWARE'])
-			? strtolower(sanitize_text_field(wp_unslash((string)$_SERVER['SERVER_SOFTWARE'])))
-			: '';
+		return self::serverOf(isset($_SERVER['SERVER_SOFTWARE']) ? sanitize_text_field(wp_unslash((string)$_SERVER['SERVER_SOFTWARE'])) : '');
+	}
+	
+	/** the web server SERVER_SOFTWARE names, in the posture's words: litespeed, apache, nginx, iis, caddy or unknown */
+	public static function serverOf(
+		string $software,
+	): string
+	{
+		$software = strtolower($software);
 		
 		return match(true)
 		{

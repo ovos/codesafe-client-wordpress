@@ -101,6 +101,9 @@ final class Plugin
 		// keeps where WP_AUTO_UPDATE_CORE is false, hooked where WordPress asks
 		$core = new CoreUpdate($this->config);
 		$core->register();
+		// wp-content/upgrade/ and upgrade-temp-backup/ closed to the web while an
+		// update runs (not on nginx, IIS, Caddy); hooked on every site, connected or not
+		(new UpgradeDir())->register();
 		// software inventory for the console's CVE matching (here AND
 		// cve_enabled on the console project) — built here so codesafe's
 		// answers can nudge it, registered below in the shutdown order

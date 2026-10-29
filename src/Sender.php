@@ -1363,7 +1363,8 @@ class Sender
 	 * Tells codesafe which of this plugin's own switches are on (codesafe
 	 * docs/plans/project-features-live.md, SENDER.md §7 "Hello"): POST
 	 * /api/v1/ingest/hello with the key — the client and its version, the
-	 * platform, the switches in codesafe's words. Synchronous through the WP
+	 * platform, the environment (Config::environment(), as every report
+	 * carries it), the switches in codesafe's words. Synchronous through the WP
 	 * HTTP API and best-effort: the response code back, 0 when the sender is
 	 * off or codesafe is out of reach. Hello::maybeSend() calls it.
 	 *
@@ -1378,18 +1379,27 @@ class Sender
 			return 0;
 		}
 		
+		$hello = [
+			'v' => 1,
+			'client' => 'wordpress/' . Plugin::VERSION,
+			'platform' => 'wordpress',
+		];
+		
+		// codesafe keys a site's facts by it: a developer's copy on the production key stays apart
+		$environment = $this->config->environment();
+		
+		if($environment !== '')
+		{
+			$hello['environment'] = $environment;
+		}
+		
 		$response = wp_remote_post($this->config->url() . '/api/v1/ingest/hello', [
 			'timeout' => 5,
 			'headers' => [
 				'Content-Type' => 'application/json',
 				'X-Codesafe-Key' => $this->config->apiKey(),
 			],
-			'body' => (string)json_encode([
-				'v' => 1,
-				'client' => 'wordpress/' . Plugin::VERSION,
-				'platform' => 'wordpress',
-				'features' => $features,
-			]),
+			'body' => (string)json_encode($hello + ['features' => $features]),
 			'sslverify' => $this->verifyTls(),
 		]);
 		

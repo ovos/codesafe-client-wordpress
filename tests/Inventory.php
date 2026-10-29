@@ -640,6 +640,21 @@ class Inventory extends Test
 			&& isset($items['mu-plugin|ovos-codesafe-shield']['source']) === false;
 	}
 	
+	/**
+	 * RULE: the report names the environment the site reports under — the
+	 * setting, else WordPress's own environment type — so codesafe keeps a
+	 * developer's copy on the production key apart from production. Falsify:
+	 * leave it out — every copy's inventory replaces production's.
+	 */
+	public function theReportNamesItsEnvironment(): bool
+	{
+		$production = $this->inventory()->gather();
+		$staging = $this->inventory(['environment' => 'staging'])->gather();
+		
+		return ($production['environment'] ?? null) === 'production'
+			&& ($staging['environment'] ?? null) === 'staging';
+	}
+	
 	/** WordPress's last update check, as it stores plugins (objects) and themes (arrays) */
 	protected function updateData(): void
 	{

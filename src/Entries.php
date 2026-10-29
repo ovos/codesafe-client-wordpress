@@ -489,7 +489,7 @@ class Entries
 			case 'content':
 				if(str_starts_with($path, 'ovos-codesafe/') || str_starts_with($path, 'ovos-console/'))
 				{
-					// the plugin's own store: the stub, under either of its names
+					// the plugin's own store, under either directory name: its stub by any of its names
 					return self::verdict(null, true);
 				}
 				
