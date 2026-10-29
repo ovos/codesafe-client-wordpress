@@ -477,7 +477,7 @@ request: with the prepend layer active the mu-plugin does nothing, and a
 request either early layer passed is not judged again (a rate rule counts it
 once).
 
-**Before WordPress — the optional `auto_prepend_file` layer.** The
+**Shield coverage FULL — the optional `auto_prepend_file` layer.** The settings page and codesafe's PROJECTS list say the Shield's coverage: FULL where this layer runs, BASIC where it does not. The
 `plugins_loaded` hook runs after WordPress has loaded every plugin; a direct
 request to a plugin file (`wp-content/plugins/x/upload.php`, a standalone
 script — the shape a large share of WordPress CVEs take) never reaches it,
