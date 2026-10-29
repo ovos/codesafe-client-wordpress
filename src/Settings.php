@@ -685,7 +685,7 @@ class Settings
 	{
 		$this->checkboxField('entry_watch',
 			__('Executed-file watch', 'ovos-codesafe'),
-			__('With the prepend layer above active, record every PHP file this site runs that WordPress did not ship as an entry point — the dropped webshell, the moment it is used — and judge it on the site\'s next request against what wordpress.org shipped: a file nobody shipped becomes an integrity finding in the console (the FILES ledger, an INBOX case, the mail and chat digest, removal advice) plus one security event carrying the address that ran it. wp-admin\'s own entries come from the core checksum list, never from a pattern; a plugin\'s own endpoint hit directly is judged shipped once and never recorded again. Read-only: nothing is blocked, deleted or changed. The request that is the site (index.php) costs one string comparison; only a stranger writes.', 'ovos-codesafe'));
+			__('With the prepend layer above active, record every PHP file this site runs that WordPress did not ship as an entry point — the dropped webshell, the moment it is used — and judge it on the site\'s next request against what wordpress.org shipped: a file nobody shipped becomes an integrity finding in the console (the INTEGRITY ledger, an INBOX case, the mail and chat digest, removal advice) plus one security event carrying the address that ran it. wp-admin\'s own entries come from the core checksum list, never from a pattern; a plugin\'s own endpoint hit directly is judged shipped once and never recorded again. Read-only: nothing is blocked, deleted or changed. The request that is the site (index.php) costs one string comparison; only a stranger writes.', 'ovos-codesafe'));
 		if($this->entries === null || $this->config->entryWatch() === false)
 		{
 			return;
