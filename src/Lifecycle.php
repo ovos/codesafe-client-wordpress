@@ -16,9 +16,11 @@ use function delete_transient;
 use function file_get_contents;
 use function file_put_contents;
 use function function_exists;
+use function get_option;
 use function get_sites;
 use function in_array;
 use function ini_get;
+use function is_array;
 use function is_dir;
 use function is_file;
 use function is_link;
@@ -32,8 +34,10 @@ use function str_contains;
 use function str_replace;
 use function strtolower;
 use function switch_to_blog;
+use function time;
 use function trim;
 use function unlink;
+use function update_option;
 
 use const DIRECTORY_SEPARATOR;
 use const PHP_SAPI;
@@ -112,22 +116,29 @@ final class Lifecycle
 		. "// then delete this directory. Until then this file does nothing.\n";
 	
 	/**
-	 * register_deactivation_hook: every box of the consent off — unless this is
-	 * one site of a network deactivating its own copy, whose word never drove
-	 * the shared store (Config::ownsSharedStore)
+	 * register_deactivation_hook: the goodbye first, while the sender still
+	 * speaks for a live site, then every box of the consent off — unless this
+	 * is one site of a network deactivating its own copy, whose word never
+	 * drove the shared store (Config::ownsSharedStore)
+	 *
+	 * @param ?Sender $sender the plugin's, unless a test hands its own
+	 * @param string $dir the store directory, unless a test hands its own
 	 */
 	public static function deactivate(
 		mixed $networkWide = false,
+		?Sender $sender = null,
+		string $dir = '',
 	): void
 	{
 		try
 		{
+			self::goodbye($sender ?? Plugin::instance()?->sender);
 			if($networkWide !== true && (new Config())->ownsSharedStore() === false)
 			{
 				return;
 			}
 			self::removeMuPlugin();
-			$dir = Adapter::storeDir();
+			$dir = $dir !== '' ? $dir : Adapter::storeDir();
 			if($dir === '')
 			{
 				return;
@@ -138,6 +149,37 @@ final class Lifecycle
 		{
 			// a deactivation never fails on our account
 		}
+	}
+	
+	/**
+	 * The plugin's last word: a `sensor_goodbye` security event on the
+	 * ordinary queue, posted by this request's shutdown flush with the
+	 * admin's account on it. The hello's record is kept with its next word
+	 * a day away: a hello after the goodbye, in this same request's
+	 * shutdown, would end the case the goodbye opens
+	 */
+	public static function goodbye(
+		?Sender $sender,
+	): void
+	{
+		$sender?->reportRefusal(Sensors::KIND_GOODBYE, 'plugin deactivated', ['action' => 'deactivated']);
+		$told = get_option(Hello::OPTION, []);
+		$told = is_array($told) ? $told : [];
+		update_option(Hello::OPTION, [
+			'sig' => (string)($told['sig'] ?? ''),
+			'at' => (int)($told['at'] ?? 0),
+			'next' => time() + Hello::DAY,
+		], false);
+	}
+	
+	/**
+	 * register_activation_hook: the hello's record forgotten, so a
+	 * reactivated plugin says hello at once — the word that ends the goodbye's
+	 * case — instead of a day later
+	 */
+	public static function activate(): void
+	{
+		delete_option(Hello::OPTION);
 	}
 	
 	/**

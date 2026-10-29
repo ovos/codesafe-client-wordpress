@@ -41,7 +41,10 @@ spl_autoload_register(static function ($class) {
 Ovos\Codesafe\Plugin::boot(__FILE__);
 
 // the prepend layer runs whether or not the plugin does: deactivating switches
-// it off through its consent file (security audit 2026-10-03 M16)
+// it off through its consent file (security audit 2026-10-03 M16), after the
+// goodbye to codesafe; activating forgets the hello's record so the first
+// request says hello at once
+register_activation_hook(__FILE__, [Ovos\Codesafe\Lifecycle::class, 'activate']);
 register_deactivation_hook(__FILE__, [Ovos\Codesafe\Lifecycle::class, 'deactivate']);
 
 if(function_exists('ovos_codesafe') === false)

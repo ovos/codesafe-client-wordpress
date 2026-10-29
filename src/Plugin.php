@@ -87,6 +87,9 @@ final class Plugin
 	protected function register(): void
 	{
 		$this->sender->register();
+		// the sensor's own words: a change of this plugin's settings, told whatever
+		// the other boxes say — hooked on every request, since WP-CLI saves too
+		(new Sensors($this->config, $this->sender))->register();
 		
 		// the Shield (docs: ovos/console wave8-shield-build.md): this site's
 		// exploit rules pulled from the console and matched at plugins_loaded,

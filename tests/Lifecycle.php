@@ -3,9 +3,12 @@ declare(strict_types=1);
 
 namespace Tests;
 
+use Ovos\Codesafe\Config;
 use Ovos\Codesafe\CoreUpdate;
+use Ovos\Codesafe\Hello;
 use Ovos\Codesafe\Inventory;
 use Ovos\Codesafe\Lifecycle as BaseLifecycle;
+use Ovos\Codesafe\Sender;
 use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
@@ -19,6 +22,7 @@ use function escapeshellarg;
 use function exec;
 use function file_get_contents;
 use function file_put_contents;
+use function get_option;
 use function glob;
 use function implode;
 use function in_array;
@@ -279,6 +283,126 @@ class Lifecycle extends Test
 		}
 		
 		return true;
+	}
+	
+	/**
+	 * RULE: a deactivation says goodbye once — a `sensor_goodbye` security
+	 * event, the plugin's last word — BEFORE the consent is rewritten, so the
+	 * sender still speaks for a live site; and it forgets the hello's record,
+	 * so a reactivation says hello at once instead of a day later. Falsify:
+	 * say it after disable() — a layer already off is what the word describes.
+	 */
+	public function aDeactivationSaysGoodbyeBeforeTheConsentGoesOff(): bool
+	{
+		$GLOBALS['wp']['options'][Hello::OPTION] = ['sig' => 'x', 'at' => time() - 100, 'next' => 0];
+		$sender = $this->recorder();
+		BaseLifecycle::deactivate(false, $sender, $this->dir);
+		$consent = Prepend::consent($this->dir);
+		$told = get_option(Hello::OPTION, []);
+		
+		return count($sender->said) === 1
+			&& $sender->said[0]['kind'] === 'sensor_goodbye'
+			&& $sender->said[0]['extra']['action'] === 'deactivated'
+			// the consent still said detect when the goodbye went out
+			&& $sender->said[0]['detect'] === true
+			&& $consent['detect'] === false && $consent['entries'] === false
+			// the hello's record stays, with the next hello a day away: this request says nothing after the goodbye
+			&& ($told['sig'] ?? '') === 'x' && (int)($told['next'] ?? 0) > time() + Hello::DAY - 60;
+	}
+	
+	/**
+	 * RULE: the goodbye is the request's last word — the shutdown's hello
+	 * stays quiet in the same request, since a hello after the goodbye would
+	 * end the sensor case the goodbye opened; the activation hook forgets the
+	 * record, so a reactivation says hello at once. Falsify: forget the
+	 * record in goodbye() — maybeSend() posts a hello a moment later.
+	 */
+	public function theGoodbyeKeepsTheSameRequestsHelloQuietAndTheActivationSpeaks(): bool
+	{
+		$GLOBALS['wp']['options'][Hello::OPTION] = ['sig' => 'stale', 'at' => time() - 3 * Hello::DAY, 'next' => 0];
+		$config = new Config;
+		$GLOBALS['wp']['options'][Config::OPTION] = ['enabled' => true, 'url' => 'https://c.example.test', 'api_key' => 'k'];
+		$hello = new class extends Sender
+		{
+			/** @var list<array> */
+			public array $said = [];
+			
+			public function __construct()
+			{
+				parent::__construct(new Config);
+			}
+			
+			public function isConnected(): bool
+			{
+				return true;
+			}
+			
+			public function hello(
+				array $features,
+			): int
+			{
+				$this->said[] = $features;
+				
+				return 202;
+			}
+		};
+		BaseLifecycle::goodbye($this->recorder());
+		$quiet = (new Hello($config, $hello, false, 'inactive', cli: false))->maybeSend();
+		BaseLifecycle::activate();
+		$spoke = (new Hello($config, $hello, false, 'inactive', cli: false))->maybeSend();
+		
+		return $quiet === false && $spoke === true && count($hello->said) === 1;
+	}
+	
+	/**
+	 * RULE: one site of a network deactivating its own copy says goodbye too
+	 * — its sender stops — while the shared consent, the main site's, stays;
+	 * and with no sender at all a deactivation never throws
+	 */
+	public function aNetworkSiteSaysGoodbyeAndLeavesTheSharedConsent(): bool
+	{
+		$GLOBALS['wp']['multisite'] = true;
+		$GLOBALS['wp']['main_site'] = false;
+		$sender = $this->recorder();
+		BaseLifecycle::deactivate(false, $sender, $this->dir);
+		$kept = Prepend::consent($this->dir);
+		
+		$GLOBALS['wp']['multisite'] = false;
+		$GLOBALS['wp']['main_site'] = true;
+		BaseLifecycle::deactivate(false, null, $this->dir);
+		$off = Prepend::consent($this->dir);
+		
+		return count($sender->said) === 1
+			&& $kept['detect'] === true
+			&& $off['detect'] === false;
+	}
+	
+	/** a Sender that records what it was told, with the consent's detect as it stood at that moment */
+	protected function recorder(): Sender
+	{
+		return new class($this->dir) extends Sender
+		{
+			/** @var list<array> */
+			public array $said = [];
+			
+			public function __construct(
+				protected string $dir,
+			)
+			{
+				parent::__construct(new Config);
+			}
+			
+			public function reportRefusal(
+				string $kind,
+				string $message = '',
+				array $extra = [],
+				array $context = [],
+				?int $priority = null,
+			): void
+			{
+				$this->said[] = ['kind' => $kind, 'extra' => $extra, 'detect' => Prepend::consent($this->dir)['detect'] ?? null];
+			}
+		};
 	}
 	
 	/** the store as a running site leaves it: stub, deny files, consent, ruleset, queue, the watch's lists */

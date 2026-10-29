@@ -140,6 +140,10 @@ class Sender
 		'shield_rate',
 		// the executed-file watch (Entries): a PHP file nobody shipped ran
 		Entries::KIND,
+		// the sensor's own words (Sensors): the goodbye a deactivation says,
+		// and a change of this plugin's settings — which keys, never values
+		Sensors::KIND_GOODBYE,
+		Sensors::KIND_SETTINGS,
 	];
 	
 	/**
@@ -166,6 +170,8 @@ class Sender
 		'shield_observe' => 60,
 		'shield_rate' => 30,
 		'shield_block' => 120,
+		// one per save by hand; a script flipping options in a loop must not flood
+		Sensors::KIND_SETTINGS => 10,
 	];
 	
 	/** the window every budget counts in, in seconds */
@@ -336,6 +342,18 @@ class Sender
 			&& $this->config->apiKey() !== '';
 	}
 	
+	/**
+	 * Pointed at a console with a key, whatever the enabled box says — the
+	 * hello's gate: a switched-off plugin still says which switches are on,
+	 * `errors` among them off, so codesafe reads the switch-off instead of
+	 * a day of silence
+	 */
+	public function isConnected(): bool
+	{
+		return $this->config->url() !== ''
+			&& $this->config->apiKey() !== '';
+	}
+	
 	public function captureException(
 		Throwable $event,
 		array $extra = [],
@@ -456,6 +474,8 @@ class Sender
 		{
 			str_starts_with($kind, 'shield_') => $this->config->shieldDetect(),
 			$kind === Entries::KIND => $this->config->entryWatch(),
+			// the sensor's own words pass whatever the box says: they are about this plugin, not the site
+			str_starts_with($kind, 'sensor_') => true,
 			default => $this->config->securityEvents(),
 		};
 		if($gate === false
@@ -495,6 +515,26 @@ class Sender
 	): void
 	{
 		try
+		{
+			$this->queue[] = $this->securityPayload($kind, $message, $extra, $context, $priority);
+		}
+		catch(Throwable)
+		{
+			// never break the host site
+		}
+	}
+	
+	/**
+	 * One security event's payload, before the flush decorates it with the
+	 * request context
+	 */
+	protected function securityPayload(
+		string $kind,
+		string $message,
+		array $extra,
+		array $context,
+		?int $priority,
+	): array
 		{
 			// an e-mail address in the line travels as written since 1.0.6:
 			// codesafe finds one anywhere in a text, masks it on arrival and
@@ -537,11 +577,50 @@ class Sender
 				$payload['context'] = $context;
 			}
 			
-			$this->queue[] = $payload;
+		return $payload;
+	}
+	
+	/**
+	 * One security event told to a named console now, synchronously, with
+	 * the key given — the word a site pointed away from a console owes that
+	 * console, which the shutdown queue would carry to the new one instead
+	 * (Sensors::settingsChanged). Best effort: the status back, 0 when the
+	 * kind is unknown, the console unnamed or out of reach
+	 */
+	public function tell(
+		string $url,
+		string $key,
+		string $kind,
+		string $message,
+		array $extra = [],
+	): int
+	{
+		$url = rtrim(trim($url), '/');
+		$key = trim($key);
+		if($url === '' || $key === '' || in_array($kind, self::SECURITY_KINDS, true) === false)
+		{
+			return 0;
+		}
+		try
+		{
+			// no request on it: the word is about switches, and the request that saved them carries the form
+			$payload = $this->decorate($this->securityPayload($kind, $message, $extra, self::withoutRequest(), null), $this->buildContext());
+			$response = wp_remote_post($url . '/api/v1/ingest', [
+				'timeout' => 5,
+				'headers' => [
+					'Content-Type' => 'application/json',
+					'X-Codesafe-Key' => $key,
+					'X-Console-Key' => $key,
+				],
+				'body' => $this->encode([$payload]),
+				'sslverify' => $this->verifyTls(),
+			]);
+			
+			return is_wp_error($response) ? 0 : (int)wp_remote_retrieve_response_code($response);
 		}
 		catch(Throwable)
 		{
-			// never break the host site
+			return 0;
 		}
 	}
 	
@@ -717,7 +796,8 @@ class Sender
 	 */
 	public function flush(): void
 	{
-		if($this->flushing || $this->isEnabled() === false)
+		// a console and a key: a switched-off plugin still posts the sensor's own words
+		if($this->flushing || $this->isConnected() === false)
 		{
 			return;
 		}
@@ -727,6 +807,7 @@ class Sender
 		try
 		{
 			$logLevel = $this->config->logLevel();
+			$enabled = $this->isEnabled();
 			$context = null;
 			
 			$errors = [];
@@ -738,6 +819,11 @@ class Sender
 				// filter) must not drop them; only errors are judged by it
 				$kind = (string)($payload['kind'] ?? 'error');
 				if($kind === 'error' && $payload['priority'] > $logLevel)
+				{
+					continue;
+				}
+				// switched off, only the sensor's own words leave: the goodbye of a disabled plugin is still said
+				if($enabled === false && str_starts_with((string)($payload['events'][0]['className'] ?? ''), 'sensor_') === false)
 				{
 					continue;
 				}
@@ -1374,7 +1460,8 @@ class Sender
 		array $features,
 	): int
 	{
-		if($this->isEnabled() === false)
+		// connected, not enabled: a switched-off plugin says so in its words (Hello::features)
+		if($this->isConnected() === false)
 		{
 			return 0;
 		}
@@ -1391,6 +1478,12 @@ class Sender
 		if($environment !== '')
 		{
 			$hello['environment'] = $environment;
+		}
+		// and by the host: two senders on one key — a second server, a copy — are told apart
+		$host = $this->homeHost();
+		if($host !== '')
+		{
+			$hello['host'] = $host;
 		}
 		
 		$response = wp_remote_post($this->config->url() . '/api/v1/ingest/hello', [

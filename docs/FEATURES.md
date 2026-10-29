@@ -534,7 +534,8 @@ of its request is capped — the URL at 2 KB, the user agent, referer and host
 at 512 bytes each — since every refused request rewrites the queue. Behind a proxy or CDN the
 *Trusted proxy* settings make this layer, the adapter and every report name
 the visitor instead of the edge; the header is read only when the connecting
-address is in the trusted ranges. Deactivating the plugin rewrites the consent
+address is in the trusted ranges. Deactivating the plugin says goodbye to
+codesafe (`sensor_goodbye`, see *Security events*), then rewrites the consent
 with every box off, so the layer stops on the next request; on a multisite
 network the store is one for every site, and only the main site — set by a
 super admin — drives it. An observe
@@ -827,6 +828,27 @@ default), the plugin reports:
   An account above the default role, any account an administrator creates,
   and every sign-up while the default role itself can write posts (the
   open-signup-into-administrator trap) are reported.
+- **The plugin's own words** (`sensor_goodbye`, `sensor_settings`) — codesafe
+  relies on this plugin to see the site, so the plugin says when it stops
+  seeing: a deactivation sends `sensor_goodbye` before the Shield's consent is
+  rewritten, with the deactivating admin's account; a saved settings page
+  sends `sensor_settings` naming the keys that changed and the switches that
+  went off or on — **names only, never a value**: not the URL, not the key,
+  not an address. A site pointed at another console tells the console it is
+  leaving first, synchronously, with the key that console knew. Both go out
+  whatever the *Security events* box says (they are about this plugin, not the
+  site), and neither becomes an issue: codesafe opens a **sensor case** on its
+  INBOX for the project and closes it when the plugin says hello again — the
+  goodbye keeps that request's own hello quiet, and the activation hook makes
+  the first request after a reactivation say hello at once; a plugin update
+  deactivates and reactivates silently, with neither word. The hello itself
+  is sent while the plugin is pointed at a console with a key, even with the
+  enabled box unticked or `CODESAFE_ENABLED` false — it then says
+  `errors: false`, so codesafe reads the switch-off instead of a day of
+  silence. It names the site's host (`home_url`), so codesafe tells two
+  senders on one key apart, and it is never sent from the command line
+  (WP-CLI, cron): php-cli reads no `.user.ini`, so its prepend layer would
+  read off and the hello would say the site lost a layer it still has.
 
 They arrive in codesafe as `security` events, grouped apart from errors and
 accepted independently of the project's severity threshold. The refusals
