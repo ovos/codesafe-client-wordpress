@@ -648,21 +648,21 @@ class Settings
 		$status = Shield\Adapter::prependStatus();
 		$line = match($status['state'])
 		{
-			'active' => __('ACTIVE — anonymous requests are judged before WordPress runs, direct hits on plugin files included; a request carrying a login cookie is judged at plugins_loaded as before.', 'ovos-codesafe'),
+			'active' => __('FULL — the Shield judges anonymous requests before WordPress runs, so files WordPress never loads are judged too: direct hits on plugin files, an update\'s staged copy. A request carrying a login cookie is judged at plugins_loaded as before.', 'ovos-codesafe'),
 			'other' => sprintf(
 				/* translators: %s: the file PHP's auto_prepend_file names */
-				__('not active — PHP already prepends %s (a host\'s or another plugin\'s file); this plugin never chains onto it. Leave it, or point the directive at the stub below instead.', 'ovos-codesafe'), $status['ini']),
+				__('BASIC — PHP already prepends %s (a host\'s or another plugin\'s file); this plugin never chains onto it. Leave it, or point the directive at the stub below instead for FULL.', 'ovos-codesafe'), $status['ini']),
 			'legacy' => sprintf(
 				/* translators: %s: the older stub PHP's auto_prepend_file names */
-				__('ACTIVE through the older stub %s, which the plugin keeps running. Paste one of the lines below in place of it when convenient: the new stub\'s name says what it is, where a bare prepend.php reads as malware persistence to people and scanners. The plugin keeps the old file current and never deletes it by itself: remove it once no directory\'s PHP configuration names it any more.', 'ovos-codesafe'), $status['ini']),
+				__('FULL through the older stub %s, which the plugin keeps running. Paste one of the lines below in place of it when convenient: the new stub\'s name says what it is, where a bare prepend.php reads as malware persistence to people and scanners. The plugin keeps the old file current and never deletes it by itself: remove it once no directory\'s PHP configuration names it any more.', 'ovos-codesafe'), $status['ini']),
 			'unavailable' => __('not available — the store directory under wp-content could not be written.', 'ovos-codesafe'),
-			default => __('not active — optional. The Shield judges at plugins_loaded; with the prepend it judges every anonymous request before WordPress exists, direct hits on plugin files included, and a block costs a file read instead of a WordPress bootstrap. Paste ONE of the lines below into your PHP configuration, then reload this page.', 'ovos-codesafe'),
+			default => __('BASIC — the Shield judges the requests WordPress runs, at plugins_loaded; files WordPress never loads, such as direct hits on plugin files, pass unjudged. For FULL, which judges every anonymous request before WordPress exists and refuses one for the cost of a file read, paste ONE of the lines below into your PHP configuration, then reload this page.', 'ovos-codesafe'),
 		};
 		if($this->config->entryWatch())
 		{
 			$line .= ' ' . __('The executed-file watch below rides the same layer.', 'ovos-codesafe');
 		}
-		echo '<tr><th scope="row">' . esc_html__('Before WordPress', 'ovos-codesafe') . '</th><td>'
+		echo '<tr><th scope="row">' . esc_html__('Shield coverage', 'ovos-codesafe') . '</th><td>'
 			. '<p class="description" style="margin: 0;">' . esc_html($line) . '</p>';
 		if($status['state'] !== 'unavailable' && $status['state'] !== 'active')
 		{

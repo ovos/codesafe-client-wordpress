@@ -51,7 +51,7 @@ wp config set CODESAFE_JS_KEY 'the project js_key'
 ## Recommended settings
 
 <p align="center">
-	<img src="docs/settings.png" alt="The plugin's settings screen in WordPress admin: the Connect to codesafe box with its address field and Connect button, then the codesafe URL and API key, log level, the switches for 404 reporting, traffic rollups (under an APCu line), security events and auto-update on codesafe's word — all ticked, as they start — the Shield status, the Before WordPress line with its two paste lines, the store, the executed-file watch, the integrity scan and its interval, release label, environment, tags and the trusted proxy, the browser-error options, and the Send test error and Scan now buttons" width="940">
+	<img src="docs/settings.png" alt="The plugin's settings screen in WordPress admin: the Connect to codesafe box with its address field and Connect button, then the codesafe URL and API key, log level, the switches for 404 reporting, traffic rollups (under an APCu line), security events and auto-update on codesafe's word — all ticked, as they start — the Shield status, the Shield coverage line with its two paste lines, the store, the executed-file watch, the integrity scan and its interval, release label, environment, tags and the trusted proxy, the browser-error options, and the Send test error and Scan now buttons" width="940">
 </p>
 
 **Everything starts on; codesafe decides.** Every feature on the page is on by default (only *Enabled*, the master switch, and *Also load in wp-admin* start off), and every one that sends something has a second half on the codesafe project: the 404, SECURITY and ROLLUPS switches, CVE for the inventory, FILES for the integrity scan and the executed-file watch, AUTO-UPDATE, JS errors with the origins allowlist, and the Shield. codesafe takes only what the project has on, so the boxes here say what this site *can* send, and a box you untick (or a constant set to `false`) is the site's own no. Read through them once: each describes a feature of codesafe.
@@ -80,7 +80,7 @@ wp config set CODESAFE_JS_KEY 'the project js_key'
 
 | Setting | When | Why |
 |---|---|---|
-| Before WordPress (`auto_prepend_file`) | when you can add one line to the PHP configuration — the page prints it | the Shield judges every anonymous request before WordPress exists, direct hits on plugin files included, and the *Executed-file watch* (on by default) starts recording the PHP files nobody shipped the moment they run — see [Advanced](#advanced) |
+| Shield coverage FULL (`auto_prepend_file`) | when you can add one line to the PHP configuration — the page prints it | codesafe shows SHIELD FULL instead of SHIELD BASIC: the Shield judges every anonymous request before WordPress exists, direct hits on plugin files included, and the *Executed-file watch* (on by default) starts recording the PHP files nobody shipped the moment they run — see [Advanced](#advanced) |
 | Release label | when you deploy with a version or a commit | every report carries it, and codesafe compares a release against the one before |
 | Environment | on staging and test sites | `staging` shows as a badge beside the project name; blank sends WordPress' own `WP_ENVIRONMENT_TYPE` |
 | Tags | when one instance serves many tenants or regions | one filter per tag in codesafe |
