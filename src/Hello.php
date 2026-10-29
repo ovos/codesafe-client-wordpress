@@ -3,8 +3,12 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use Ovos\Codesafe\Shield\Adapter;
+use Ovos\Codesafe\Shield\Prepend;
+
 use function function_exists;
 use function get_option;
+use function in_array;
 use function is_array;
 use function json_encode;
 use function md5;
@@ -41,11 +45,14 @@ final class Hello
 	/**
 	 * @param ?bool $apcu whether APCu is there to count the rollups in;
 	 * null asks this SAPI (Rollup::hasApcu)
+	 * @param ?string $prepend the prepend layer's state (Prepend::status());
+	 * null asks this site (prependState())
 	 */
 	public function __construct(
 		protected Config $config,
 		protected Sender $sender,
 		protected ?bool $apcu = null,
+		protected ?string $prepend = null,
 	)
 	{
 	}
@@ -60,7 +67,9 @@ final class Hello
 	 * The switches in codesafe's words. The Shield's two count only where the
 	 * adapter really runs: detect without the kill constant, enforce on top of
 	 * detect — enforce alone is inert (Config::shieldEnforce); the rollups
-	 * only where APCu lets them count
+	 * only where APCu lets them count. `shield_prepend` says whether PHP's
+	 * auto_prepend_file runs the Shield before WordPress, whatever its boxes
+	 * say: codesafe reads it beside shield_detect
 	 *
 	 * @return array<string, bool>
 	 */
@@ -81,8 +90,26 @@ final class Hello
 			'shield_enforce' => $detect && $this->config->shieldEnforce(),
 			// the Shield off by the server's constant — codesafe says so instead of a silent site
 			'shield_kill' => $this->config->shieldKill(),
+			// an older stub PHP still names (this plugin's prepend.php, ovos-console's) runs the layer: live as well
+			'shield_prepend' => in_array($this->prepend ?? self::prependState(), ['active', 'legacy'], true),
 			'js' => $this->config->jsEnabled(),
 		];
+	}
+	
+	/**
+	 * The prepend layer's state as the settings page reads it (Prepend::status()),
+	 * off the store's paths as named, creating no directory; `unavailable` where
+	 * the content directory is unknown
+	 */
+	public static function prependState(): string
+	{
+		$paths = Adapter::storePaths();
+		if($paths['stub'] === '')
+		{
+			return 'unavailable';
+		}
+		
+		return Prepend::status($paths['stub'], null, Adapter::legacyStub() ?: null)['state'];
 	}
 	
 	/**
@@ -100,7 +127,8 @@ final class Hello
 		
 		$now ??= time();
 		$features = $this->features();
-		$signature = md5(Plugin::VERSION . '|' . json_encode($features));
+		// the environment rides the hello (Sender::hello()): a changed one is told at once
+		$signature = md5(Plugin::VERSION . '|' . $this->config->environment() . '|' . json_encode($features));
 		$told = get_option(self::OPTION, []);
 		$told = is_array($told) ? $told : [];
 		

@@ -13,6 +13,7 @@ use Throwable;
 
 use function array_filter;
 use function array_keys;
+use function array_map;
 use function array_reverse;
 use function array_slice;
 use function array_values;
@@ -22,6 +23,7 @@ use function class_exists;
 use function count;
 use function define;
 use function defined;
+use function dirname;
 use function explode;
 use function file_get_contents;
 use function file_put_contents;
@@ -147,6 +149,11 @@ catch(Throwable)
  * (Entries) judges the record against what wordpress.org shipped on the
  * site's next request and reports what nobody shipped.
  *
+ * Before any rule, guard() holds one invariant: a script under WordPress's
+ * update working directories (wp-content/upgrade/, upgrade-temp-backup/) is
+ * a staged or parked copy the upgrader never requests over HTTP, so it is
+ * refused under the same consent a rule set to block meets, rule or not.
+ *
  * @author Marcin Gil <mg@ovos.at>
  */
 final class Prepend
@@ -164,8 +171,25 @@ final class Prepend
 	/** the ruleset's name, as the consent may carry it */
 	public const RULES_PATTERN = '~^shield-[0-9a-f]{24}\.json$~';
 	
-	/** the stub the directive points at, beside the store */
-	public const STUB = 'prepend.php';
+	/**
+	 * The stub the directive points at, beside the store: named for the
+	 * product and its job, as a host's other prepend files are — a bare
+	 * prepend.php reads as malware persistence to people and to scanners
+	 */
+	public const STUB = 'codesafe-shield.php';
+	
+	/**
+	 * The stub's earlier name in the same directory, which a site's PHP
+	 * configuration may still name: kept current while the file is there,
+	 * never removed but by the uninstall (status() `legacy`, tendOldStub())
+	 */
+	public const STUB_OLD = 'prepend.php';
+	
+	/** the stub's name in the directory ovos-console left (wp-content/ovos-console/), which a configuration may still name */
+	public const LEGACY_STUB = 'prepend.php';
+	
+	/** every name this plugin's stub has in its directory: the integrity scan and the uninstall know both */
+	public const STUB_NAMES = [self::STUB, self::STUB_OLD];
 	
 	/**
 	 * What every file this layer and the plugin write begins with (1.0.3,
@@ -267,6 +291,27 @@ final class Prepend
 	 */
 	public const ADMIN_WITHOUT_PLUGINS = ['load-scripts.php', 'load-styles.php', 'install.php', 'upgrade.php', 'setup-config.php'];
 	
+	/**
+	 * WordPress's update working directories below the content directory:
+	 * the upgrader unpacks a package into the first and parks the copy it
+	 * replaces in the second, and reads both through the filesystem, never
+	 * over HTTP. A script run from either is a staged or parked copy (guard())
+	 */
+	public const UPGRADE_DIRS = ['upgrade', 'upgrade-temp-backup'];
+	
+	/** the guard's name: its report's `guard` and `action`, and its refusal's X-Shield-Guard */
+	public const GUARD_UPGRADE = 'upgrade_dir';
+	
+	/** the guard's two report messages, fixed: codesafe tells the guard's rows by them */
+	public const GUARD_REFUSED = 'shield guard refused a script in the upgrade working directory';
+	
+	public const GUARD_OBSERVED = 'shield guard observed a script in the upgrade working directory';
+	
+	/** the kernel's two report kinds (Verdict::KIND_BLOCK, Verdict::KIND_OBSERVE) restated: the guard runs without the kernel */
+	public const GUARD_KINDS = ['block' => 'shield_block', 'observe' => 'shield_observe'];
+	
+	public const HEADER_GUARD = 'X-Shield-Guard';
+	
 	/** a refused request's uri as the queue and the seen list hold it, at most, in bytes (contextOf()) */
 	public const CONTEXT_URI_MAX = 2048;
 	
@@ -320,6 +365,19 @@ final class Prepend
 			// the executed-file watch first: it records, whatever the Shield's
 			// boxes say, and a signed-in request is recorded like any other
 			self::entry($dir, $_SERVER, $consent);
+			// WordPress's update working directories, before any rule: nothing honest runs a script there
+			$guard = self::guard($_SERVER, $consent);
+			if($guard !== null)
+			{
+				if($guard['block'])
+				{
+					self::queue($dir, $guard['report'], self::contextOf($_SERVER, 403, $ip));
+					self::refuse(0, 403, 0, self::GUARD_UPGRADE);
+				}
+				// observed: queued with the status the request ends with, and the rules still judge it
+				$report = $guard['report'];
+				register_shutdown_function(static fn() => self::queueAtEnd($dir, $report, $ip));
+			}
 			$ran = false;
 			// the mu-plugin stage runs inside WordPress, which defined ABSPATH; the prepend layer runs before it
 			$judged = self::judge($dir, $_SERVER, $_POST, $_COOKIE, null, $consent, $ran, $_GET, $_FILES, defined('ABSPATH') ? true : null, $_REQUEST);
@@ -457,9 +515,11 @@ final class Prepend
 	 * ABSPATH), `entries` whether that watch is on, `rules` the ruleset's
 	 * name in the store (RULES_PATTERN, '' for none), `proxy_header` and
 	 * `proxies` the trusted proxy the site named (clientIp()), `rest_prefix`
-	 * the site's REST prefix (restPrefixOf(), WordPress's default when none)
+	 * the site's REST prefix (restPrefixOf(), WordPress's default when none),
+	 * `content` the content directory the guard measures against (realpath
+	 * of WP_CONTENT_DIR, '' when unknown: the guard then says nothing)
 	 *
-	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string}
+	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string}
 	 */
 	public static function consent(
 		string $dir,
@@ -481,6 +541,7 @@ final class Prepend
 			'kill' => ($decoded['kill'] ?? false) === true,
 			'prefix' => is_string($decoded['prefix'] ?? null) ? $decoded['prefix'] : '',
 			'root' => is_string($decoded['root'] ?? null) ? $decoded['root'] : '',
+			'content' => is_string($decoded['content'] ?? null) ? $decoded['content'] : '',
 			'entries' => ($decoded['entries'] ?? false) === true,
 			'rules' => $rules,
 			'proxy_header' => $header,
@@ -496,7 +557,7 @@ final class Prepend
 	 * new one. The REST prefix is kept unless given: the writer before
 	 * plugins_loaded cannot know it (writeRestPrefix())
 	 *
-	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string} $consent
+	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string} $consent
 	 * @return bool whether the file was (re)written
 	 */
 	public static function writeConsent(
@@ -517,6 +578,7 @@ final class Prepend
 			'kill' => $consent['kill'] === true,
 			'prefix' => (string)$consent['prefix'],
 			'root' => (string)($consent['root'] ?? ''),
+			'content' => (string)($consent['content'] ?? ''),
 			'entries' => ($consent['entries'] ?? false) === true,
 			'rules' => $rules,
 			'proxy_header' => (string)($consent['proxy_header'] ?? ''),
@@ -888,6 +950,83 @@ final class Prepend
 	}
 	
 	/**
+	 * The guard before every rule: a script run from one of WordPress's
+	 * update working directories (UPGRADE_DIRS) is refused while the
+	 * blocking box is ticked and observed while it is not, as a rule set to
+	 * block is; nothing with detection off or the kill constant set. Null
+	 * when it has nothing to say, else whether it refuses and the report
+	 * it queues. Needs neither the kernel nor a ruleset
+	 *
+	 * @param array<string, mixed> $server
+	 * @param array{detect?: bool, enforce?: bool, kill?: bool, content?: string} $consent
+	 * @return ?array{block: bool, report: array{0: string, 1: string, 2: array<string, string>}}
+	 */
+	public static function guard(
+		array $server,
+		array $consent,
+	): ?array
+	{
+		if(($consent['kill'] ?? false) === true || ($consent['detect'] ?? false) !== true)
+		{
+			return null;
+		}
+		$staged = self::staged($server, $consent['content'] ?? '');
+		if($staged === null)
+		{
+			return null;
+		}
+		$block = ($consent['enforce'] ?? false) === true;
+		
+		return [
+			'block' => $block,
+			'report' => [
+				self::GUARD_KINDS[$block ? 'block' : 'observe'],
+				$block ? self::GUARD_REFUSED : self::GUARD_OBSERVED,
+				[
+					'guard' => self::GUARD_UPGRADE,
+					// the event's sub-kind: codesafe files the guard's reports apart from every rule's
+					'action' => self::GUARD_UPGRADE,
+					'matched' => self::capped($staged, self::CONTEXT_FIELD_MAX),
+				],
+			],
+		];
+	}
+	
+	/**
+	 * The path below the content directory of a script this request runs
+	 * from one of WordPress's update working directories (UPGRADE_DIRS);
+	 * null for any other script, or while the content directory is unknown.
+	 * Measured on the resolved path and without case: a case-blind
+	 * filesystem serves the directory under any spelling
+	 *
+	 * @param array<string, mixed> $server
+	 * @param string $content the content directory, resolved (the consent's `content`)
+	 */
+	public static function staged(
+		array $server,
+		string $content,
+	): ?string
+	{
+		$script = $server['SCRIPT_FILENAME'] ?? '';
+		$file = $content !== '' && is_string($script) && $script !== '' ? realpath($script) : false;
+		if($file === false)
+		{
+			return null;
+		}
+		$file = str_replace('\\', '/', $file);
+		$content = rtrim(str_replace('\\', '/', $content), '/') . '/';
+		if(str_starts_with(strtolower($file), strtolower($content)) === false)
+		{
+			return null;
+		}
+		$relative = substr($file, strlen($content));
+		// the directory itself, never a file beside it such as upgrade.php
+		$top = explode('/', $relative, 2);
+		
+		return count($top) === 2 && in_array(strtolower($top[0]), self::UPGRADE_DIRS, true) ? $relative : null;
+	}
+	
+	/**
 	 * The known set the plugin exported — wp-admin's entries off the core
 	 * checksum list (`core`) and the paths the judge found shipped
 	 * (`learnt`) — or null when it never did: the watch then has nothing to
@@ -1069,7 +1208,8 @@ final class Prepend
 		$path = $at ?? $dir . DIRECTORY_SEPARATOR . self::STUB;
 		$source = self::source();
 		$marker = sprintf('%s v%d', self::STUB_MARKER, self::STUB_VERSION);
-		$store = $at === null ? '__DIR__' : var_export($dir, true);
+		// beside the data the stub runs against __DIR__, elsewhere against the data's path: the scan holds it to the same rule
+		$store = $at === null || self::spelled(dirname($at)) === self::spelled($dir) ? '__DIR__' : var_export($dir, true);
 		if(is_file($path))
 		{
 			$existing = (string)file_get_contents($path);
@@ -1278,6 +1418,30 @@ final class Prepend
 	}
 	
 	/**
+	 * Shutdown's half for a report no stash carries (the guard's observe):
+	 * queued with this request's facts and the status it ended with. Never
+	 * throws
+	 *
+	 * @param array{0: string, 1: string, 2: array} $report
+	 */
+	protected static function queueAtEnd(
+		string $dir,
+		array $report,
+		string $ip,
+	): void
+	{
+		try
+		{
+			$code = http_response_code();
+			self::queue($dir, $report, self::contextOf($_SERVER, is_int($code) ? $code : null, $ip));
+		}
+		catch(Throwable)
+		{
+			// the report is lost, never the request
+		}
+	}
+	
+	/**
 	 * The refused request's own facts for its row — the plugin reports a
 	 * queued verdict from a LATER request, whose URI, address and user agent
 	 * are somebody else's; the console's offender score follows the ip. The
@@ -1371,10 +1535,12 @@ final class Prepend
 	 * What the settings page says about this layer, off PHP's own ini value:
 	 * `active` when the directive names the stub, `other` when it names
 	 * something else (a host's or another plugin's prepend — this one never
-	 * chains), `legacy` when it names the stub ovos-console left ($legacy,
-	 * rewritten to run this plugin), `inactive` when there is none
+	 * chains), `legacy` when it names an older stub that runs this plugin all
+	 * the same — this directory's STUB_OLD, or the one ovos-console left
+	 * ($legacy) — `inactive` when there is none. `named` is the stub the
+	 * directive names, '' for none of this plugin's
 	 *
-	 * @return array{state: string, ini: string, stub: string}
+	 * @return array{state: string, ini: string, stub: string, named: string}
 	 */
 	public static function status(
 		string $dir,
@@ -1385,25 +1551,82 @@ final class Prepend
 		$ini ??= (string)ini_get('auto_prepend_file');
 		$ini = trim($ini);
 		$stub = $dir . DIRECTORY_SEPARATOR . self::STUB;
-		$same = static fn(string $path): string => strtolower(rtrim(str_replace('\\', '/', $path), '/'));
+		$named = '';
 		if($ini === '' || strtolower($ini) === 'none')
 		{
 			$state = 'inactive';
 		}
-		elseif($same($ini) === $same($stub))
+		elseif(self::spelled($ini) === self::spelled($stub))
 		{
 			$state = 'active';
-		}
-		elseif($legacy !== null && $same($ini) === $same($legacy))
-		{
-			$state = 'legacy';
+			$named = $stub;
 		}
 		else
 		{
 			$state = 'other';
+			foreach([$dir . DIRECTORY_SEPARATOR . self::STUB_OLD, $legacy] as $old)
+			{
+				if($old !== null && self::spelled($ini) === self::spelled($old))
+				{
+					$state = 'legacy';
+					$named = $old;
+					
+					break;
+				}
+			}
 		}
 		
-		return ['state' => $state, 'ini' => $ini, 'stub' => $stub];
+		return ['state' => $state, 'ini' => $ini, 'stub' => $stub, 'named' => $named];
+	}
+	
+	/**
+	 * The older stubs tended, the plugin's half after ensureStub(): the one
+	 * PHP's configuration names (status() `legacy`) is kept current, and so
+	 * is this directory's STUB_OLD whenever it is there and carries the
+	 * stub's marker, named by this request's configuration or not — another
+	 * directory's php.ini or .user.ini may still name it. Neither is ever
+	 * removed here: PHP fails every request whose prepend file is gone, and
+	 * only the uninstall, which knows which one is named, takes it away.
+	 * `kept` when one was tended, '' when there was none
+	 *
+	 * @param array{state: string, named: string} $status status() as this request reads it
+	 */
+	public static function tendOldStub(
+		string $dir,
+		string $stubDir,
+		array $status,
+	): string
+	{
+		$tended = [];
+		if($status['state'] === 'legacy' && $status['named'] !== '')
+		{
+			$tended[] = $status['named'];
+		}
+		$old = $stubDir . DIRECTORY_SEPARATOR . self::STUB_OLD;
+		// a file by that name the plugin did not write is left as it is
+		if(is_file($old) && str_contains((string)@file_get_contents($old), self::STUB_MARKER)
+			&& in_array(self::spelled($old), array_map(self::spelled(...), $tended), true) === false)
+		{
+			$tended[] = $old;
+		}
+		$kept = '';
+		foreach($tended as $path)
+		{
+			if(is_dir(dirname($path)) && self::ensureStub($dir, $path) !== '')
+			{
+				$kept = 'kept';
+			}
+		}
+		
+		return $kept;
+	}
+	
+	/** a path as two spellings of it compare: forward slashes, no trailing one, lower case */
+	protected static function spelled(
+		string $path,
+	): string
+	{
+		return strtolower(rtrim(str_replace('\\', '/', trim($path)), '/'));
 	}
 	
 	/** the two lines an operator pastes — the ini form and the .htaccess form — for the settings page */
@@ -1651,21 +1874,22 @@ final class Prepend
 	}
 	
 	/**
-	 * This layer's refusal: 403 for a match rule, 429 with Retry-After for a
-	 * rate rule past its limit — the rule and the layer named, a plain body,
-	 * and the request ends here
+	 * This layer's refusal: 403 for a match rule or the guard, 429 with
+	 * Retry-After for a rate rule past its limit — the rule (or the guard)
+	 * and the layer named, a plain body, and the request ends here
 	 */
 	protected static function refuse(
 		int $ruleId,
 		int $status = 403,
 		int $retryAfter = 0,
+		string $guard = '',
 	): void
 	{
 		$limited = $status === 429;
 		if(headers_sent() === false)
 		{
 			http_response_code($limited ? 429 : 403);
-			header(self::HEADER_RULE . ': ' . $ruleId);
+			header($guard === '' ? self::HEADER_RULE . ': ' . $ruleId : self::HEADER_GUARD . ': ' . $guard);
 			header(self::HEADER_LAYER . ': prepend');
 			header('Content-Type: text/plain; charset=UTF-8');
 			if($limited)

@@ -423,7 +423,7 @@ class Inventory
 	
 	/**
 	 * The report the console's InventoryPayload expects — platform-tagged
-	 * ({platform, core, php, updates, items}), items keyed and sorted
+	 * ({platform, core, php, updates, items, environment}), items keyed and sorted
 	 * (type|slug, first occurrence wins) so the content hash is order-stable
 	 */
 	public function gather(): array
@@ -482,7 +482,7 @@ class Inventory
 		// core's own automatic updates: the policy and why, what blocks it, the minor on offer
 		$updates['core'] = $this->core()->report($coreData, $core);
 		
-		return [
+		$report = [
 			'v' => 1,
 			'type' => 'inventory',
 			'platform' => 'wordpress',
@@ -491,6 +491,16 @@ class Inventory
 			'updates' => $updates,
 			'items' => array_values(array_slice($items, 0, self::MAX_ITEMS)),
 		];
+		
+		// codesafe keeps one inventory per environment: a developer's copy on the production key never replaces production's
+		$environment = $this->config->environment();
+		
+		if($environment !== '')
+		{
+			$report['environment'] = $environment;
+		}
+		
+		return $report;
 	}
 	
 	/**

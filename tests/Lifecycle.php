@@ -146,6 +146,45 @@ class Lifecycle extends Test
 			&& is_file($this->dir . DIRECTORY_SEPARATOR . Prepend::QUEUE) === false;
 	}
 	
+	/**
+	 * RULE: while PHP's configuration names either of the plugin's stubs, or
+	 * cannot be known (WP-CLI), the uninstall keeps both, inert — another
+	 * directory's php.ini or .user.ini may name the other — while a file by a
+	 * stub's name the plugin never wrote still goes; with neither named both
+	 * go and the directory with them. Falsify: keep only the stub this
+	 * request's configuration names — a site whose wp-admin still prepends
+	 * prepend.php fails every request there; know the new name alone — the
+	 * old stub goes while named; keep the stubs when none is named — the
+	 * directory never goes; keep any file by a stub's name — a host's own
+	 * file stays behind.
+	 */
+	public function uninstallKeepsEveryStubWhileOneIsNamed(): bool
+	{
+		$old = $this->dir . DIRECTORY_SEPARATOR . Prepend::STUB_OLD;
+		$new = $this->dir . DIRECTORY_SEPARATOR . Prepend::STUB;
+		$seen = [];
+		foreach([[$old, false], [$new, false], [null, true]] as [$ini, $cli])
+		{
+			$this->fill();
+			Prepend::ensureStub($this->dir, $old);
+			$gone = BaseLifecycle::removeStore($this->dir, $ini, $cli);
+			$seen[] = [$gone, $this->names(), file_get_contents($old) === BaseLifecycle::INERT_STUB
+				&& file_get_contents($new) === BaseLifecycle::INERT_STUB];
+		}
+		$this->fill();
+		file_put_contents($old, "<?php\n// a host's own file\n");
+		$foreign = BaseLifecycle::removeStore($this->dir, $new);
+		$foreignLeft = $this->names();
+		$this->fill();
+		Prepend::ensureStub($this->dir, $old);
+		$none = BaseLifecycle::removeStore($this->dir, '');
+		$both = [Prepend::STUB, Prepend::STUB_OLD];
+		
+		return $seen === [[false, $both, true], [false, $both, true], [false, $both, true]]
+			&& $foreign === false && $foreignLeft === [Prepend::STUB]
+			&& $none === true && is_dir($this->dir) === false;
+	}
+	
 	/** every option and named transient through WordPress, the suffixed transients by prefix */
 	public function uninstallForgetsEveryOptionAndTransient(): bool
 	{

@@ -7,14 +7,17 @@ use Ovos\Codesafe\Shield\Adapter;
 use Ovos\Codesafe\Shield\Prepend;
 use Throwable;
 
+use function array_map;
 use function constant;
 use function defined;
 use function delete_option;
 use function delete_site_option;
 use function delete_transient;
+use function file_get_contents;
 use function file_put_contents;
 use function function_exists;
 use function get_sites;
+use function in_array;
 use function ini_get;
 use function is_dir;
 use function is_file;
@@ -25,6 +28,7 @@ use function restore_current_blog;
 use function rmdir;
 use function rtrim;
 use function scandir;
+use function str_contains;
 use function str_replace;
 use function strtolower;
 use function switch_to_blog;
@@ -240,11 +244,13 @@ final class Lifecycle
 	
 	/**
 	 * The store's files gone, and the directory with them — unless $ini (PHP's
-	 * auto_prepend_file) names its stub, or $keepStub says PHP's configuration
-	 * cannot be known: then the stub stays as INERT_STUB, since removing a
-	 * file PHP prepends fails every request. Only files directly in $dir are
-	 * touched, never a subdirectory or what a link points at. Returns whether
-	 * the directory itself is gone
+	 * auto_prepend_file) names one of its stubs (Prepend::STUB_NAMES), or
+	 * $keepStub says PHP's configuration cannot be known: then every stub of
+	 * this plugin's stays as INERT_STUB, the one not named too, since another
+	 * directory's configuration may name it and removing a file PHP prepends
+	 * fails every request. Only files directly in $dir are touched, never a
+	 * subdirectory or what a link points at. Returns whether the directory
+	 * itself is gone
 	 */
 	public static function removeStore(
 		string $dir,
@@ -257,9 +263,22 @@ final class Lifecycle
 		{
 			return false;
 		}
-		$stub = $dir . DIRECTORY_SEPARATOR . Prepend::STUB;
 		$same = static fn(string $path): string => strtolower(rtrim(str_replace('\\', '/', trim($path)), '/'));
-		$named = $keepStub || ($ini !== null && trim($ini) !== '' && $same($ini) === $same($stub));
+		$names = static fn(string $name): bool => $ini !== null && trim($ini) !== '' && $same($ini) === $same($dir . DIRECTORY_SEPARATOR . $name);
+		// one stub named, or the configuration unknown: another directory's php.ini or .user.ini may name the other, so both stay
+		$prepended = $keepStub || in_array(true, array_map($names, Prepend::STUB_NAMES), true);
+		$keeps = static function(string $name, string $path) use ($prepended, $names): bool
+		{
+			if($prepended === false || in_array($name, Prepend::STUB_NAMES, true) === false)
+			{
+				return false;
+			}
+			// unreadable reads as no file of this plugin's
+			$text = (string)@file_get_contents($path);
+			
+			// the one named, or this plugin's: its marker, or the inert text an earlier uninstall left
+			return $names($name) || str_contains($text, Prepend::STUB_MARKER) || $text === self::INERT_STUB;
+		};
 		$kept = false;
 		
 		foreach(scandir($dir) ?: [] as $name)
@@ -269,9 +288,9 @@ final class Lifecycle
 			{
 				continue;
 			}
-			if($named && $name === Prepend::STUB)
+			if($keeps($name, $path))
 			{
-				$kept = @file_put_contents($stub, self::INERT_STUB) !== false;
+				$kept = @file_put_contents($path, self::INERT_STUB) !== false || $kept;
 				
 				continue;
 			}

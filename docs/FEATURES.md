@@ -174,7 +174,9 @@ keeps it on the site, and codesafe answers `403` and stores nothing while
 the project's CVE switch is off.
 
 What one report contains, exactly: `platform` (`wordpress`), the core and
-PHP versions, and up to 300 items of `{type: plugin|theme|mu-plugin, slug,
+PHP versions, the `environment` every report carries (so codesafe keeps a
+developer's copy on the production key apart from production), and up to
+300 items of `{type: plugin|theme|mu-plugin, slug,
 version, name, active}`. A plugin or theme also carries what WordPress's own
 update check knows about it — the same numbers the Plugins and Themes screens
 show, premium and GitHub-hosted plugins included, since every updater files
@@ -480,7 +482,9 @@ once).
 request to a plugin file (`wp-content/plugins/x/upload.php`, a standalone
 script — the shape a large share of WordPress CVEs take) never reaches it,
 and a block there has already paid for the bootstrap and the database
-connection. The plugin writes a stub into `wp-content/ovos-codesafe/prepend.php`
+connection. The plugin writes a stub into `wp-content/ovos-codesafe/codesafe-shield.php`
+— named for the product and its job, as Wordfence's `wordfence-waf.php` is;
+a bare `prepend.php` reads as malware persistence to people and scanners —
 and the settings page prints the one line that points PHP's prepend at it
 (`auto_prepend_file = "…"` for `.user.ini` / `php.ini`, `php_value
 auto_prepend_file "…"` for `.htaccess` under mod_php). With it, every
@@ -544,7 +548,45 @@ The stub lives outside the plugin
 directory and includes the plugin only if it is still there, so removing the
 plugin never leaves PHP with a missing prepend file — a fatal on every
 request — and everything fails open. The plugin never edits server
-configuration; the integrity scan recognises the stub as the plugin's own.
+configuration (the only `.htaccess` files it writes outside its store are
+the denies below); the integrity scan recognises the stub as the plugin's own.
+A configuration that still names an older stub — the plugin's earlier
+`wp-content/ovos-codesafe/prepend.php`, or ovos console's
+`wp-content/ovos-console/prepend.php` — keeps working: the plugin keeps
+that file current, never deletes it, reports the layer live, and the
+settings page asks once for the new line. Its own old stub stays current as
+long as it is there — another directory's `php.ini` or `.user.ini` may still
+name it. The uninstall removes the stubs only when PHP's configuration
+names neither and can be read; while it names either, or cannot be read
+(WP-CLI), both stay, inert — another directory's configuration may name the
+other one.
+
+**WordPress's update working directories.** Before any rule, the layer
+refuses every PHP file run from `wp-content/upgrade/` or
+`wp-content/upgrade-temp-backup/`: WordPress unpacks each update into the
+first and parks the version it replaces in the second, and reads both
+through the filesystem, never over HTTP — a script run there is a staged or
+parked copy somebody found. The refusal is a 403 with `X-Shield-Guard:
+upgrade_dir`, reported as `shield_block` with the message *shield guard
+refused a script in the upgrade working directory*; it needs no rule and
+follows the same switches (with blocking off it is observed and reported as
+`shield_observe`, with detection off or the kill constant it does nothing).
+The plugin also closes both directories without the layer, on WordPress 6.4
+and later (the first with the `pre_unzip_file` hook): each time
+WordPress unpacks a package into `wp-content/upgrade/` — after it emptied
+the directory, before the first file is extracted and before the rollback
+parks the old version (`pre_unzip_file`) — it writes a deny `.htaccess` and
+an `index.php` into each of them, making `upgrade-temp-backup/` when
+WordPress has not yet, through WordPress's own filesystem. WordPress's weekly
+cleanup empties `upgrade-temp-backup/`, the two files with it; the next update
+writes them again before it parks anything. A file by either name the plugin
+did not write is left as it is (WordPress 7.1.4 and later keep an `index.php`
+of their own in `upgrade/`). It skips only a server known to ignore
+`.htaccess` — nginx, IIS, Caddy — and writes on an unnamed one (WP-CLI),
+where the file is inert if ignored; on those three the layer's guard, or a
+rule in the server's own configuration, is what closes the directories.
+OpenLiteSpeed reads a new `.htaccess` only after a restart unless its
+`.htaccess` auto-load is switched on.
 
 ## The executed-file watch
 
@@ -872,9 +914,11 @@ again on its side as a backstop, but the first cut happens here:
   the page's text goes as it is — a customer's account page with it. Untick
   *DOM snapshot* where that is more than you want in codesafe.
 - **The hello** says which of the plugin's own switches are on, on or off,
-  and the plugin's version — once a day and whenever a box changes, so
-  codesafe's project list can dim a feature switched on there but off here.
-  Never a setting's value, a URL or a key.
+  whether PHP's `auto_prepend_file` runs the Shield before WordPress, the
+  plugin's version and the environment every report carries — once a day and
+  whenever one of them changes, so codesafe's project list can dim a feature
+  switched on there but off here. Never another setting's value, a URL or a
+  key.
 
 ## Automatic, signed updates
 
