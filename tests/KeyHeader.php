@@ -51,7 +51,7 @@ class KeyHeader extends Test
 			$sites += $old;
 		}
 		
-		// Sender (four), Rollup, Inventory, ScanRunner and the Shield kernel
-		return $sites === 8;
+		// Sender (five: the batch, the test error, the release, the hello, the word to a console left), Rollup, Inventory, ScanRunner and the Shield kernel
+		return $sites === 9;
 	}
 }

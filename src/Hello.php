@@ -6,6 +6,8 @@ namespace Ovos\Codesafe;
 use Ovos\Codesafe\Shield\Adapter;
 use Ovos\Codesafe\Shield\Prepend;
 
+use function constant;
+use function defined;
 use function function_exists;
 use function get_option;
 use function in_array;
@@ -47,14 +49,27 @@ final class Hello
 	 * null asks this SAPI (Rollup::hasApcu)
 	 * @param ?string $prepend the prepend layer's state (Prepend::status());
 	 * null asks this site (prependState())
+	 * @param ?bool $cli whether this is a command-line run (WP-CLI, cron);
+	 * null asks the SAPI (fromCli())
 	 */
 	public function __construct(
 		protected Config $config,
 		protected Sender $sender,
 		protected ?bool $apcu = null,
 		protected ?string $prepend = null,
+		protected ?bool $cli = null,
 	)
 	{
+	}
+	
+	/**
+	 * Whether this run is the command line's: php-cli reads no .user.ini, so
+	 * its prepend layer reads off and a WP-CLI hello would say the site lost
+	 * the layer it still has
+	 */
+	public function fromCli(): bool
+	{
+		return $this->cli ?? (PHP_SAPI === 'cli' || (defined('WP_CLI') && constant('WP_CLI') === true));
 	}
 	
 	/** after the Sender's handler, so the response is out before the post */
@@ -78,7 +93,8 @@ final class Hello
 		$detect = $this->config->shieldDetect() && $this->config->shieldKill() === false;
 		
 		return [
-			'errors' => true,
+			// the plugin's own switch: off, and the site reports nothing — said rather than left to silence
+			'errors' => $this->config->enabled(),
 			'not_found' => $this->config->report404(),
 			'rollups' => $this->config->rollups() && ($this->apcu ?? Rollup::hasApcu()),
 			'security' => $this->config->securityEvents(),
@@ -120,7 +136,9 @@ final class Hello
 		?int $now = null,
 	): bool
 	{
-		if($this->sender->isEnabled() === false)
+		// never from the command line, whose PHP is not the site's; a console and a
+		// key are enough otherwise: a switched-off plugin still says which switches are on
+		if($this->fromCli() || $this->sender->isConnected() === false)
 		{
 			return false;
 		}

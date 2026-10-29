@@ -59,13 +59,13 @@ class Hello extends Test
 	 */
 	public function theSwitchesAreToldInCodesafesWords(): bool
 	{
-		$features = (new PluginHello($this->config(['report_404' => true, 'inventory' => true, 'shield_detect' => true,
-			'shield_enforce' => true]), $this->sender()))->features();
+		$features = (new PluginHello($this->config(['enabled' => true, 'report_404' => true, 'inventory' => true, 'shield_detect' => true,
+			'shield_enforce' => true]), $this->sender(), cli: false))->features();
 		$off = (new PluginHello($this->config(['rollups' => false, 'security_events' => false, 'auto_update_vulnerable' => false,
-			'scan' => false]), $this->sender()))->features();
+			'scan' => false]), $this->sender(), cli: false))->features();
 		$killed = (new PluginHello($this->config(['shield_detect' => true, 'shield_enforce' => true, 'shield_kill' => true]),
-			$this->sender()))->features();
-		$inert = (new PluginHello($this->config(['shield_detect' => false, 'shield_enforce' => true]), $this->sender()))->features();
+			$this->sender(), cli: false))->features();
+		$inert = (new PluginHello($this->config(['shield_detect' => false, 'shield_enforce' => true]), $this->sender(), cli: false))->features();
 		
 		return $features === [
 				'errors' => true,
@@ -95,8 +95,8 @@ class Hello extends Test
 	 */
 	public function rollupsAreToldOnlyWhereApcuCountsThem(): bool
 	{
-		$without = (new PluginHello($this->config(['rollups' => true]), $this->sender(), false))->features();
-		$with = (new PluginHello($this->config(['rollups' => true]), $this->sender(), true))->features();
+		$without = (new PluginHello($this->config(['rollups' => true]), $this->sender(), false, cli: false))->features();
+		$with = (new PluginHello($this->config(['rollups' => true]), $this->sender(), true, cli: false))->features();
 		
 		return $without['rollups'] === false && $with['rollups'] === true;
 	}
@@ -113,7 +113,7 @@ class Hello extends Test
 		$told = [];
 		foreach(['active', 'legacy', 'inactive', 'other', 'unavailable'] as $state)
 		{
-			$told[$state] = (new PluginHello($this->config(), $this->sender(), null, $state))->features()['shield_prepend'];
+			$told[$state] = (new PluginHello($this->config(), $this->sender(), null, $state, cli: false))->features()['shield_prepend'];
 		}
 		
 		return $told === ['active' => true, 'legacy' => true, 'inactive' => false, 'other' => false, 'unavailable' => false];
@@ -193,10 +193,10 @@ class Hello extends Test
 	public function aChangedPrependOrEnvironmentSendsTheHelloAgain(): bool
 	{
 		$sender = $this->sender();
-		$first = (new PluginHello($this->config(), $sender, null, 'inactive'))->maybeSend(self::NOW);
-		$same = (new PluginHello($this->config(), $sender, null, 'inactive'))->maybeSend(self::NOW + 60);
-		$pasted = (new PluginHello($this->config(), $sender, null, 'active'))->maybeSend(self::NOW + 120);
-		$staging = (new PluginHello($this->config(['environment' => 'staging']), $sender, null, 'active'))->maybeSend(self::NOW + 180);
+		$first = (new PluginHello($this->config(), $sender, null, 'inactive', cli: false))->maybeSend(self::NOW);
+		$same = (new PluginHello($this->config(), $sender, null, 'inactive', cli: false))->maybeSend(self::NOW + 60);
+		$pasted = (new PluginHello($this->config(), $sender, null, 'active', cli: false))->maybeSend(self::NOW + 120);
+		$staging = (new PluginHello($this->config(['environment' => 'staging']), $sender, null, 'active', cli: false))->maybeSend(self::NOW + 180);
 		
 		return $first && $same === false && $pasted && $staging
 			&& count($sender->said) === 3
@@ -207,12 +207,12 @@ class Hello extends Test
 	public function aHelloGoesOutOnceADayAndWhenASwitchChanges(): bool
 	{
 		$sender = $this->sender();
-		$hello = new PluginHello($this->config(['rollups' => true]), $sender);
+		$hello = new PluginHello($this->config(['rollups' => true]), $sender, cli: false);
 		
 		$first = $hello->maybeSend(self::NOW);
 		$same = $hello->maybeSend(self::NOW + 60);
 		$nextDay = $hello->maybeSend(self::NOW + PluginHello::DAY);
-		$changed = (new PluginHello($this->config(['rollups' => false]), $sender))->maybeSend(self::NOW + PluginHello::DAY + 60);
+		$changed = (new PluginHello($this->config(['rollups' => false]), $sender, cli: false))->maybeSend(self::NOW + PluginHello::DAY + 60);
 		
 		return $first && $same === false && $nextDay && $changed
 			&& count($sender->said) === 3
@@ -223,7 +223,7 @@ class Hello extends Test
 	public function aRefusalWaitsAnHourAndA404ADay(): bool
 	{
 		$sender = $this->sender(503);
-		$hello = new PluginHello($this->config(), $sender);
+		$hello = new PluginHello($this->config(), $sender, cli: false);
 		
 		$refused = $hello->maybeSend(self::NOW);
 		$soon = $hello->maybeSend(self::NOW + 60);
@@ -242,7 +242,7 @@ class Hello extends Test
 	{
 		$sender = $this->sender(202, false);
 		
-		return (new PluginHello($this->config(), $sender))->maybeSend(self::NOW) === false
+		return (new PluginHello($this->config(), $sender, cli: false))->maybeSend(self::NOW) === false
 			&& $sender->said === [];
 	}
 	
@@ -288,6 +288,78 @@ class Hello extends Test
 	}
 	
 	/**
+	 * RULE: a plugin switched off but still pointed at a console with a key
+	 * says hello all the same, with `errors` false — codesafe reads the
+	 * switch-off off that word instead of a day of silence. Without a URL or
+	 * a key nothing is said. Falsify: gate the hello on the enabled box — a
+	 * disabled sender goes dark and codesafe can only guess why.
+	 */
+	public function aConnectedPluginSwitchedOffStillSaysHello(): bool
+	{
+		$off = $this->sender(202, false, true);
+		$said = (new PluginHello($this->config(['enabled' => false, 'url' => 'https://c.example.test', 'api_key' => 'k']), $off, cli: false))
+			->maybeSend(self::NOW);
+		$dark = $this->sender(202, false, false);
+		$silent = (new PluginHello($this->config(['enabled' => false]), $dark, cli: false))->maybeSend(self::NOW);
+		$on = (new PluginHello($this->config(['enabled' => true, 'url' => 'https://c.example.test', 'api_key' => 'k']),
+			$this->sender(), cli: false))->features();
+		
+		return $said === true && count($off->said) === 1 && $off->said[0]['errors'] === false
+			&& $silent === false && $dark->said === []
+			&& $on['errors'] === true;
+	}
+	
+	/**
+	 * RULE: the hello is never said from the command line — php-cli reads no
+	 * .user.ini, so its prepend layer reads off, and a WP-CLI run would flip
+	 * `shield_prepend` under the site. The seam says cli, and without a word
+	 * the SAPI does (this test runs on php-cli). Falsify: drop the guard — a
+	 * `wp cron event run` opens a sensor case on a healthy site.
+	 */
+	public function theHelloIsNotSaidFromTheCommandLine(): bool
+	{
+		$config = $this->config(['enabled' => true, 'url' => 'https://c.example.test', 'api_key' => 'k']);
+		$cli = $this->sender();
+		$said = (new PluginHello($config, $cli, cli: true))->maybeSend(self::NOW);
+		$sapi = $this->sender();
+		$bySapi = (new PluginHello($config, $sapi))->maybeSend(self::NOW);
+		$web = $this->sender();
+		$spoke = (new PluginHello($config, $web, cli: false))->maybeSend(self::NOW);
+		
+		return $said === false && $cli->said === []
+			&& $bySapi === false && $sapi->said === []
+			&& $spoke === true && count($web->said) === 1;
+	}
+	
+	/**
+	 * RULE: the hello names the site's host where the plugin knows it
+	 * (home_url), so codesafe can tell two senders on one key apart — a
+	 * staging copy, a second server; a plugin that cannot say leaves the
+	 * word out. Falsify: leave it out always — codesafe keys the flips by
+	 * the project alone and two hosts flap them.
+	 */
+	public function theHelloNamesTheSitesHost(): bool
+	{
+		$GLOBALS['wp']['options'][Config::OPTION] = ['enabled' => true, 'url' => 'https://c.example.test', 'api_key' => 'k'];
+		$named = new class(new Config) extends Sender
+		{
+			protected function homeHost(): string
+			{
+				return 'shop.example.test';
+			}
+		};
+		$named->hello(['errors' => true]);
+		$nameless = new Sender(new Config);
+		$nameless->hello(['errors' => true]);
+		$bodies = array_map(static fn(array $post): array => (array)json_decode((string)($post[1]['body'] ?? ''), true), $GLOBALS['wp']['posted']);
+		
+		return count($bodies) === 2
+			&& ($bodies[0]['host'] ?? '') === 'shop.example.test'
+			&& array_key_exists('host', $bodies[1]) === false
+			&& ($bodies[1]['client'] ?? '') === 'wordpress/' . Plugin::VERSION;
+	}
+	
+	/**
 	 * The plugin's real Config over these settings — the option the settings
 	 * page writes, the defaults filling the rest (entry_watch and js_enabled
 	 * default on)
@@ -303,13 +375,14 @@ class Hello extends Test
 		return new Config;
 	}
 	
-	/** a Sender that keeps what it was told and answers $code */
+	/** a Sender that keeps what it was told and answers $code; connected as $enabled unless said otherwise */
 	protected function sender(
 		int $code = 202,
 		bool $enabled = true,
+		?bool $connected = null,
 	): Sender
 	{
-		return new class($code, $enabled) extends Sender
+		return new class($code, $enabled, $connected ?? $enabled) extends Sender
 		{
 			/** @var list<array<string, bool>> */
 			public array $said = [];
@@ -317,6 +390,7 @@ class Hello extends Test
 			public function __construct(
 				public int $code,
 				protected bool $on,
+				protected bool $reaches,
 			)
 			{
 				parent::__construct(new Config);
@@ -325,6 +399,11 @@ class Hello extends Test
 			public function isEnabled(): bool
 			{
 				return $this->on;
+			}
+			
+			public function isConnected(): bool
+			{
+				return $this->reaches;
 			}
 			
 			public function hello(
