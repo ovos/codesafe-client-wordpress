@@ -84,6 +84,8 @@ function wp_shim_reset(): void
 		'doing_ajax' => false,
 		'logged_in' => false,
 		'rest_namespaces' => [],
+		// wp_is_serving_rest_request(): whether WordPress serves a REST request now (rest_api_loaded() has run)
+		'serving_rest' => false,
 		// a network's sites: the ids get_sites() finds, every args it was asked with,
 		// and get_blog_option() by site id (before main_options)
 		'sites' => [],
@@ -664,9 +666,16 @@ function wp_doing_ajax(): bool
 	return $GLOBALS['wp']['doing_ajax'];
 }
 
+// the login cookie's user, else a determine_current_user filter's (a token plugin's), asked on every call:
+// WordPress caches the answer, and clears a cached user 0 before it authenticates a REST request
 function is_user_logged_in(): bool
 {
-	return $GLOBALS['wp']['logged_in'];
+	return $GLOBALS['wp']['logged_in'] || (int)apply_filters('determine_current_user', false) > 0;
+}
+
+function wp_is_serving_rest_request(): bool
+{
+	return $GLOBALS['wp']['serving_rest'];
 }
 
 /** the site's name and the core version, the two the plugin reads */

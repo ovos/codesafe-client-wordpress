@@ -530,15 +530,28 @@ set theirs. A REST request the login cookie alone signs in, without a valid
 REST nonce, is judged anonymous at `plugins_loaded`, as WordPress runs it.
 A caller WordPress signs in only later — a REST request with a token another
 plugin reads (Bearer, JWT, OAuth), every XML-RPC call, whose credentials
-each method checks — is unknown to the kernel at `plugins_loaded`: a rule
-for anonymous callers or a capability waits instead of refusing, and the
-request is judged again where WordPress has settled the user
-(`rest_pre_dispatch`, `xmlrpc_call`), its verdict reported once then; never
-judged again, it is reported as the observe it was. The early layers judge
-such a request by the rules for anyone and leave the rest to the adapter the
-same way, and the must-use plugin, which runs inside WordPress, treats every
-signed-in request as this layer treats one to a file WordPress runs through,
-whatever the script. A request to the REST API's `/batch/v1` has each
+each method checks — is unknown to the kernel at `plugins_loaded`. Only a
+rule for anyone refuses it there, and that refusal counts no one signed in:
+WordPress has signed no one in yet and never reads the token. Everything
+else waits for the user WordPress settles — the last
+`rest_authentication_errors` callback while WordPress serves the REST
+request, after every authentication method and also when one refuses the
+token, or `xmlrpc_call` after an XML-RPC method's login — and the request is
+judged, reported and counted then, once, as that user: a junk token is the
+anonymous caller WordPress runs, a valid one its user. A request that never
+gets there — a failed XML-RPC login, a body no method reads — is settled on
+WordPress's shutdown as the user it ran as, anonymous unless a method signed
+one in, and too late to refuse: the observe it was. A forged `Authorization`
+header so never reads as a signed-in caller in codesafe, whose promotion and
+alarm weigh signed-in matches and refusals. A plugin that signs its users in
+later than that — inside a route's `permission_callback` or on
+`rest_pre_dispatch` — is read as anonymous: a rule for anonymous callers
+refuses it, as it must refuse before the route's own code runs. The early layers judge such a
+request by the rules for anyone and leave the rest to the adapter the same
+way; the evidence of one they passed is counted once WordPress has the user.
+The must-use plugin, which runs inside WordPress, treats every signed-in
+request as this layer treats one to a file WordPress runs through, whatever
+the script. A request to the REST API's `/batch/v1` has each
 request its body lists judged as a request of its own. Where the user cannot
 be told, a rule that asks only observes. Anywhere else — a direct hit on a
 plugin's PHP file, or WordPress's installer pages (`wp-admin/install.php`,

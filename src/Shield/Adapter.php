@@ -77,6 +77,7 @@ use function wp_date;
 use function wp_die;
 use function wp_is_application_passwords_available;
 use function wp_is_application_passwords_available_for_user;
+use function wp_is_serving_rest_request;
 use function wp_kses_normalize_entities;
 use function wp_kses_post;
 use function wp_remote_get;
@@ -149,9 +150,10 @@ catch(Throwable)
  * user; a login cookie without a valid wp_rest nonce is no one, as
  * WordPress runs it. A caller WordPress tells only later — a REST request
  * with a token another plugin reads, every XML-RPC call — is unknown to the
- * kernel: what depends on who it is waits, and the request is judged again
- * where WordPress has settled the user (judgeRequest()). What cannot be told
- * is held, never refused.
+ * kernel: only a rule for anyone refuses it here; anything else is judged
+ * again, counted and reported where WordPress has settled the user
+ * (judgeRequest()). What cannot be told is held, never refused, and never
+ * counted as signed in on a guess.
  *
  * Fails open on everything: the shield may never be why a page does not
  * load.
@@ -170,6 +172,9 @@ final class Adapter
 {
 	/** plugins_loaded: before any plugin's own hooks at the default priority */
 	public const HOOK_PRIORITY = 0;
+	
+	/** rest_authentication_errors: the last callback, once every authentication method has read its credentials */
+	public const AUTHENTICATED_PRIORITY = PHP_INT_MAX;
 	
 	public const DIR = 'ovos-codesafe';
 	
@@ -193,9 +198,11 @@ final class Adapter
 	
 	/**
 	 * The request held until WordPress has settled its caller: what it was
-	 * judged on, and the verdict that waits (judgeRequest())
+	 * judged on, whether it is an XML-RPC call, and the verdict that waits —
+	 * null for a request an earlier layer judged, which waits for its tally
+	 * alone (judgeRequest(), tallyRequest())
 	 *
-	 * @var ?array{request: array{0: array, 1: array, 2: array, 3: array, 4: array}, ip: string, restPrefix: string, facts: Facts, verdict: Verdict}
+	 * @var ?array{request: array{0: array, 1: array, 2: array, 3: array, 4: array, 5?: array}, ip: string, restPrefix: string, xmlrpc: bool, verdict: ?Verdict}
 	 */
 	protected ?array $held = null;
 	
@@ -292,7 +299,7 @@ final class Adapter
 					$extra['layer'] = 'prepend';
 					$this->sender->reportRefusal($report[0], $report[1], $extra);
 				}
-				$this->tallyRequest($request, $caller, $this->sender->clientIp(), $restPrefix);
+				$this->tallyRequest($request, $caller, $this->sender->clientIp(), $restPrefix, $xmlrpc);
 				
 				return;
 			}
@@ -300,7 +307,7 @@ final class Adapter
 			// here, a rate rule would count it twice — only its evidence is counted
 			if(defined(Prepend::JUDGED))
 			{
-				$this->tallyRequest($request, $caller, $this->sender->clientIp(), $restPrefix);
+				$this->tallyRequest($request, $caller, $this->sender->clientIp(), $restPrefix, $xmlrpc);
 				
 				return;
 			}
@@ -314,13 +321,14 @@ final class Adapter
 	
 	/**
 	 * One request judged — counted, reported, a block refused — for the
-	 * caller WordPress runs it as. When that caller waits on WordPress
-	 * (caller() `known` false) and so does the verdict, it is held instead:
-	 * judged again where WordPress has settled the user (judgeAgain(), on
-	 * rest_pre_dispatch for REST, after its authentication, or on
-	 * xmlrpc_call, after an XML-RPC method's login), else settled as the
-	 * observe it was on WordPress's shutdown (settleHeld()). The verdict,
-	 * null while held
+	 * caller WordPress runs it as. A caller WordPress tells only later
+	 * (caller() `known` false) is refused here only by a rule that holds for
+	 * anyone, and that refusal counts no one signed in: WordPress has signed
+	 * no one in yet and never reads the credentials. Any other verdict on it
+	 * is held: settled where WordPress has settled the user (judgeAgain(), the
+	 * last rest_authentication_errors callback for REST, xmlrpc_call after an
+	 * XML-RPC method's login), else on WordPress's shutdown (settleHeld()).
+	 * The verdict, null while held
 	 *
 	 * @param array{0: array<string, mixed>, 1: array<string, mixed>, 2: array<string, mixed>, 3: array<string, mixed>, 4: array<string, mixed>} $request
 	 *     the server parameters, the query, the form, the cookies and the uploads
@@ -336,17 +344,16 @@ final class Adapter
 	{
 		$facts = self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix, $request[5] ?? null);
 		$verdict = $this->kernel()->judge($facts, $this->consent());
-		if(($caller['known'] ?? true) === false && $verdict->reason === Verdict::REASON_UNANSWERED)
+		if(($caller['known'] ?? true) === false)
 		{
-			$this->held = ['request' => $request, 'ip' => $ip, 'restPrefix' => $restPrefix, 'facts' => $facts, 'verdict' => $verdict];
-			if(function_exists('add_filter') && function_exists('add_action'))
+			if($verdict->isBlock() === false)
 			{
-				$xmlrpc ? add_action('xmlrpc_call', [$this, 'judgeAgain'], self::HOOK_PRIORITY) : add_filter('rest_pre_dispatch', [$this, 'judgeAgain'], self::HOOK_PRIORITY);
-				// WordPress's shutdown action runs before the plugins' shutdown functions, the Sender's flush among them
-				add_action('shutdown', [$this, 'settleHeld'], self::HOOK_PRIORITY);
+				$this->hold($request, $ip, $restPrefix, $xmlrpc, $verdict);
+				
+				return null;
 			}
-			
-			return null;
+			// the kernel tallies an unknown caller's match as signed in: one junk token would then hold every rule it matches
+			$facts = self::facts($request[0], $request[1], $request[2], $request[3], $request[4], self::anonymous(), $ip, $restPrefix, $request[5] ?? null);
 		}
 		$this->settle($facts, $verdict);
 		
@@ -354,10 +361,12 @@ final class Adapter
 	}
 	
 	/**
-	 * The held request judged again, once, for the caller WordPress has
-	 * settled by now — $caller when given, else the current user — and
-	 * counted, reported and refused as any verdict. A filter's value goes
-	 * back unchanged; never throws
+	 * The held request settled, once, for the caller WordPress has settled
+	 * by now — $caller when given, else the current user (resolve()) — and
+	 * refused as any verdict. A REST request stays held while WordPress is
+	 * not serving REST: the filter applied anywhere else meets a user the
+	 * token has not signed in yet. A filter's value goes back unchanged;
+	 * never throws
 	 *
 	 * @param ?array{authed: bool, user: string, can: ?Closure(string): bool, nonce: ?Closure(string, string): bool, known?: bool} $caller
 	 */
@@ -369,17 +378,10 @@ final class Adapter
 		try
 		{
 			$held = $this->held;
-			if($held === null)
+			if($held !== null && ($caller !== null || $held['xmlrpc'] || self::servingRest()))
 			{
-				return $result;
+				$this->resolve($caller, true);
 			}
-			$this->held = null;
-			[$server, $get, $post, $cookies, $files] = $held['request'];
-			$bag = $held['request'][5] ?? null;
-			// WordPress has authenticated the request by now: the current user is the one it runs
-			$caller ??= self::caller($server, $get, $post, function_exists('is_user_logged_in') && is_user_logged_in(), false);
-			$facts = self::facts($server, $get, $post, $cookies, $files, $caller, $held['ip'], $held['restPrefix'], $bag);
-			$this->settle($facts, $this->kernel()->judge($facts, $this->consent()));
 		}
 		catch(Throwable)
 		{
@@ -392,8 +394,9 @@ final class Adapter
 	/**
 	 * The evidence of a request an earlier layer judged — the vpatches it
 	 * reached and the counting's heartbeat (Kernel::tally()) — for the caller
-	 * WordPress runs it as, which the layer before WordPress could not tell.
-	 * Judged nothing, counted nothing else; never throws
+	 * WordPress runs it as, which the layer before WordPress could not tell;
+	 * an unknown caller's is held until WordPress has settled the user
+	 * (resolve()). Judged nothing, counted nothing else; never throws
 	 *
 	 * @param array{0: array<string, mixed>, 1: array<string, mixed>, 2: array<string, mixed>, 3: array<string, mixed>, 4: array<string, mixed>} $request
 	 * @param array{authed: bool, user: string, can: ?Closure(string): bool, nonce: ?Closure(string, string): bool, known?: bool} $caller
@@ -403,10 +406,17 @@ final class Adapter
 		array $caller,
 		string $ip,
 		string $restPrefix,
+		bool $xmlrpc = false,
 	): void
 	{
 		try
 		{
+			if(($caller['known'] ?? true) === false)
+			{
+				$this->hold($request, $ip, $restPrefix, $xmlrpc, null);
+				
+				return;
+			}
 			$this->kernel()->tally(self::facts($request[0], $request[1], $request[2], $request[3], $request[4], $caller, $ip, $restPrefix, $request[5] ?? null),
 				$this->consent());
 		}
@@ -416,22 +426,93 @@ final class Adapter
 		}
 	}
 	
-	/** WordPress's shutdown: a held verdict nobody judged again is the observe it was, counted and reported once */
+	/** WordPress's shutdown: a held request nobody settled is settled for the caller WordPress ran it as, too late to refuse */
 	public function settleHeld(): void
 	{
 		try
 		{
-			$held = $this->held;
-			$this->held = null;
-			if($held !== null)
+			if($this->held !== null)
 			{
-				$this->settle($held['facts'], $held['verdict']);
+				$this->resolve(null, false);
 			}
 		}
 		catch(Throwable)
 		{
 			// never break the host site
 		}
+	}
+	
+	/**
+	 * The request kept for the hook where WordPress settles its caller, and
+	 * for WordPress's shutdown should that hook never fire
+	 *
+	 * @param array{0: array<string, mixed>, 1: array<string, mixed>, 2: array<string, mixed>, 3: array<string, mixed>, 4: array<string, mixed>} $request
+	 */
+	protected function hold(
+		array $request,
+		string $ip,
+		string $restPrefix,
+		bool $xmlrpc,
+		?Verdict $verdict,
+	): void
+	{
+		$this->held = ['request' => $request, 'ip' => $ip, 'restPrefix' => $restPrefix, 'xmlrpc' => $xmlrpc, 'verdict' => $verdict];
+		if(function_exists('add_filter') === false || function_exists('add_action') === false)
+		{
+			return;
+		}
+		if($xmlrpc)
+		{
+			// each XML-RPC method fires xmlrpc_call after its own login
+			add_action('xmlrpc_call', [$this, 'judgeAgain'], self::HOOK_PRIORITY);
+		}
+		else
+		{
+			// WP_REST_Server::check_authentication() runs this filter after serve_request() cleared a cached user 0: by
+			// its last callback every method has read its credentials, and it runs when one refuses them, where dispatch never does
+			add_filter('rest_authentication_errors', [$this, 'judgeAgain'], self::AUTHENTICATED_PRIORITY);
+		}
+		// WordPress's shutdown action runs before the plugins' shutdown functions, the Sender's flush among them
+		add_action('shutdown', [$this, 'settleHeld'], self::HOOK_PRIORITY);
+	}
+	
+	/**
+	 * The held request settled, once, for $caller, else the current user —
+	 * the one WordPress has settled, or never will now. What an earlier layer
+	 * judged is only tallied. A verdict a rule over the request decided, or
+	 * that waited on who the caller is, is judged again: judge() returned it
+	 * before counting any rate rule. A pass, a rate rule's verdict or an
+	 * observed listed address stands, counted, reported and tallied for that
+	 * caller. Without $refuses what would block is the observe it was
+	 */
+	protected function resolve(
+		?array $caller,
+		bool $refuses,
+	): void
+	{
+		$held = $this->held;
+		$this->held = null;
+		if($held === null)
+		{
+			return;
+		}
+		[$server, $get, $post, $cookies, $files] = $held['request'];
+		$caller ??= self::caller($server, $get, $post, function_exists('is_user_logged_in') && is_user_logged_in(), false);
+		$facts = self::facts($server, $get, $post, $cookies, $files, $caller, $held['ip'], $held['restPrefix'], $held['request'][5] ?? null);
+		$consent = $this->consent();
+		$verdict = $held['verdict'];
+		if($verdict === null)
+		{
+			$this->kernel()->tally($facts, $consent);
+			
+			return;
+		}
+		$ruled = $verdict->rule !== null && $verdict->isRate() === false && ($verdict->rule['kind'] ?? '') !== Ruleset::KIND_THREAT;
+		if($ruled || $verdict->reason === Verdict::REASON_UNANSWERED)
+		{
+			$verdict = $this->kernel()->judge($facts, $refuses ? $consent : new Consent($consent->detect, false, $consent->kill));
+		}
+		$this->settle($facts, $verdict);
 	}
 	
 	/** a verdict counted, reported and its evidence tallied as Kernel::handle() would, and a block refused the WordPress way */
@@ -1201,7 +1282,7 @@ final class Adapter
 				{
 					true => $current,
 					// WordPress runs it as user 0, or refuses it: a nonce is checked for user 0 then, not for the current user
-					false => ['authed' => false, 'user' => '', 'can' => static fn(string $capability): bool => false, 'nonce' => null, 'known' => true],
+					false => self::anonymous(),
 					null => ['user' => $current['user']] + $unknown,
 				};
 			}
@@ -1229,6 +1310,28 @@ final class Adapter
 		{
 			return $unknown;
 		}
+	}
+	
+	/**
+	 * The caller WordPress runs a request as when no one is signed in:
+	 * lacking every capability, no nonce answered for them
+	 *
+	 * @return array{authed: bool, user: string, can: Closure(string): bool, nonce: null, known: bool}
+	 */
+	protected static function anonymous(): array
+	{
+		return ['authed' => false, 'user' => '', 'can' => static fn(string $capability): bool => false, 'nonce' => null, 'known' => true];
+	}
+	
+	/** whether WordPress is serving a REST request now: rest_api_loaded() defines REST_REQUEST just before it does */
+	protected static function servingRest(): bool
+	{
+		if(function_exists('wp_is_serving_rest_request'))
+		{
+			return (bool)wp_is_serving_rest_request();
+		}
+		
+		return defined('REST_REQUEST') && constant('REST_REQUEST') === true;
 	}
 	
 	/**
