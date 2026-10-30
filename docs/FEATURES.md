@@ -401,7 +401,21 @@ drawn at random and every other file in the directory begins with a PHP
 `exit`, so a server that ignores `.htaccess` (nginx, IIS) serves nothing from
 it; the settings page warns there, and the `CODESAFE_STORE_DIR` constant moves
 the store to a directory outside the document root (the prepend stub stays
-where PHP's configuration names it). A codesafe that goes
+where PHP's configuration names it). The ruleset kept there is sealed, an
+HMAC under a key derived from the project key over every field of it, the
+kernel's modules among them, and a record not sealed under this site's key is
+ignored as if there were none. That stops a record written by something that
+can write the store but cannot read its directory, by another site sharing the
+APCu pool, by an earlier plugin version or another kernel, or pulled under
+another API key. It does not stop code that runs as the web server's own user:
+that code can read the consent file, which holds the seal key, and the API key
+in the site's options too. The request that finds such a record is not judged
+by it and pulls the ruleset whole; the settings page says so meanwhile. The
+layers before WordPress judge by the consent file the plugin rewrites when a
+setting or the API key changes; where it cannot be rewritten (its owner or
+permissions changed, a read-only filesystem) the settings page's Shield status
+says so, and a layer that cannot read the rules leaves every request to
+`plugins_loaded`. A codesafe that goes
 silent for a day lifts the rules: a stale shield is not a shield. Of what
 codesafe serves a site keeps at most 25 match and rate rules, 100 virtual
 patches and 5 000 threat addresses — the rest is dropped — and no match rule
@@ -490,7 +504,9 @@ and the settings page prints the one line that points PHP's prepend at it
 auto_prepend_file "…"` for `.htaccess` under mod_php). With it, every
 **anonymous** request is judged against the cached ruleset before WordPress
 exists — the same rules, the same two switches, read from a small consent
-file the plugin rewrites whenever a box changes — and a block answers 403
+file the plugin rewrites whenever a box or the API key changes; it carries the
+key the ruleset's seal is checked with, derived from the project key and never
+the key itself, so this layer reads the rules but cannot fetch them — and a block answers 403
 with `X-Shield-Rule` and `X-Shield-Layer: prepend` for the cost of a file
 read. A request carrying a WordPress login cookie to a file WordPress runs
 through — `index.php`, `wp-login.php`, `xmlrpc.php`, `wp-cron.php`,

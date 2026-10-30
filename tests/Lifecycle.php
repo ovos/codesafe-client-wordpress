@@ -9,6 +9,7 @@ use Ovos\Codesafe\Hello;
 use Ovos\Codesafe\Inventory;
 use Ovos\Codesafe\Lifecycle as BaseLifecycle;
 use Ovos\Codesafe\Sender;
+use Ovos\Codesafe\Shield\Kernel;
 use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
@@ -57,6 +58,9 @@ class Lifecycle extends Test
 {
 	protected const string RULES = 'shield-cdcdcdcdcdcdcdcdcdcdcdcd.json';
 	
+	/** the API key the ruleset is sealed under; the consent carries its seal key (Kernel::sealKey()) */
+	protected const string KEY = 'lifecycle-key';
+	
 	protected string $dir;
 	
 	#[Internal]
@@ -71,9 +75,9 @@ class Lifecycle extends Test
 			'project' => 'harness',
 			'rules' => [['id' => 7, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'ua', 'op' => 'contains',
 				'value' => 'zz-bot', 'ci' => true, 'mode' => 'proven', 'expires_at' => null]],
-		], time())->toRecord());
+		], time(), platforms: Prepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		Prepend::writeConsent($this->dir, ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => 'p:', 'root' => '/srv/wp',
-			'entries' => true, 'rules' => self::RULES]);
+			'entries' => true, 'rules' => self::RULES, 'seal' => Kernel::sealKey(self::KEY)]);
 		unset($GLOBALS['wpdb']);
 	}
 	

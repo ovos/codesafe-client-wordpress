@@ -76,11 +76,23 @@ final class Wordpress implements Platform
 	/** WordPress's batch route: each request it lists reaches its own route's handler */
 	public const BATCH_ROUTE = '/batch/v1';
 	
-	/** the batch's sub-requests judged at most — WordPress takes 25 unless a site raises it; past this the batch holds unanswered */
+	/**
+	 * the batch's sub-requests judged at most — WordPress refuses a batch of
+	 * more requests than rest_get_max_batch_size, 25 unless a site raises it,
+	 * so one past this runs nothing honest, and a vpatch its unread requests
+	 * may reach fails closed (overflows()). The count is WordPress's limit,
+	 * not the bytes: a batch within it whose body runs past JSON_CAP holds
+	 * unanswered, since an editor saving 25 large posts sends one
+	 */
 	public const BATCH_MAX = 1000;
 	
-	/** the shortcodes or blocks one decode step reads in a value at most: past them the value is not read in full and the condition holds unanswered */
-	public const OCCURRENCES_MAX = 256;
+	/**
+	 * the shortcodes or blocks one decode step reads in a value at most: no
+	 * post carries that many of one tag, and the read costs under 60 ms
+	 * there; past them the value is not read in full and the condition holds
+	 * as one past Ruleset::DECODED_MAX does (Kernel::patched())
+	 */
+	public const OCCURRENCES_MAX = 16384;
 	
 	/** a shortcode tag as add_shortcode() takes one, in printable ASCII: never `<>&/[]=` or a space */
 	public const SHORTCODE_TAG = '~^[^<>&/\[\]\x00-\x20=\x7f-\xff]{1,100}$~D';
@@ -181,11 +193,39 @@ final class Wordpress implements Platform
 		return self::batchReaches($rule, $facts);
 	}
 	
+	/** whether the batch lists more requests than the kernel reads (batchOverflows()): WordPress refuses one past its own count, so nothing honest fails closed */
+	public function overflows(
+		Facts $facts,
+	): bool
+	{
+		return self::batchOverflows($facts);
+	}
+	
 	public function jsonType(
 		string $contentType,
 	): bool
 	{
 		return self::jsonMediaType($contentType);
+	}
+	
+	/**
+	 * The method WordPress runs a REST request as
+	 * (WP_REST_Server::serve_request()): $_GET['_method'], else the
+	 * X-HTTP-Method-Override header, upper-cased by set_method(). Null off a
+	 * REST route (routes()), for a batch's sub-request — serve_batch_request_v1()
+	 * takes the method the item names — and where neither is sent
+	 */
+	public function appMethod(
+		Facts $facts,
+	): ?string
+	{
+		if($facts->outer() !== null || self::routes($facts) === [])
+		{
+			return null;
+		}
+		$override = $facts->query['_method'] ?? ($facts->headers['x-http-method-override'] ?? null);
+		
+		return is_string($override) && $override !== '' ? strtoupper($override) : null;
 	}
 	
 	/** a REST prefix without its slashes; none is WordPress's default, wp-json */
@@ -277,13 +317,19 @@ final class Wordpress implements Platform
 				$routes[] = $route;
 			}
 		}
-		foreach([...Kernel::pick($facts->query, 'rest_route'), ...Kernel::pick($facts->form, 'rest_route')] as $value)
+		// rest_route is a query var WP::parse_request() reads, from $_POST then $_GET, and parse_request() runs through the front
+		// controller alone (frontController()); PHP fills $_POST on POST alone, and a batch's sub-request has no query vars of its own
+		$bags = $facts->outer() === null && self::frontController($facts) ? (strtoupper($facts->method) === 'POST' ? [$facts->query, $facts->form] : [$facts->query]) : [];
+		foreach($bags as $bag)
 		{
-			// WordPress's empty(): '' and '0' address no route, and an untrailed '0' is the index
-			if($value !== '' && $value !== '0')
+			foreach(Kernel::pick($bag, 'rest_route') as $value)
 			{
-				$route = self::untrailed($value);
-				$routes[] = $route === '0' ? '/' : $route;
+				// WordPress's empty(): '' and '0' address no route, and an untrailed '0' is the index
+				if($value !== '' && $value !== '0')
+				{
+					$route = self::untrailed($value);
+					$routes[] = $route === '0' ? '/' : $route;
+				}
 			}
 		}
 		foreach($routes as $route)
@@ -330,12 +376,28 @@ final class Wordpress implements Platform
 		return $subs;
 	}
 	
-	/** whether a request addresses WordPress's batch route */
+	/**
+	 * Whether a path reaches WordPress's front controller — index.php by
+	 * name, or a pretty path a rewrite hands it — the one place wp() runs
+	 * WP::parse_request() (wp-blog-header.php): wp-admin's scripts,
+	 * wp-login.php, xmlrpc.php and a plugin's own file never do, so
+	 * rest_route and the REST method override mean nothing there
+	 */
+	public static function frontController(
+		Facts $facts,
+	): bool
+	{
+		$script = $facts->scriptPath();
+		
+		return preg_match('~\.php$~i', $script) !== 1 || preg_match('~(^|/)index\.php$~i', $script) === 1;
+	}
+	
+	/** whether a request addresses WordPress's batch route as the method it runs (appMethod()): the route answers POST alone */
 	public static function isBatch(
 		Facts $facts,
 	): bool
 	{
-		return array_filter(self::routes($facts), static fn(string $route): bool => strcasecmp($route, self::BATCH_ROUTE) === 0) !== [];
+		return $facts->appMethod() === 'POST' && array_filter(self::routes($facts), static fn(string $route): bool => strcasecmp($route, self::BATCH_ROUTE) === 0) !== [];
 	}
 	
 	/**
@@ -364,6 +426,7 @@ final class Wordpress implements Platform
 			}
 			$sources[] = $facts->json();
 		}
+		// the form as PHP parsed it: the batch route takes POST alone, so no body the kernel parses itself reaches it
 		foreach([...$sources, $facts->form, $facts->query] as $source)
 		{
 			if(is_array($source) && isset($source['requests']))
@@ -392,7 +455,7 @@ final class Wordpress implements Platform
 	/**
 	 * Whether a request is a batch whose sub-requests the kernel did not
 	 * read in full: the JSON body that comes first past JSON_CAP
-	 * (Facts::jsonUnread()), or a list past BATCH_MAX
+	 * (Facts::jsonUnread()), or a list past BATCH_MAX (batchOverflows())
 	 */
 	public static function batchUnread(
 		Facts $facts,
@@ -403,11 +466,21 @@ final class Wordpress implements Platform
 		{
 			return false;
 		}
-		if(self::jsonFirst($facts) && $facts->jsonUnread())
-		{
-			return true;
-		}
-		$list = self::batchList($facts);
+		
+		return (self::jsonFirst($facts) && $facts->jsonUnread()) || self::batchOverflows($facts);
+	}
+	
+	/**
+	 * Whether a batch lists more requests than BATCH_MAX, which WordPress
+	 * itself refuses to run: a vpatch the unread ones may reach fails closed
+	 * at no honest cost, where a body past JSON_CAP, whose count WordPress
+	 * would accept, only holds unanswered
+	 */
+	public static function batchOverflows(
+		Facts $facts,
+	): bool
+	{
+		$list = self::isBatch($facts) ? self::batchList($facts) : null;
 		
 		return is_array($list) && count($list) > self::BATCH_MAX;
 	}

@@ -57,6 +57,9 @@ class ShieldRest extends Test
 	
 	protected const string NONCE = 'a1b2c3d4e5';
 	
+	/** the project key the store is sealed under: the kernels here hold only its seal key, as the prepend layer does */
+	protected const string KEY = 'rest-key';
+	
 	protected string $dir;
 	
 	protected Kernel $kernel;
@@ -88,12 +91,12 @@ class ShieldRest extends Test
 				['id' => 22, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'block', 'expires_at' => null,
 					'who' => 'lacks:manage_options', 'conditions' => $route],
 			],
-		], time())->toRecord());
+		], time())->toRecord(Kernel::sealKey(self::KEY)));
 		$this->kernel = new Kernel('', '', $store,
 			static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''],
 			static function(): void
 			{
-			});
+			}, sealKey: Kernel::sealKey(self::KEY));
 	}
 	
 	#[Internal]
@@ -462,7 +465,7 @@ class ShieldRest extends Test
 			static function(string $kind, string $message, array $extra) use (&$reports): void
 			{
 				$reports[] = [$kind, $message, $extra];
-			});
+			}, sealKey: Kernel::sealKey(self::KEY));
 		$config = new class extends Config
 		{
 			public function __construct()

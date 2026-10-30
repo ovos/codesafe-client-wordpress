@@ -238,6 +238,32 @@ function __(
 	return $text;
 }
 
+function _n(
+	string $single,
+	string $plural,
+	int $number,
+	string $domain = '',
+): string
+{
+	return $number === 1 ? $single : $plural;
+}
+
+function wp_date(
+	string $format,
+	?int $timestamp = null,
+): string
+{
+	return date($format, $timestamp ?? time());
+}
+
+function human_time_diff(
+	int $from,
+	int $to = 0,
+): string
+{
+	return max(1, intdiv(abs(($to === 0 ? time() : $to) - $from), 60)) . ' mins';
+}
+
 function plugin_basename(
 	string $file,
 ): string

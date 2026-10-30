@@ -11,6 +11,7 @@ use Ovos\Codesafe\Sender;
 use Ovos\Codesafe\Shield\Consent;
 use Ovos\Codesafe\Shield\Facts;
 use Ovos\Codesafe\Shield\Kernel;
+use Ovos\Codesafe\Shield\Platform;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
 use Ovos\Codesafe\Shield\Verdict;
@@ -24,6 +25,7 @@ use function _n;
 use function add_action;
 use function add_filter;
 use function array_filter;
+use function array_map;
 use function ceil;
 use function class_exists;
 use function constant;
@@ -503,9 +505,14 @@ final class Adapter
 	 * The settings page's one line about the Shield (Settings::shieldStatusRow):
 	 * why it is off, or what the store holds — the rules live, how many of
 	 * them are set to BLOCK and so may block, when the ruleset was pulled, and
-	 * whether this site blocks. Read off the store alone, no network
+	 * whether this site blocks. Read off the store alone, no network, and only
+	 * a record sealed under this site's key counts; a consent file the early
+	 * layers judge by that the plugin could not rewrite is said with it.
+	 * $dir is the store directory, storeDir() by default
 	 */
-	public function status(): string
+	public function status(
+		?string $dir = null,
+	): string
 	{
 		if($this->config->shieldKill())
 		{
@@ -519,19 +526,56 @@ final class Adapter
 		{
 			return __('off — the console URL and API key above are what the rules are pulled with.', 'ovos-codesafe');
 		}
+		$line = $this->storeLine();
+		$dir ??= self::storeDir();
+		$consent = $dir . DIRECTORY_SEPARATOR . Prepend::CONSENT;
+		
+		return match(self::staleConsent($this->config, $dir))
+		{
+			'seal' => $line . ' ' . sprintf(
+				/* translators: %s: the consent file's path */
+				__('WARNING: the layers before WordPress (the auto_prepend_file stub, the must-use plugin) cannot read the rules: their consent file %s was not rewritten after the API key changed, so requests are judged only at plugins_loaded and direct hits on plugin files pass unjudged. Check that the web server can write that file and its directory.', 'ovos-codesafe'), $consent),
+			'settings' => $line . ' ' . sprintf(
+				/* translators: %s: the consent file's path */
+				__('WARNING: the layers before WordPress (the auto_prepend_file stub, the must-use plugin) judge by switches this page no longer shows: their consent file %s could not be rewritten. Check that the web server can write that file and its directory.', 'ovos-codesafe'), $consent),
+			default => $line,
+		};
+	}
+	
+	/**
+	 * What the store holds, as the kernel judges by it: the rules live, how
+	 * many may block, when they were pulled, whether this site blocks
+	 */
+	protected function storeLine(): string
+	{
 		try
 		{
-			$record = $this->kernel()->store()->read();
+			$kernel = $this->kernel();
+			$record = $kernel->store()->read();
+			// as the kernel judges by it: sealed under this site's key and pulled with its modules, else no ruleset at all
+			$ruleset = Ruleset::fromRecord($record, Kernel::sealKey($this->config->apiKey()),
+				array_map(static fn(Platform $platform): string => $platform->name(), $kernel->platforms()));
 		}
 		catch(Throwable)
 		{
 			$record = null;
+			$ruleset = null;
 		}
 		if(is_array($record) === false)
 		{
 			return __('no ruleset yet — the first request after saving pulls it from the console (then every five minutes).', 'ovos-codesafe');
 		}
-		$rules = is_array($record['rules'] ?? null) ? $record['rules'] : [];
+		// planted, sealed under another key, or unsealed: the kernel judges nothing by it and pulls the ruleset whole
+		if($ruleset === null)
+		{
+			return __('no ruleset in use — the stored one is not sealed under this site\'s key (another key, an older plugin version, or not written by this plugin) and is ignored; the ruleset is pulled whole from the console at the end of this request.', 'ovos-codesafe');
+		}
+		// what the pull writes in a refused record's place while the console does not answer
+		if($ruleset->isRefused())
+		{
+			return __('no ruleset in use — the stored one was not sealed under this site\'s key and the console has not answered the pull that replaces it yet; it is asked again every five minutes.', 'ovos-codesafe');
+		}
+		$rules = $ruleset->rules;
 		$blocks = 0;
 		foreach($rules as $rule)
 		{
@@ -541,7 +585,7 @@ final class Adapter
 				$blocks++;
 			}
 		}
-		$fetchedAt = (int)($record['fetched_at'] ?? 0);
+		$fetchedAt = $ruleset->fetchedAt;
 		$pulled = $fetchedAt > 0
 			? sprintf(
 				/* translators: 1: a time of day, 2: a human duration such as "3 mins" */
@@ -554,12 +598,53 @@ final class Adapter
 			/* translators: 1: number of live rules, 2: number of rules set to block, 3: when the ruleset was pulled, 4: the blocking state */
 			_n('%1$d rule live, %2$d of them set to BLOCK — %3$s · %4$s', '%1$d rules live, %2$d of them set to BLOCK — %3$s · %4$s', count($rules), 'ovos-codesafe'),
 			count($rules), $blocks, $pulled, $blocking);
-		if(($record['usable'] ?? true) === false)
+		if($ruleset->usable === false)
 		{
 			$line .= ' ' . __('The last pull carried a ruleset this version cannot run; the rules above are the ones kept.', 'ovos-codesafe');
 		}
 		
 		return $line;
+	}
+	
+	/**
+	 * Whether the consent the early layers read lags behind this request's
+	 * configuration — syncPrepend() rewrites it on every request, so a lag is
+	 * a file the plugin could not write (its owner, its permissions, a
+	 * read-only filesystem): 'seal' when it holds another key's seal, so
+	 * those layers read no rules; 'settings' when another field differs;
+	 * '' when it is current, or there is none to compare
+	 */
+	protected static function staleConsent(
+		Config $config,
+		string $dir,
+	): string
+	{
+		try
+		{
+			$written = $dir === '' ? null : Prepend::consent($dir);
+			if($written === null)
+			{
+				return '';
+			}
+			$wanted = self::consentOf($config);
+			if($written['seal'] !== $wanted['seal'])
+			{
+				return 'seal';
+			}
+			foreach($wanted as $field => $value)
+			{
+				if(($written[$field] ?? null) !== $value)
+				{
+					return 'settings';
+				}
+			}
+		}
+		catch(Throwable)
+		{
+			// the settings page never fails over this line
+		}
+		
+		return '';
 	}
 	
 	/**
@@ -755,21 +840,8 @@ final class Adapter
 			{
 				return;
 			}
-			$connected = $config->enabled() && $config->url() !== '' && $config->apiKey() !== '';
-			Prepend::writeConsent($dir, [
-				'detect' => $config->shieldDetect() && $connected,
-				'enforce' => $config->shieldEnforce(),
-				'kill' => $config->shieldKill(),
-				'prefix' => self::prefixOf(),
-				// the executed-file watch (Entries) rides the same layer with its own switch
-				'root' => Entries::root(),
-				// the update working directories the layer's guard refuses scripts in lie below it
-				'content' => self::contentRoot(),
-				'entries' => $config->entryWatch() && $connected,
-				// the visitor's address behind a proxy the site trusts (M5)
-				'proxy_header' => $config->trustedProxyHeader(),
-				'proxies' => $config->trustedProxies(),
-			]);
+			$consent = self::consentOf($config);
+			Prepend::writeConsent($dir, $consent);
 			// 1.0.2's plain-JSON files, or a store CODESAFE_STORE_DIR has moved since
 			if(is_file($stubDir . DIRECTORY_SEPARATOR . 'shield-consent.json')
 				|| ($dir !== $stubDir && is_file($stubDir . DIRECTORY_SEPARATOR . Prepend::CONSENT)))
@@ -783,7 +855,7 @@ final class Adapter
 			// the one ovos-console left: kept running this plugin, never deleted
 			// while named, since PHP fails every request whose prepend file is gone
 			Prepend::tendOldStub($dir, $stubDir, Prepend::status($stubDir, null, self::legacyStub() ?: null));
-			$judges = $connected && $config->shieldDetect() && $config->shieldKill() === false;
+			$judges = $consent['detect'] && $consent['kill'] === false;
 			// the mu-plugin stage (ovos/codesafe docs/plans/shield-auto-deploy.md P7.g):
 			// the judge before the other plugins load, kept while the Shield is on
 			if(defined('WPMU_PLUGIN_DIR'))
@@ -808,6 +880,39 @@ final class Adapter
 		{
 			// the layer then judges on what it last had, or nothing
 		}
+	}
+	
+	/**
+	 * The consent the prepend layer reads, as this request's configuration
+	 * gives it (Prepend::consent()). It carries the seal key of the API key,
+	 * never the key: syncPrepend() compares it on every request, so a new
+	 * key — a settings save, a Connect, a constant — reaches the file on the
+	 * next one, whose shutdown pull seals the store under that key
+	 *
+	 * @return array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, proxy_header: string, proxies: list<string>, seal: string}
+	 */
+	public static function consentOf(
+		Config $config,
+	): array
+	{
+		$connected = $config->enabled() && $config->url() !== '' && $config->apiKey() !== '';
+		
+		return [
+			'detect' => $config->shieldDetect() && $connected,
+			'enforce' => $config->shieldEnforce(),
+			'kill' => $config->shieldKill(),
+			'prefix' => self::prefixOf(),
+			// the executed-file watch (Entries) rides the same layer with its own switch
+			'root' => Entries::root(),
+			// the update working directories the layer's guard refuses scripts in lie below it
+			'content' => self::contentRoot(),
+			'entries' => $config->entryWatch() && $connected,
+			// the visitor's address behind a proxy the site trusts
+			'proxy_header' => $config->trustedProxyHeader(),
+			'proxies' => $config->trustedProxies(),
+			// the key kernel() seals the store under: the layer reads the record with it and the same modules (Prepend::platforms())
+			'seal' => $connected && class_exists(Kernel::class, false) ? Kernel::sealKey($config->apiKey()) : '',
+		];
 	}
 	
 	/** what the settings page says about the prepend layer: its state, PHP's ini value, the stub and the two lines to paste */

@@ -8,6 +8,8 @@ use Ovos\Codesafe\Inventory;
 use Ovos\Codesafe\Plugin;
 use Ovos\Codesafe\Sender;
 use Ovos\Codesafe\Shield\Adapter;
+use Ovos\Codesafe\Shield\Kernel;
+use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Test;
 use Ovos\Test\Internal;
@@ -100,7 +102,7 @@ class ShieldNudge extends Test
 		$on = new Adapter($this->config(true), new Sender(new Config));
 		$store = $on->kernel()->store();
 		$store->write(Ruleset::fromPayload(['contract' => Ruleset::CONTRACT, 'dialect' => Ruleset::DIALECT, 'project' => 'p', 'rules' => []],
-			time(), '', $one)->toRecord());
+			time(), '', $one, Prepend::platforms())->toRecord(Kernel::sealKey('nudge-key')));
 		$off = new Adapter($this->config(false), new Sender(new Config));
 		
 		try

@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Tests;
 
 use Ovos\Codesafe\Redactor;
+use Ovos\Codesafe\Shield\Kernel;
 use Ovos\Codesafe\Shield\Prepend as BasePrepend;
 use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
@@ -84,8 +85,14 @@ class Prepend extends Test
 	/** the ruleset's name the consent carries — drawn by writeConsent() when none is given */
 	protected const string RULES_NAME = 'shield-abababababababababababab.json';
 	
+	/** the API key the ruleset is sealed under */
+	protected const string KEY = 'harness-key';
+	
+	/** Kernel::sealKey(self::KEY): what the adapter writes into the consent, never the key itself */
+	protected const string SEAL = '7c7a00e4abca682d0f5c8a4e2f46c29f036b9f508e73f10e47198eeb605b1099';
+	
 	protected const array ENFORCE = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'content' => '', 'entries' => false,
-		'rules' => self::RULES_NAME, 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'wp-json'];
+		'rules' => self::RULES_NAME, 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'wp-json', 'seal' => self::SEAL];
 	
 	protected string $dir;
 	
@@ -104,7 +111,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		
 		unset($GLOBALS[BasePrepend::STASH]);
 	}
@@ -179,7 +186,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
 		$request = fn(string $uri, string $script, array $get): array => [$this->server(self::BOT, $uri, $script), $get];
@@ -214,7 +221,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time(), platforms: BasePrepend::platforms())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root, 'rest_prefix' => 'api'] + self::ENFORCE);
 		$moved = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/api/fx/v1/settings', $root . '/index.php'));
@@ -244,7 +251,7 @@ class Prepend extends Test
 				'dialect' => 're2-2026',
 				'project' => 'harness',
 				'rules' => $rules,
-			], time(), platforms: BasePrepend::platforms())->toRecord());
+			], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		};
 		$root = $this->site();
 		file_put_contents($root . '/xmlrpc.php', "<?php\n");
@@ -332,7 +339,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time(), platforms: BasePrepend::platforms())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$root = $this->site();
 		$apcu = function_exists('apcu_enabled') && apcu_enabled();
 		BasePrepend::writeConsent($this->dir, ['root' => $root, 'prefix' => 'tests:prepend-deferred:' . uniqid()] + self::ENFORCE);
@@ -689,7 +696,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		BasePrepend::writeConsent($this->dir, ['prefix' => 'tests:prepend-rate:' . uniqid()] + self::ENFORCE);
 		$login = fn(string $ip, string $name): ?array => BasePrepend::judge($this->dir,
 			['REQUEST_METHOD' => 'POST', 'REQUEST_URI' => '/wp-login.php', 'HTTP_USER_AGENT' => 'Mozilla/5.0', 'REMOTE_ADDR' => $ip],
@@ -914,7 +921,7 @@ class Prepend extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$server = ['REMOTE_ADDR' => '173.245.48.7', 'HTTP_CF_CONNECTING_IP' => '198.51.100.23'] + $this->server('Mozilla/5.0', '/');
 		BasePrepend::writeConsent($this->dir, self::ENFORCE);
 		$direct = BasePrepend::judge($this->dir, $server);
@@ -1013,7 +1020,7 @@ class Prepend extends Test
 			'project' => 'harness',
 			'rules' => [['id' => 43, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
 				'who' => 'anonymous', 'conditions' => [['target' => 'query:probe', 'test' => 'equals', 'value' => '1']]]],
-		], time(), platforms: BasePrepend::platforms())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$root = $this->site();
 		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
 		$basic = ['HTTP_AUTHORIZATION' => 'Basic ' . base64_encode('integration:abcd 1234')];
@@ -1086,7 +1093,7 @@ class Prepend extends Test
 			'rules' => [['id' => 44, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null,
 				'who' => 'anyone', 'conditions' => [['target' => 'path', 'test' => 'suffix', 'value' => '/file.php'],
 				['target' => 'request:action', 'test' => 'equals', 'value' => 'fx_delete']]]],
-		], time(), platforms: BasePrepend::platforms())->toRecord());
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		BasePrepend::writeConsent($this->dir, self::ENFORCE);
 		$server = $this->server('Mozilla/5.0', '/wp-content/plugins/some-plugin/file.php?action=benign');
 		$bag = BasePrepend::judge($this->dir, $server, [], ['action' => 'fx_delete'], null, null, $ran, ['action' => 'benign'], [], null, ['action' => 'fx_delete']);

@@ -130,7 +130,8 @@ catch(Throwable)
  * - the consent is what the plugin last wrote (shield-consent.php): the two
  *   checkboxes and the kill constant as of the site's last request, so an
  *   unticked box reaches this layer one request later than it reaches the
- *   adapter;
+ *   adapter; with them the key the ruleset is sealed under, never the API
+ *   key: this layer checks the rules the adapter pulled and cannot pull;
  * - everything fails open — no consent, no ruleset, a throw of any kind, the
  *   request goes on as if this layer were not there.
  *
@@ -417,7 +418,8 @@ final class Prepend
 	/**
 	 * The pure part: the consent gate, the login-cookie rule, the judge. Null
 	 * when this layer has nothing to say (no consent, detection off, kill,
-	 * the kernel not ready(), anything but a block for a request carrying a
+	 * the kernel not ready(), no ruleset it can read (the adapter then judges
+	 * the request whole), anything but a block for a request carrying a
 	 * login cookie or a REST request with Basic credentials); otherwise
 	 * the verdict and the report the kernel would have sent — the adapter
 	 * sends it, or the queue holds it
@@ -425,7 +427,7 @@ final class Prepend
 	 * @param array<string, mixed> $server
 	 * @param array<string, mixed> $post
 	 * @param array<string, mixed> $cookies
-	 * @param ?array{detect: bool, enforce: bool, kill: bool, prefix: string, rest_prefix?: string} $consent the consent read already, or null to read it
+	 * @param ?array{detect: bool, enforce: bool, kill: bool, prefix: string, rest_prefix?: string, seal?: string} $consent the consent read already, or null to read it
 	 * @param ?bool $judged set: whether the kernel judged the request (false when the layer left it alone)
 	 * @param ?array<string, mixed> $get the parsed query; null = the raw URI's
 	 * @param array<string, mixed> $files the uploads — a virtual patch reads their names
@@ -469,10 +471,20 @@ final class Prepend
 			$report = [$kind, $message, $extra];
 		};
 		$store = new Store(self::rules($dir, $consent), $consent['prefix']);
+		// the adapter's seal key, not its API key: the record it pulled reads back only under that key and with the
+		// adapter's modules, and a consent without one reads no record at all
+		$seal = self::sealOf($consent['seal'] ?? null);
 		// this layer never pulls: a transport that answers nothing keeps even a mis-call harmless
 		$kernel = static fn(Store $store): Kernel => new Kernel('', '', $store, static fn(): array => ['status' => 0, 'headers' => [], 'body' => ''],
-			$reporter, platforms: self::platforms());
+			$reporter, platforms: self::platforms(), sealKey: $seal);
 		$counting = $kernel($store);
+		// no store this layer can read (none yet, or a consent the plugin could not rewrite after a key change): left to
+		// the adapter whole — judged here, the request would be marked judged and only tallied at plugins_loaded, and the
+		// kernel would force a pull on every request
+		if($counting->ruleset() === null)
+		{
+			return null;
+		}
 		// who WordPress will run it as is told only later for a deferred request, an XML-RPC call (inside each
 		// method) and a REST request with a token another plugin reads; the adapter cannot name that caller
 		// either, so the rules for anyone are judged here and what depends on who waits for the adapter
@@ -517,9 +529,11 @@ final class Prepend
 	 * `proxies` the trusted proxy the site named (clientIp()), `rest_prefix`
 	 * the site's REST prefix (restPrefixOf(), WordPress's default when none),
 	 * `content` the content directory the guard measures against (realpath
-	 * of WP_CONTENT_DIR, '' when unknown: the guard then says nothing)
+	 * of WP_CONTENT_DIR, '' when unknown: the guard then says nothing),
+	 * `seal` the key the ruleset is sealed under (sealOf(), '' when none:
+	 * the kernel then reads no ruleset)
 	 *
-	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string}
+	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string, seal: string}
 	 */
 	public static function consent(
 		string $dir,
@@ -547,6 +561,7 @@ final class Prepend
 			'proxy_header' => $header,
 			'proxies' => is_array($decoded['proxies'] ?? null) ? array_values(array_filter($decoded['proxies'], 'is_string')) : [],
 			'rest_prefix' => self::restPrefixOf($decoded['rest_prefix'] ?? null),
+			'seal' => self::sealOf($decoded['seal'] ?? null),
 		];
 	}
 	
@@ -555,9 +570,11 @@ final class Prepend
 	 * there (one small read per request, one write per change). The ruleset's
 	 * name is drawn once and kept: the one there, else the one given, else a
 	 * new one. The REST prefix is kept unless given: the writer before
-	 * plugins_loaded cannot know it (writeRestPrefix())
+	 * plugins_loaded cannot know it (writeRestPrefix()). The seal key is
+	 * the given one, '' when none: a writer without the API key leaves the
+	 * layer no ruleset to read
 	 *
-	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string} $consent
+	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string, seal?: string} $consent
 	 * @return bool whether the file was (re)written
 	 */
 	public static function writeConsent(
@@ -584,6 +601,7 @@ final class Prepend
 			'proxy_header' => (string)($consent['proxy_header'] ?? ''),
 			'proxies' => array_values(array_filter((array)($consent['proxies'] ?? []), 'is_string')),
 			'rest_prefix' => self::restPrefixOf($consent['rest_prefix'] ?? $current['rest_prefix'] ?? null),
+			'seal' => self::sealOf($consent['seal'] ?? null),
 		];
 		if($current === $wanted)
 		{
@@ -620,6 +638,14 @@ final class Prepend
 		$prefix = is_string($prefix) ? trim($prefix, '/') : '';
 		
 		return $prefix === '' ? self::REST_PREFIX : $prefix;
+	}
+	
+	/** a seal key as Kernel::sealKey() writes it, 64 lowercase hex; '' for anything else, which reads no ruleset */
+	protected static function sealOf(
+		mixed $seal,
+	): string
+	{
+		return is_string($seal) && preg_match('~^[0-9a-f]{64}\z~', $seal) === 1 ? $seal : '';
 	}
 	
 	/**
