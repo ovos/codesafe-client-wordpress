@@ -18,6 +18,7 @@ use function apcu_store;
 use function array_fill;
 use function array_intersect_key;
 use function base_convert;
+use function bin2hex;
 use function curl_exec;
 use function curl_getinfo;
 use function curl_init;
@@ -65,6 +66,7 @@ use function microtime;
 use function preg_match;
 use function preg_quote;
 use function preg_replace;
+use function random_bytes;
 use function register_shutdown_function;
 use function reset;
 use function rest_get_server;
@@ -1054,12 +1056,21 @@ class Rollup
 		array $fields,
 	): array
 	{
+		// the seq first: one that starts over (APCu dropped the counter, kept the instance, as an
+		// apc.ttl idle eviction can) takes a new instance, or a codesafe that dedups on (instance, seq)
+		// takes every fragment for a retry; a failed inc answers 0 and takes one too
+		$seq = (int)apcu_inc($this->prefix() . 'seq');
+		if($seq <= 1)
+		{
+			apcu_delete($this->prefix() . 'instance');
+		}
+		
 		return [
 			'v' => 1,
 			'type' => 'rollup',
 			'host' => self::hostName((string)gethostname()),
 			'instance' => $this->instance(),
-			'seq' => (int)apcu_inc($this->prefix() . 'seq'),
+			'seq' => $seq,
 		] + self::assemble($minute, $fields);
 	}
 	
@@ -1073,7 +1084,9 @@ class Rollup
 	{
 		$instance = apcu_entry($this->prefix() . 'instance',
 			static fn(): string => 'p' . (int)getmypid()
-				. '-' . base_convert((string)time(), 10, 36));
+				. '-' . base_convert((string)time(), 10, 36)
+				// a new instance within the same second, after a seq that started over, is new all the same
+				. '-' . bin2hex(random_bytes(3)));
 		
 		return (string)$instance;
 	}
