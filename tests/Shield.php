@@ -82,6 +82,9 @@ class Shield extends Test
 	
 	protected const string PREPEND = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Shield' . DIRECTORY_SEPARATOR . 'Prepend.php';
 	
+	/** the harness kernel's API key: its store is sealed under Kernel::sealKey() of it */
+	protected const string KEY = 'harness-key';
+	
 	protected string $path;
 	
 	protected Kernel $kernel;
@@ -104,11 +107,11 @@ class Shield extends Test
 			'dialect' => 're2-2026',
 			'project' => 'harness',
 			'rules' => $rules,
-		], time())->toRecord());
+		], time())->toRecord(Kernel::sealKey(self::KEY)));
 		
 		$this->reports = [];
 		$this->pulls = 0;
-		$this->kernel = new Kernel('https://console.invalid', 'harness-key', $store,
+		$this->kernel = new Kernel('https://console.invalid', self::KEY, $store,
 			function(): array
 			{
 				$this->pulls++;
@@ -317,12 +320,12 @@ class Shield extends Test
 		$dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ovos-shield-module-' . uniqid();
 		mkdir($dir, 0700, true);
 		$consent = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'entries' => false,
-			'rules' => 'shield-cdcdcdcdcdcdcdcdcdcdcdcd.json', 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'api'];
+			'rules' => 'shield-cdcdcdcdcdcdcdcdcdcdcdcd.json', 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'api', 'seal' => Kernel::sealKey(self::KEY)];
 		$rules = $dir . DIRECTORY_SEPARATOR . $consent['rules'];
 		$input = $dir . DIRECTORY_SEPARATOR . 'alone.json';
 		$script = $dir . DIRECTORY_SEPARATOR . 'alone.php';
 		(new Store($rules, ''))->write(Ruleset::fromPayload(['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => $this->moduleRules()],
-			time(), platforms: Prepend::platforms())->toRecord());
+			time(), platforms: Prepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$refused = [];
 		$alone = [];
 		try
@@ -375,12 +378,12 @@ class Shield extends Test
 		$copy = $dir . DIRECTORY_SEPARATOR . 'Shield';
 		mkdir($copy, 0700, true);
 		$consent = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'entries' => false,
-			'rules' => 'shield-efefefefefefefefefefefef.json', 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'api'];
+			'rules' => 'shield-efefefefefefefefefefefef.json', 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'api', 'seal' => Kernel::sealKey(self::KEY)];
 		$rules = $dir . DIRECTORY_SEPARATOR . $consent['rules'];
 		$input = $dir . DIRECTORY_SEPARATOR . 'upgrade.json';
 		$script = $dir . DIRECTORY_SEPARATOR . 'upgrade.php';
 		(new Store($rules, ''))->write(Ruleset::fromPayload(['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => $this->moduleRules()],
-			time(), platforms: Prepend::platforms())->toRecord());
+			time(), platforms: Prepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
 		$module = (string)file_get_contents(self::MODULE);
 		// what the upgrade has copied of each kernel file: true whole, false nothing yet, a string the part written so far
 		$states = [
@@ -529,7 +532,7 @@ class Shield extends Test
 		$store = new Store($path, '', false);
 		$store->write(Ruleset::fromPayload(['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => [['id' => 51, 'kind' => 'vpatch',
 			'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => 'proven', 'expires_at' => null, 'who' => 'anyone',
-			'conditions' => [['target' => 'request:action', 'test' => 'equals', 'value' => 'fx_delete']]]]], time(), platforms: Prepend::platforms())->toRecord());
+			'conditions' => [['target' => 'request:action', 'test' => 'equals', 'value' => 'fx_delete']]]]], time(), platforms: Prepend::platforms())->toRecord(Kernel::sealKey('k')));
 		$config = new class extends Config
 		{
 			public function __construct()
