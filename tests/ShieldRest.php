@@ -16,13 +16,13 @@ use Ovos\Codesafe\Shield\Verdict;
 use Ovos\Test;
 use Ovos\Test\Internal;
 
-use function array_replace;
 use function count;
 use function hash;
 use function implode;
 use function intdiv;
 use function ksort;
 use function is_dir;
+use function is_user_logged_in;
 use function mkdir;
 use function rmdir;
 use function scandir;
@@ -34,6 +34,7 @@ use function unlink;
 use function wp_shim_reset;
 
 use const DIRECTORY_SEPARATOR;
+use const PHP_INT_MAX;
 
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'files' . DIRECTORY_SEPARATOR . 'wordpress.file.php';
 // the kernel file holds Facts, Store and Ruleset beside Kernel: the adapter's require brings it
@@ -256,11 +257,13 @@ class ShieldRest extends Test
 	
 	/**
 	 * RULE: a held request waits on the hook where WordPress has settled its
-	 * caller — rest_pre_dispatch for REST, xmlrpc_call for an XML-RPC call —
-	 * and on WordPress's shutdown action, both before any plugin's default
-	 * priority; a request the kernel decides at once waits on nothing.
-	 * Falsify: wait on init — a token is still unread there, and the second
-	 * judgement guesses again.
+	 * caller — the last rest_authentication_errors callback for REST, after
+	 * every authentication method and also when one refuses the credentials,
+	 * xmlrpc_call for an XML-RPC call, before any plugin's default priority —
+	 * and on WordPress's shutdown action; a known caller's request waits on
+	 * nothing. Falsify: wait on rest_pre_dispatch — a token plugin that
+	 * refuses a junk token stops the dispatch, and the request is settled
+	 * only at shutdown; or on init — a token is still unread there.
 	 */
 	public function aHeldRequestWaitsOnTheHookWordPressSettlesItsCallerOn(): bool
 	{
@@ -277,7 +280,7 @@ class ShieldRest extends Test
 		$GLOBALS['wp']['hooked'] = [];
 		$this->adapter($reports)->judgeRequest($call, Adapter::caller($call[0], [], [], false, true), '203.0.113.9', 'wp-json');
 		
-		return $restHooks === [['rest_pre_dispatch', [$rest, 'judgeAgain'], Adapter::HOOK_PRIORITY, 1], ['shutdown', [$rest, 'settleHeld'], Adapter::HOOK_PRIORITY, 1]]
+		return $restHooks === [['rest_authentication_errors', [$rest, 'judgeAgain'], PHP_INT_MAX, 1], ['shutdown', [$rest, 'settleHeld'], Adapter::HOOK_PRIORITY, 1]]
 			&& $xmlrpcHooks === [['xmlrpc_call', [$xmlrpc, 'judgeAgain'], Adapter::HOOK_PRIORITY, 1], ['shutdown', [$xmlrpc, 'settleHeld'], Adapter::HOOK_PRIORITY, 1]]
 			&& $GLOBALS['wp']['hooked'] === [];
 	}
@@ -285,12 +288,12 @@ class ShieldRest extends Test
 	/**
 	 * RULE: an unknown caller's request is held, not settled: nothing is
 	 * counted or reported until WordPress has settled the user. Judged again
-	 * then (rest_pre_dispatch, xmlrpc_call), it is refused for an anonymous
-	 * caller and served for one holding manage_options, once; never judged
-	 * again, WordPress's shutdown reports the observe it was, once. Falsify:
-	 * report the held verdict at once — every JWT call is reported twice; or
-	 * judge it again with the unknown caller — a forged Bearer header turns
-	 * every block into an observe.
+	 * then (rest_authentication_errors, xmlrpc_call), it is refused for an
+	 * anonymous caller and served for one holding manage_options, once; never
+	 * judged again, WordPress's shutdown reports the observe it was, once.
+	 * Falsify: report the held verdict at once — every JWT call is reported
+	 * twice; or judge it again with the unknown caller — a forged Bearer
+	 * header turns every block into an observe.
 	 */
 	public function anUnknownCallerIsJudgedAgainOnceWordPressHasTheUser(): bool
 	{
@@ -305,7 +308,7 @@ class ShieldRest extends Test
 		$heldReports = count($reports);
 		$adapter->judgeAgain(null, $anonymous);
 		$refused = $reports;
-		// judged once: a second rest_pre_dispatch (a batch's sub-request) finds nothing held
+		// judged once: the filter applied again finds nothing held
 		$adapter->judgeAgain(null, $anonymous);
 		$once = count($reports);
 		
@@ -347,49 +350,239 @@ class ShieldRest extends Test
 		$admin = ['authed' => true, 'user' => 'user:7', 'can' => static fn(string $capability): bool => true, 'nonce' => null, 'known' => true];
 		$anonymous = ['authed' => false, 'user' => '', 'can' => static fn(string $capability): bool => false, 'nonce' => null, 'known' => true];
 		$unknown = Adapter::caller(['HTTP_AUTHORIZATION' => 'Bearer forged'] + $this->server(), [], [], false, true);
-		$taken = static function() use ($store): array
-		{
-			// the minute the tally ran in, and the one either side should the clock turn
-			$minute = intdiv(time(), 60);
-			$hits = [];
-			foreach([$minute - 1, $minute, $minute + 1] as $at)
-			{
-				foreach($store->takeHits($at) as $id => $counts)
-				{
-					foreach($counts as $outcome => $count)
-					{
-						$hits[$id][$outcome] = ($hits[$id][$outcome] ?? 0) + $count;
-					}
-				}
-			}
-			ksort($hits);
-			
-			return $hits;
-		};
-		$taken();
+		$this->taken($store);
 		
 		// served: the administrator holds manage_options and is signed in
 		$adapter->judgeRequest($request, $admin, '203.0.113.9', 'wp-json');
-		$served = $taken();
+		$served = $this->taken($store);
 		// held, then judged again for an anonymous caller: tallied once, then
 		$adapter->judgeRequest($request, $unknown, '203.0.113.9', 'wp-json');
-		$whileHeld = $taken();
+		$whileHeld = $this->taken($store);
 		$adapter->judgeAgain(null, $anonymous);
 		$adapter->judgeAgain(null, $anonymous);
-		$settled = $taken();
+		$settled = $this->taken($store);
 		// an earlier layer judged it: only the evidence
 		$reports = [];
 		$adapter->tallyRequest($request, $admin, '203.0.113.9', 'wp-json');
-		$early = $taken();
+		$early = $this->taken($store);
 		
-		$zero = ['observe' => 0, 'block' => 0, 'entry' => 0, 'match' => 0, 'authed' => 0];
-		$entered = array_replace($zero, ['entry' => 1]);
+		$entered = $this->counts(entry: 1);
 		
 		return $served === [0 => $entered, 21 => $entered, 22 => $entered]
 			&& $whileHeld === []
-			&& $settled[0] === $entered && $settled[21] === array_replace($zero, ['block' => 1, 'entry' => 1, 'match' => 1])
-			&& $settled[22] === array_replace($zero, ['entry' => 1, 'match' => 1])
+			&& $settled[0] === $entered && $settled[21] === $this->counts(block: 1, entry: 1, match: 1)
+			&& $settled[22] === $this->counts(entry: 1, match: 1)
 			&& $early === [0 => $entered, 21 => $entered, 22 => $entered] && $reports === [];
+	}
+	
+	/**
+	 * RULE: a REST request with a token WordPress reads only later — here a
+	 * junk one, which no plugin signs in — is settled where WordPress has
+	 * authenticated it, while it serves REST: nothing is counted at
+	 * plugins_loaded, nor where the filter is applied before WordPress serves
+	 * REST; then it is the anonymous caller WordPress runs, an observing
+	 * vpatch's match reported and tallied as not signed in, a blocking one
+	 * for anonymous callers refusing it. Falsify: settle the observe at once —
+	 * every match of a forged Bearer header reads as signed in, and one probe
+	 * holds the rule's promotion for good; or settle it wherever the filter
+	 * is applied — before WordPress serves REST the token is unread.
+	 */
+	public function aJunkTokenIsAnonymousOnceWordPressHasAuthenticatedIt(): bool
+	{
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer x'] + $this->server(), [], [], [], []];
+		$unknown = Adapter::caller($request[0], [], [], false, true);
+		$reports = [];
+		$store = $this->store([$this->vpatch(31, 'observe', 'anonymous')]);
+		$adapter = $this->adapter($reports, $store);
+		$this->taken($store);
+		
+		$adapter->judgeRequest($request, $unknown, '203.0.113.9', 'wp-json');
+		$atPluginsLoaded = [$reports, $this->taken($store)];
+		$early = $adapter->judgeAgain('early');
+		$beforeServing = [$reports, $this->taken($store)];
+		$GLOBALS['wp']['serving_rest'] = true;
+		$adapter->judgeAgain(null);
+		$observed = $reports;
+		$observedHits = $this->taken($store);
+		
+		$refusals = [];
+		$blocking = $this->store([$this->vpatch(21, 'block', 'anonymous')]);
+		$refusing = $this->adapter($refusals, $blocking);
+		$this->taken($blocking);
+		$refusing->judgeRequest($request, $unknown, '203.0.113.9', 'wp-json');
+		$refusing->judgeAgain(null);
+		$refusedHits = $this->taken($blocking);
+		
+		return $unknown['known'] === false
+			&& $atPluginsLoaded === [[], []] && $early === 'early' && $beforeServing === [[], []]
+			&& count($observed) === 1 && $observed[0][0] === Verdict::KIND_OBSERVE && $observed[0][2]['rule'] === 31
+			&& $observed[0][2]['authed'] === false
+			&& $observedHits === [0 => $this->counts(entry: 1), 31 => $this->counts(observe: 1, entry: 1, match: 1)]
+			&& count($refusals) === 1 && $refusals[0][0] === Verdict::KIND_BLOCK && $refusals[0][2]['rule'] === 21
+			&& $refusals[0][2]['authed'] === false
+			&& $refusedHits[21] === $this->counts(block: 1, entry: 1, match: 1);
+	}
+	
+	/**
+	 * RULE: a token another plugin signs in — its determine_current_user
+	 * filter, which reads the token only while WordPress serves REST — is
+	 * that user once WordPress has authenticated the request, and the request
+	 * is judged again for them: a vpatch for anonymous callers is not theirs,
+	 * one for anyone is reported and tallied as signed in. Falsify: settle the
+	 * unknown caller at plugins_loaded — the anonymous rule's match is charged
+	 * to an integration it never applies to.
+	 */
+	public function aValidTokenIsItsUserOnceWordPressHasAuthenticatedIt(): bool
+	{
+		$GLOBALS['wp']['filters']['determine_current_user'] = [static fn(mixed $user): mixed => $GLOBALS['wp']['serving_rest'] ? 7 : $user];
+		$GLOBALS['wp']['current_caps'] = ['edit_posts'];
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.x'] + $this->server(), [], [], [], []];
+		$reports = [];
+		$store = $this->store([$this->vpatch(31, 'observe', 'anonymous'), $this->vpatch(33, 'observe', 'anyone')]);
+		$adapter = $this->adapter($reports, $store);
+		$this->taken($store);
+		
+		// plugins_loaded: the token plugin has not read the token yet
+		$caller = Adapter::caller($request[0], [], [], is_user_logged_in(), true);
+		$adapter->judgeRequest($request, $caller, '203.0.113.9', 'wp-json');
+		$atPluginsLoaded = [$reports, $this->taken($store)];
+		$GLOBALS['wp']['serving_rest'] = true;
+		$adapter->judgeAgain(null);
+		$hits = $this->taken($store);
+		
+		return $caller['known'] === false && $atPluginsLoaded === [[], []]
+			&& count($reports) === 1 && $reports[0][0] === Verdict::KIND_OBSERVE && $reports[0][2]['rule'] === 33
+			&& $reports[0][2]['authed'] === true
+			&& $hits === [0 => $this->counts(entry: 1), 31 => $this->counts(entry: 1), 33 => $this->counts(observe: 1, entry: 1, match: 1, authed: 1)];
+	}
+	
+	/**
+	 * RULE: an unknown caller is refused at plugins_loaded by a rule that
+	 * holds for anyone, though a rule for anonymous callers before it waits,
+	 * and nothing is held; WordPress has signed no one in when it refuses and
+	 * never reads the token, so the refusal is reported and tallied as not
+	 * signed in. Falsify: hold a block too — a Bearer header carries the
+	 * exploit past plugins_loaded into the plugins' own init hooks; or count
+	 * the refusal for the unknown caller — one probe with a Bearer header
+	 * raises a signed-in refusal on codesafe.
+	 */
+	public function aRuleForAnyoneRefusesAnUnknownCallerAtPluginsLoaded(): bool
+	{
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer x'] + $this->server(), [], [], [], []];
+		$reports = [];
+		$store = $this->store([$this->vpatch(35, 'block', 'anonymous'), $this->vpatch(34, 'block', 'anyone')]);
+		$adapter = $this->adapter($reports, $store);
+		$this->taken($store);
+		
+		$verdict = $adapter->judgeRequest($request, Adapter::caller($request[0], [], [], false, true), '203.0.113.9', 'wp-json');
+		$hits = $this->taken($store);
+		
+		return $verdict?->isBlock() === true && ($verdict->rule['id'] ?? 0) === 34
+			&& $GLOBALS['wp']['hooked'] === []
+			&& count($reports) === 1 && $reports[0][0] === Verdict::KIND_BLOCK && $reports[0][2]['rule'] === 34
+			&& $reports[0][2]['authed'] === false
+			&& $hits[34] === $this->counts(block: 1, entry: 1, match: 1)
+			&& $hits[35] === $this->counts(entry: 1, match: 1);
+	}
+	
+	/**
+	 * RULE: an XML-RPC call is settled as the caller its method signed in: on
+	 * xmlrpc_call, after the method's login, as that user; never signed in by
+	 * then — a failed login, a body no method reads — WordPress ran it as
+	 * user 0 throughout, and its shutdown settles it as anonymous. Falsify:
+	 * settle the call at plugins_loaded — every password guess against
+	 * xmlrpc.php reads as a signed-in match; or wait for WordPress to serve
+	 * REST — a signed-in call is settled only at shutdown, as no one.
+	 */
+	public function anXmlRpcCallIsTheCallerItsMethodSignedIn(): bool
+	{
+		$call = [['REQUEST_URI' => '/xmlrpc.php'] + $this->server(), [], [], [], []];
+		$unknown = Adapter::caller($call[0], [], [], false, false, true);
+		$reports = [];
+		$store = $this->store([$this->vpatch(37, 'observe', 'anonymous', '/xmlrpc.php'), $this->vpatch(36, 'observe', 'anyone', '/xmlrpc.php')]);
+		$this->taken($store);
+		
+		$guessed = $this->adapter($reports, $store);
+		$guessed->judgeRequest($call, $unknown, '203.0.113.9', 'wp-json', true);
+		$atPluginsLoaded = [$reports, $this->taken($store)];
+		$guessed->settleHeld();
+		$guess = $reports;
+		$guessHits = $this->taken($store);
+		
+		$reports = [];
+		$signed = $this->adapter($reports, $store);
+		$signed->judgeRequest($call, $unknown, '203.0.113.9', 'wp-json', true);
+		$GLOBALS['wp']['logged_in'] = true;
+		$signed->judgeAgain('wp.getUsersBlogs');
+		$signedIn = $reports;
+		$signedHits = $this->taken($store);
+		
+		return $unknown['known'] === false && $atPluginsLoaded === [[], []]
+			&& count($guess) === 1 && $guess[0][0] === Verdict::KIND_OBSERVE && $guess[0][2]['rule'] === 37 && $guess[0][2]['authed'] === false
+			&& $guessHits === [0 => $this->counts(entry: 1), 36 => $this->counts(entry: 1, match: 1), 37 => $this->counts(observe: 1, entry: 1, match: 1)]
+			&& count($signedIn) === 1 && $signedIn[0][2]['rule'] === 36 && $signedIn[0][2]['authed'] === true
+			&& $signedHits === [0 => $this->counts(entry: 1), 36 => $this->counts(observe: 1, entry: 1, match: 1, authed: 1), 37 => $this->counts(entry: 1)];
+	}
+	
+	/**
+	 * RULE: a held request no rule over it decided — passed, or observed as a
+	 * listed address the section only observes — is not judged again once
+	 * WordPress has the user: the rate rules counted it at plugins_loaded,
+	 * once, and the next request from each address is the one past the
+	 * limit. Falsify: judge every held request again — a token-carrying
+	 * integration is charged twice and meets a rate rule's limit at half its
+	 * rate.
+	 */
+	public function aHeldRequestIsChargedToARateRuleOnce(): bool
+	{
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer x'] + $this->server(), [], [], [], []];
+		$unknown = Adapter::caller($request[0], [], [], false, true);
+		$plain = [$this->server(), [], [], [], []];
+		$anonymous = Adapter::caller($plain[0], [], [], false, true);
+		$reports = [];
+		$store = $this->store([['id' => 41, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'uri', 'op' => 'prefix',
+			'value' => '/wp-json/fx/v1/', 'ci' => true, 'mode' => 'observe', 'expires_at' => null, 'kind' => 'rate',
+			'rate' => ['key' => 'ip', 'limit' => 1, 'window' => 60]]], ['mode' => 'observe', 'addresses' => ['198.51.100.7']]);
+		$adapter = $this->adapter($reports, $store);
+		$GLOBALS['wp']['serving_rest'] = true;
+		
+		$passed = $adapter->judgeRequest($request, $unknown, '203.0.113.9', 'wp-json');
+		$adapter->judgeAgain(null);
+		$listed = $adapter->judgeRequest($request, $unknown, '198.51.100.7', 'wp-json');
+		$adapter->judgeAgain(null);
+		$settled = $reports;
+		$next = $adapter->judgeRequest($plain, $anonymous, '203.0.113.9', 'wp-json');
+		$listedNext = $adapter->judgeRequest($plain, $anonymous, '198.51.100.7', 'wp-json');
+		
+		return $passed === null && $listed === null && $settled === []
+			&& $next?->isRate() === true && $listedNext?->isRate() === true
+			&& count($reports) === 2 && $reports[0][0] === Verdict::KIND_RATE && $reports[1][0] === Verdict::KIND_RATE;
+	}
+	
+	/**
+	 * RULE: a request an earlier layer judged with its caller unknown is
+	 * tallied once WordPress has settled the caller, as that caller, once,
+	 * and reported nothing. Falsify: tally it at plugins_loaded — the prepend
+	 * layer's observe of a forged Bearer header reaches codesafe as a
+	 * signed-in match.
+	 */
+	public function anEarlierLayersRequestIsTalliedForTheCallerWordPressSettled(): bool
+	{
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer x'] + $this->server(), [], [], [], []];
+		$reports = [];
+		$store = $this->store([$this->vpatch(31, 'observe', 'anonymous')]);
+		$adapter = $this->adapter($reports, $store);
+		$this->taken($store);
+		
+		$adapter->tallyRequest($request, Adapter::caller($request[0], [], [], false, true), '203.0.113.9', 'wp-json');
+		$atPluginsLoaded = $this->taken($store);
+		$GLOBALS['wp']['serving_rest'] = true;
+		$adapter->judgeAgain(null);
+		$adapter->settleHeld();
+		$hits = $this->taken($store);
+		
+		return $atPluginsLoaded === [] && $reports === []
+			&& $hits === [0 => $this->counts(entry: 1), 31 => $this->counts(entry: 1, match: 1)];
 	}
 	
 	/**
@@ -494,6 +687,70 @@ class ShieldRest extends Test
 		};
 		
 		return new Adapter($config, new Sender(new Config), $kernel);
+	}
+	
+	/** a virtual patch on the paths under $path, as the door serves one */
+	protected function vpatch(
+		int $id,
+		string $mode,
+		string $who,
+		string $path = '/wp-json/fx/v1/',
+	): array
+	{
+		return ['id' => $id, 'kind' => 'vpatch', 'origin' => 'finding', 'finding' => '', 'cve' => '', 'mode' => $mode, 'expires_at' => null,
+			'who' => $who, 'conditions' => [['target' => 'path', 'test' => 'prefix', 'value' => $path]]];
+	}
+	
+	/** a store holding these rules and this threat section sealed, counting in APCu under a prefix of its own */
+	protected function store(
+		array $rules,
+		?array $threats = null,
+	): Store
+	{
+		$payload = ['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => $rules] + ($threats === null ? [] : ['threats' => $threats]);
+		$store = new Store($this->dir . DIRECTORY_SEPARATOR . 'shield-' . uniqid() . '.json', 'shield-rest-' . uniqid());
+		$store->write(Ruleset::fromPayload($payload, time())->toRecord(Kernel::sealKey(self::KEY)));
+		
+		return $store;
+	}
+	
+	/**
+	 * What the store counted since the last call, by rule — the minute the
+	 * tally ran in, and the one either side should the clock turn
+	 *
+	 * @return array<int, array{observe: int, block: int, entry: int, match: int, authed: int}>
+	 */
+	protected function taken(
+		Store $store,
+	): array
+	{
+		$minute = intdiv(time(), 60);
+		$hits = [];
+		foreach([$minute - 1, $minute, $minute + 1] as $at)
+		{
+			foreach($store->takeHits($at) as $id => $counts)
+			{
+				foreach($counts as $outcome => $count)
+				{
+					$hits[$id][$outcome] = ($hits[$id][$outcome] ?? 0) + $count;
+				}
+			}
+		}
+		ksort($hits);
+		
+		return $hits;
+	}
+	
+	/** one rule's counts as the store hands them back, every outcome present */
+	protected function counts(
+		int $observe = 0,
+		int $block = 0,
+		int $entry = 0,
+		int $match = 0,
+		int $authed = 0,
+	): array
+	{
+		return ['observe' => $observe, 'block' => $block, 'entry' => $entry, 'match' => $match, 'authed' => $authed];
 	}
 	
 	/** the request with Basic credentials as WordPress leaves them by plugins_loaded */
