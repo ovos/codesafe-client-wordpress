@@ -14,6 +14,7 @@ use function apcu_delete;
 use function apcu_fetch;
 use function apcu_store;
 use function array_fill;
+use function array_map;
 use function count;
 use function get_option;
 use function intdiv;
@@ -181,6 +182,37 @@ class Rollup extends Test
 		$rollup->clear();
 		
 		return count($sent) === 1 && $sent[0]['minute'] === $minute - 3;
+	}
+	
+	/**
+	 * RULE: a seq that starts over takes a new instance. Under apc.ttl APCu
+	 * may drop the seq counter, which is only ever incremented, while the
+	 * instance, read on every flush, survives: the old instance with a seq
+	 * from 1 again repeats pairs codesafe has seen, and a codesafe that
+	 * dedups on (instance, seq) drops each fragment as a retry. Falsify: take
+	 * the instance before the seq — the third fragment ships the first one's
+	 * instance with seq 1 again.
+	 */
+	public function aSeqThatStartsOverTakesANewInstance(): bool
+	{
+		$this->needsApcu();
+		$rollup = $this->rollup();
+		$minute = intdiv(time(), 60);
+		foreach([0, 1, 2] as $step)
+		{
+			if($step === 2)
+			{
+				$rollup->dropSeq();
+			}
+			$rollup->seed($minute + $step - 1);
+			$rollup->flushNow($minute + $step);
+		}
+		$sent = array_map(static fn(array $payload): array => [$payload['instance'], $payload['seq']], $rollup->sent);
+		$rollup->clear();
+		
+		return count($sent) === 3
+			&& $sent[0][1] === 1 && $sent[1] === [$sent[0][0], 2]
+			&& $sent[2][1] === 1 && $sent[2][0] !== $sent[0][0];
 	}
 	
 	/**
@@ -383,6 +415,12 @@ class Rollup extends Test
 			): void
 			{
 				$this->flush($minute);
+			}
+			
+			/** what an idle eviction does: the seq counter gone, the instance kept */
+			public function dropSeq(): void
+			{
+				apcu_delete($this->prefix() . 'seq');
 			}
 			
 			public function routeNow(
