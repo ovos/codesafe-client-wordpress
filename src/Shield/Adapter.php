@@ -605,7 +605,7 @@ final class Adapter
 		}
 		if($this->config->enabled() === false || $this->config->url() === '' || $this->config->apiKey() === '')
 		{
-			return __('off — the console URL and API key above are what the rules are pulled with.', 'ovos-codesafe');
+			return __('off — the codesafe URL and API key above are what the rules are pulled with.', 'ovos-codesafe');
 		}
 		$line = $this->storeLine();
 		$dir ??= self::storeDir();
@@ -644,17 +644,17 @@ final class Adapter
 		}
 		if(is_array($record) === false)
 		{
-			return __('no ruleset yet — the first request after saving pulls it from the console (then every five minutes).', 'ovos-codesafe');
+			return __('no ruleset yet — the first request after saving pulls it from codesafe (then every five minutes).', 'ovos-codesafe');
 		}
 		// planted, sealed under another key, or unsealed: the kernel judges nothing by it and pulls the ruleset whole
 		if($ruleset === null)
 		{
-			return __('no ruleset in use — the stored one is not sealed under this site\'s key (another key, an older plugin version, or not written by this plugin) and is ignored; the ruleset is pulled whole from the console at the end of this request.', 'ovos-codesafe');
+			return __('no ruleset in use — the stored one is not sealed under this site\'s key (another key, an older plugin version, or not written by this plugin) and is ignored; the ruleset is pulled whole from codesafe at the end of this request.', 'ovos-codesafe');
 		}
 		// what the pull writes in a refused record's place while the console does not answer
 		if($ruleset->isRefused())
 		{
-			return __('no ruleset in use — the stored one was not sealed under this site\'s key and the console has not answered the pull that replaces it yet; it is asked again every five minutes.', 'ovos-codesafe');
+			return __('no ruleset in use — the stored one was not sealed under this site\'s key and codesafe has not answered the pull that replaces it yet; it is asked again every five minutes.', 'ovos-codesafe');
 		}
 		$rules = $ruleset->rules;
 		$blocks = 0;

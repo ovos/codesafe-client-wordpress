@@ -53,7 +53,7 @@ class JsClient
 			return;
 		}
 		
-		$src = plugins_url('assets/console-client.js', $this->file)
+		$src = plugins_url('assets/codesafe-client.js', $this->file)
 			. '?ver=' . rawurlencode(Plugin::VERSION);
 			
 		$options = [

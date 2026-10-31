@@ -1,6 +1,6 @@
 === ovos codesafe ===
 Contributors: ovos
-Tags: error monitoring, error reporting, javascript errors, logging, debugging
+Tags: security, firewall, virtual patching, vulnerability, error monitoring
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.3
@@ -8,11 +8,11 @@ Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Error monitoring and cyberdefence for WordPress: PHP and JavaScript errors, scanner probes, failed logins, a read-only integrity scan for files nobody shipped, and a request-side shield for the CVEs you run — sent to your own ovos codesafe.
+From the first threat to the verified patch: a request-side shield for the vulnerabilities you run, the attacks on your site, a read-only scan for files nobody shipped, and the errors in your code — in your own ovos codesafe.
 
 == Description ==
 
-This plugin reports errors from your WordPress site to [ovos codesafe](https://ovos.github.io/codesafe/) — one live dashboard for the errors of every site and service you run, grouped into issues, alerted and resolved, and one place where the attacks on your sites read as a map of your weak spots. You get your own codesafe instance, not a shared tenancy: run for you by ovos in Vienna, or set up on your own infrastructure for larger organisations. The plugin itself is free and GPL-licensed.
+This plugin connects your WordPress site to [ovos codesafe](https://ovos.github.io/codesafe/), which works around the clock, end to end: it detects the attacks on your site and the errors in your code, shields against the attack pattern while the fix ships, and proves the fix held. Built for a time when AI writes the exploits. You get your own codesafe instance, not a shared tenancy: run for you by ovos in Vienna, or set up on your own infrastructure for larger organisations. The plugin itself is free and GPL-licensed.
 
 **Up to half of what a public WordPress site reports is not a bug.** It is automated traffic looking for a way in — `/wp-login.php`, `/wp-includes/ID3/file.php`, and a long tail of random filenames probing for a backdoor someone else already installed. On our own instances, not-found probes and refused logins are around 45–50% of everything reported. codesafe counts those apart from real errors so they never drown your bug list, folds them into attack waves by the address behind them, matches your installed plugins against a public vulnerability feed — so "vulnerable **and** being probed" is something you can see rather than guess — and, for a CVE with no patch out yet, drafts the exploit's request shape from the fix and lets this plugin shield the site until the update lands.
 
@@ -81,10 +81,6 @@ No. Every report is sent from the shutdown handler after the response went out, 
 = Is blocking safe? =
 
 codesafe blocks only what it can tell apart from honest traffic. A rule blocks at once only when two independent drafts of it agree on the request it targets and it is guarded the way the fix guards it: a capability every administrator holds, or for a forged request a nonce. Every other rule observes first and reports what it would have blocked. codesafe watches every blocking rule. One that refuses a share of the site's real visitors is switched back to observe automatically; one that refuses logged-in users or addresses with no attack history raises an alarm for a person. In codesafe a rule can be set to observe or off, for this site alone or everywhere, and the project's whole Shield to observe or off; the site follows with its next report. On the server, `CODESAFE_SHIELD_ENFORCE` set to false stops all blocking at the next request, and `CODESAFE_SHIELD_KILL` the whole Shield.
-
-= I run the old ovos-console plugin. How do I switch? =
-
-Install ovos codesafe beside it and activate it. Its settings are copied, the old plugin is deactivated on the next admin page, and `OVOS_CONSOLE_*` constants, `ovos_console()` and the old filter names keep working. If PHP's `auto_prepend_file` names `wp-content/ovos-console/prepend.php`, keep that file until you have pointed the directive at `wp-content/ovos-codesafe/codesafe-shield.php`; the plugin keeps it working meanwhile. Then delete ovos console under Plugins.
 
 = What leaves the site? =
 

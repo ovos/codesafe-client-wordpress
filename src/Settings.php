@@ -232,7 +232,7 @@ class Settings
 		
 		settings_fields('ovos_codesafe');
 		
-		echo '<h2>' . esc_html__('Console connection', 'ovos-codesafe') . '</h2>';
+		echo '<h2>' . esc_html__('codesafe connection', 'ovos-codesafe') . '</h2>';
 		echo '<p>' . esc_html__('Filled in by Connect above — or paste a codesafe project\'s keys here. PHP errors use the secret API key; browser errors use the public JS key — allowlist this site\'s origin in the project settings.', 'ovos-codesafe') . '</p>';
 		echo '<table class="form-table" role="presentation">';
 		
@@ -240,22 +240,22 @@ class Settings
 			__('Enabled', 'ovos-codesafe'),
 			__('Master switch for PHP and browser error reporting.', 'ovos-codesafe'));
 		$this->inputField('url',
-			__('Console URL', 'ovos-codesafe'), 'url', 'https://console.example');
+			__('codesafe URL', 'ovos-codesafe'), 'url', 'https://codesafe.example');
 		$this->inputField('api_key',
 			__('API key', 'ovos-codesafe'), 'password', '',
 			__('The project\'s secret api_key. Stored value is kept when left blank.', 'ovos-codesafe'));
 		$this->levelField();
 		$this->checkboxField('report_404',
 			__('Report 404s', 'ovos-codesafe'),
-			__('Report front-end not-found (404) requests as access events. Surfaces scanner and broken-link traffic in the console, grouped apart from real errors and never creating issues. Rate-limited, and static-asset 404s are ignored.', 'ovos-codesafe'));
+			__('Report front-end not-found (404) requests as access events. Surfaces scanner and broken-link traffic in codesafe, grouped apart from real errors and never creating issues. Rate-limited, and static-asset 404s are ignored.', 'ovos-codesafe'));
 		$this->apcuStatusRow();
 		$this->checkboxField('rollups',
 			__('Traffic rollups', 'ovos-codesafe'),
-			__('Send anonymous per-minute traffic counters (request totals split by status, method, resolved page type and logged-in state — never URLs or visitor data), so the console can read error and probe counts as rates. Requires the APCu PHP extension and the project\'s rollups switch in the console; without APCu nothing is collected or sent.', 'ovos-codesafe'));
+			__('Send anonymous per-minute traffic counters (request totals split by status, method, resolved page type and logged-in state — never URLs or visitor data), so codesafe can read error and probe counts as rates. Requires the APCu PHP extension and the project\'s rollups switch in codesafe; without APCu nothing is collected or sent.', 'ovos-codesafe'));
 		$this->rollupsRefusedRow();
 		$this->checkboxField('security_events',
 			__('Security events', 'ovos-codesafe'),
-			__('Report refused actions as security events, apart from errors: failed logins (any door — form, XML-RPC, application passwords, with the username masked), a login succeeding after recent failures (the credential-stuffing success; clean logins are never reported), rejected nonce checks, forbidden REST calls, and sensitive admin changes (user creation and role grants, plugin installs and activations, signup/site-URL/admin-e-mail option changes, file-editor saves, admin application passwords). Informational by default in the console — they feed its attack detection without raising alerts. Each kind has its own per-minute budget, so a flood of failed logins never silences a privilege grant or a Shield block; what goes over a budget is counted and sent as one summary event, and sensitive admin changes are never held back.', 'ovos-codesafe'));
+			__('Report refused actions as security events, apart from errors: failed logins (any door — form, XML-RPC, application passwords, with the username masked), a login succeeding after recent failures (the credential-stuffing success; clean logins are never reported), rejected nonce checks, forbidden REST calls, and sensitive admin changes (user creation and role grants, plugin installs and activations, signup/site-URL/admin-e-mail option changes, file-editor saves, admin application passwords). Informational by default in codesafe — they feed its attack detection without raising alerts. Each kind has its own per-minute budget, so a flood of failed logins never silences a privilege grant or a Shield block; what goes over a budget is counted and sent as one summary event, and sensitive admin changes are never held back.', 'ovos-codesafe'));
 		$this->checkboxField('auto_update_vulnerable',
 			__('Auto-update on codesafe\'s word', 'ovos-codesafe'),
 			__('codesafe may switch WordPress\' own automatic updates on and off: on automatically for a plugin, or WordPress itself, that is vulnerable AND being probed on this site (needs the project\'s AUTO-UPDATE switch in codesafe), on or off for anything an operator picks on the project\'s SOFTWARE list in codesafe — a plugin, a theme, or WordPress\' own minor releases. For WordPress itself that is minor releases only, even where WP_AUTO_UPDATE_CORE is false in wp-config.php — never a major release, and never past DISALLOW_FILE_MODS, AUTOMATIC_UPDATER_DISABLED or a version-controlled site — and off only withdraws codesafe\'s own override, never WordPress\' own setting; untick this box to stop both. The one virtual patch WordPress supports natively; every switch-on and switch-off is reported as a security event naming why. Nothing is downgraded, deactivated or deleted, and nothing is installed by this plugin — WordPress updates from wordpress.org or the plugin\'s own update server on its own schedule, twice a day.', 'ovos-codesafe'));
@@ -272,10 +272,10 @@ class Settings
 			__('Optional deploy label (git sha, version), max 64 characters.', 'ovos-codesafe'));
 		$this->inputField('environment',
 			__('Environment', 'ovos-codesafe'), 'text', '',
-			__('Deployment stage sent with every report. Left blank, WordPress\' own environment type (WP_ENVIRONMENT_TYPE) is sent — the console shows non-production values as a badge beside the project name.', 'ovos-codesafe'));
+			__('Deployment stage sent with every report. Left blank, WordPress\' own environment type (WP_ENVIRONMENT_TYPE) is sent — codesafe shows non-production values as a badge beside the project name.', 'ovos-codesafe'));
 		$this->inputField('tags',
 			__('Tags', 'ovos-codesafe'), 'text', '',
-			__('Optional tags on every report (PHP and browser), comma-separated — a tenant, a region, a team: shop, eu, tenant:acme. Lowercase letters, digits and _ . : - only, up to 10; the console shows them in its TAGS column, one filter per tag. The CODESAFE_TAGS constant overrides this field.', 'ovos-codesafe'));
+			__('Optional tags on every report (PHP and browser), comma-separated — a tenant, a region, a team: shop, eu, tenant:acme. Lowercase letters, digits and _ . : - only, up to 10; codesafe shows them in its TAGS column, one filter per tag. The CODESAFE_TAGS constant overrides this field.', 'ovos-codesafe'));
 		$this->inputField('trusted_proxy_header',
 			__('Trusted proxy header', 'ovos-codesafe'), 'text', 'CF-Connecting-IP',
 			__('Only behind a proxy or CDN (Cloudflare, a load balancer): the header it names the visitor\'s address in — CF-Connecting-IP, X-Forwarded-For, X-Real-IP. Read ONLY when the request comes from one of the ranges below; otherwise, and when this is blank, the connecting address (REMOTE_ADDR) is the visitor, as before. Behind a proxy without this, every report, rate rule and offender score names the proxy instead of the visitor. CODESAFE_TRUSTED_PROXY_HEADER overrides this field.', 'ovos-codesafe'));
@@ -290,20 +290,20 @@ class Settings
 		
 		$this->checkboxField('js_enabled',
 			__('Report JavaScript errors', 'ovos-codesafe'),
-			__('Loads the bundled console-client.js on the front end.', 'ovos-codesafe'));
+			__('Loads the bundled codesafe-client.js on the front end.', 'ovos-codesafe'));
 		$this->inputField('js_key',
 			__('JS key', 'ovos-codesafe'), 'text', '',
 			__('The project\'s public js_key (distinct from the secret API key).', 'ovos-codesafe'));
 		$this->checkboxField('js_trace',
 			__('Trace correlation', 'ovos-codesafe'),
-			__('Send a W3C traceparent header on the page\'s same-origin fetch/XHR calls, so browser and PHP errors of the same request share a trace id in the console. Disable if a firewall or security plugin rejects the extra request header.', 'ovos-codesafe'));
+			__('Send a W3C traceparent header on the page\'s same-origin fetch/XHR calls, so browser and PHP errors of the same request share a trace id in codesafe. Disable if a firewall or security plugin rejects the extra request header.', 'ovos-codesafe'));
 		$this->requestBodyField();
 		$this->checkboxField('snapshot',
 			__('DOM snapshot', 'ovos-codesafe'),
-			__('Upload a masked DOM snapshot with the first error per page load (replay-lite), so the console shows the page the error happened on. Input values and scripts are stripped in the browser before upload; the page\'s text goes as it is — mark an area with data-codesafe-mask to blank it.', 'ovos-codesafe'));
+			__('Upload a masked DOM snapshot with the first error per page load (replay-lite), so codesafe shows the page the error happened on. Input values and scripts are stripped in the browser before upload; the page\'s text goes as it is — mark an area with data-codesafe-mask to blank it.', 'ovos-codesafe'));
 		$this->checkboxField('snapshot_styles',
 			__('Inline styles into snapshots', 'ovos-codesafe'),
-			__('Embeds the page\'s CSS so snapshots render styled in the console viewer.', 'ovos-codesafe'));
+			__('Embeds the page\'s CSS so snapshots render styled in codesafe.', 'ovos-codesafe'));
 		$this->checkboxField('js_admin',
 			__('Also load in wp-admin and on the login page', 'ovos-codesafe'),
 			'');
@@ -330,7 +330,7 @@ class Settings
 		}
 		else
 		{
-			echo '<p>' . esc_html__('Save an enabled configuration (console URL + API key) first, then send a test error.', 'ovos-codesafe') . '</p>';
+			echo '<p>' . esc_html__('Save an enabled configuration (codesafe URL + API key) first, then send a test error.', 'ovos-codesafe') . '</p>';
 		}
 		
 		$this->renderScanSection();
@@ -448,15 +448,15 @@ class Settings
 		[$class, $message] = match(true)
 		{
 			$status === 202 => ['notice-success',
-				__('Test error accepted by the console — it appears in the grid within a second.', 'ovos-codesafe')],
+				__('Test error accepted by codesafe — it appears in the grid within a second.', 'ovos-codesafe')],
 			$status === -1 => ['notice-warning',
-				__('Not configured — enable reporting and set the console URL and API key first.', 'ovos-codesafe')],
+				__('Not configured — enable reporting and set the codesafe URL and API key first.', 'ovos-codesafe')],
 			$status === 0 => ['notice-error',
-				__('Console unreachable — check the URL.', 'ovos-codesafe')],
+				__('codesafe unreachable — check the URL.', 'ovos-codesafe')],
 			$status === 401, $status === 403 => ['notice-error',
 				sprintf(
 					/* translators: %d: HTTP status code */
-					__('Console rejected the key (HTTP %d) — check the project API key.', 'ovos-codesafe'),
+					__('codesafe rejected the key (HTTP %d) — check the project API key.', 'ovos-codesafe'),
 					$status)],
 			default => ['notice-error',
 				sprintf(
@@ -685,7 +685,7 @@ class Settings
 	{
 		$this->checkboxField('entry_watch',
 			__('Executed-file watch', 'ovos-codesafe'),
-			__('With the prepend layer above active, record every PHP file this site runs that WordPress did not ship as an entry point — the dropped webshell, the moment it is used — and judge it on the site\'s next request against what wordpress.org shipped: a file nobody shipped becomes an integrity finding in the console (the INTEGRITY ledger, an INBOX case, the mail and chat digest, removal advice) plus one security event carrying the address that ran it. wp-admin\'s own entries come from the core checksum list, never from a pattern; a plugin\'s own endpoint hit directly is judged shipped once and never recorded again. Read-only: nothing is blocked, deleted or changed. The request that is the site (index.php) costs one string comparison; only a stranger writes.', 'ovos-codesafe'));
+			__('With the prepend layer above active, record every PHP file this site runs that WordPress did not ship as an entry point — the dropped webshell, the moment it is used — and judge it on the site\'s next request against what wordpress.org shipped: a file nobody shipped becomes an integrity finding in codesafe (the INTEGRITY ledger, an INBOX case, the mail and chat digest, removal advice) plus one security event carrying the address that ran it. wp-admin\'s own entries come from the core checksum list, never from a pattern; a plugin\'s own endpoint hit directly is judged shipped once and never recorded again. Read-only: nothing is blocked, deleted or changed. The request that is the site (index.php) costs one string comparison; only a stranger writes.', 'ovos-codesafe'));
 		if($this->entries === null || $this->config->entryWatch() === false)
 		{
 			return;
@@ -694,7 +694,7 @@ class Settings
 		$prepend = Shield\Adapter::prependStatus()['state'];
 		$line = match(true)
 		{
-			$status['enabled'] === false => __('inactive — the plugin is not connected to a console.', 'ovos-codesafe'),
+			$status['enabled'] === false => __('inactive — the plugin is not connected to codesafe.', 'ovos-codesafe'),
 			$prepend !== 'active' && $prepend !== 'legacy' => __('waiting for the layer — PHP does not prepend the stub yet, so nothing is recorded; paste one of the lines above.', 'ovos-codesafe'),
 			$status['exported'] === false => __('waiting for the wordpress.org core checksum list — the known wp-admin entries are written from it; until then nothing is recorded. Tried again a few minutes after every request.', 'ovos-codesafe'),
 			default => sprintf(
@@ -710,13 +710,13 @@ class Settings
 				__('Last finding: %1$s (%2$s, %3$s), last run %4$s%5$s.', 'ovos-codesafe'),
 				(string)($last['path'] ?? ''), (string)($last['tier'] ?? ''), (string)($last['detector'] ?? ''),
 				wp_date('Y-m-d H:i', (int)($last['at'] ?? 0)),
-				(int)($last['sent'] ?? 0) === 202 ? __(' — reported', 'ovos-codesafe') : __(' — the console did not take the report', 'ovos-codesafe'));
+				(int)($last['sent'] ?? 0) === 202 ? __(' — reported', 'ovos-codesafe') : __(' — codesafe did not take the report', 'ovos-codesafe'));
 		}
 		if($status['exported'] && is_array($status['refused']))
 		{
 			$line .= ' ' . sprintf(
 				/* translators: 1: the HTTP status, 2: when */
-				__('The console refused a report with %1$d at %2$s — is the project\'s file switch on?', 'ovos-codesafe'),
+				__('codesafe refused a report with %1$d at %2$s — is the project\'s file switch on?', 'ovos-codesafe'),
 				(int)($status['refused']['status'] ?? 0), wp_date('Y-m-d H:i', (int)($status['refused']['at'] ?? 0)));
 		}
 		echo '<tr><th scope="row">' . esc_html__('Executed files', 'ovos-codesafe') . '</th><td>'
@@ -795,7 +795,7 @@ class Settings
 	{
 		$this->checkboxField('scan',
 			__('Integrity scan', 'ovos-codesafe'),
-			__('Walk this site\'s files in the background for what nobody shipped — PHP under uploads, images that open with a PHP tag, files in the document root WordPress did not ship, .htaccess directives that make images execute, drop-ins without an installed plugin behind them — plus the site\'s hardening posture, and send the findings to the console. Read-only: nothing is ever deleted or changed. Half a second per request after the response went out, one full pass per interval. The Scan now button below works without this switch.', 'ovos-codesafe'));
+			__('Walk this site\'s files in the background for what nobody shipped — PHP under uploads, images that open with a PHP tag, files in the document root WordPress did not ship, .htaccess directives that make images execute, drop-ins without an installed plugin behind them — plus the site\'s hardening posture, and send the findings to codesafe. Read-only: nothing is ever deleted or changed. Half a second per request after the response went out, one full pass per interval. The Scan now button below works without this switch.', 'ovos-codesafe'));
 		
 		$locked = $this->config->isConstant('scan_interval');
 		$current = $this->config->scanInterval();
@@ -897,7 +897,7 @@ class Settings
 	protected function renderScanSection(): void
 	{
 		echo '<hr><h2>' . esc_html__('Integrity scan', 'ovos-codesafe') . '</h2>';
-		echo '<p>' . esc_html__('A read-only walk of this site\'s files for what nobody shipped: PHP under uploads, images that open with a PHP tag, files in the document root WordPress did not ship, hidden PHP, .htaccess and .user.ini directives that make other files execute or send visitors elsewhere, drop-ins and plugin data directories without their plugin — and the hardening posture the advice depends on. Results stay on this page and are sent to the console when one is connected. Nothing is ever deleted or changed; a finding is a place to look, not a verdict.', 'ovos-codesafe') . '</p>';
+		echo '<p>' . esc_html__('A read-only walk of this site\'s files for what nobody shipped: PHP under uploads, images that open with a PHP tag, files in the document root WordPress did not ship, hidden PHP, .htaccess and .user.ini directives that make other files execute or send visitors elsewhere, drop-ins and plugin data directories without their plugin — and the hardening posture the advice depends on. Results stay on this page and are sent to codesafe when it is connected. Nothing is ever deleted or changed; a finding is a place to look, not a verdict.', 'ovos-codesafe') . '</p>';
 		
 		$state = $this->runner->state();
 		
@@ -983,12 +983,12 @@ class Settings
 		
 		$delivery = match(true)
 		{
-			$sent === 202 => __('accepted by the console', 'ovos-codesafe'),
-			$sent === -1 => __('kept here only — no console configured', 'ovos-codesafe'),
-			$sent === 0 => __('console unreachable', 'ovos-codesafe'),
+			$sent === 202 => __('accepted by codesafe', 'ovos-codesafe'),
+			$sent === -1 => __('kept here only — codesafe is not configured', 'ovos-codesafe'),
+			$sent === 0 => __('codesafe unreachable', 'ovos-codesafe'),
 			default => sprintf(
 				/* translators: %d: HTTP status code */
-				__('console answered HTTP %d', 'ovos-codesafe'),
+				__('codesafe answered HTTP %d', 'ovos-codesafe'),
 				$sent),
 		};
 		
