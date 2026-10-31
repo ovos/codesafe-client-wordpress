@@ -16,7 +16,7 @@ This plugin reports errors from your WordPress site to [ovos codesafe](https://o
 
 **Up to half of what a public WordPress site reports is not a bug.** It is automated traffic looking for a way in — `/wp-login.php`, `/wp-includes/ID3/file.php`, and a long tail of random filenames probing for a backdoor someone else already installed. On our own instances, not-found probes and refused logins are around 45–50% of everything reported. codesafe counts those apart from real errors so they never drown your bug list, folds them into attack waves by the address behind them, matches your installed plugins against a public vulnerability feed — so "vulnerable **and** being probed" is something you can see rather than guess — and, for a CVE with no patch out yet, drafts the exploit's request shape from the fix and lets this plugin shield the site until the update lands.
 
-See it working first: the [live demo](https://console-demo.ovos.at/) is a public instance filled with synthetic errors, no login required.
+See it working first: the [live demo](https://codesafe-demo.ovos.at/) is a public instance filled with synthetic errors, no login required.
 
 What the plugin sends — every feature starts on, codesafe's project switches decide what it takes, and a box on the settings page (or a constant) switches one off for this site:
 

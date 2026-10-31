@@ -2,7 +2,7 @@
 declare(strict_types=1);
 /**
  * Plugin Name: ovos codesafe
- * Description: Connects this site to an ovos codesafe instance — PHP and browser JavaScript errors, with grouping, alerting and issue lifecycle handled by the console.
+ * Description: From the first threat to the verified patch. Connects this site to your ovos codesafe instance: sends its PHP and JavaScript errors, failed logins and attack probes, scans for files nobody shipped, and judges each request against codesafe's Shield rules before your plugins run.
  * Version: 1.0.1
  * Requires at least: 6.0
  * Requires PHP: 8.3

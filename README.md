@@ -1,10 +1,12 @@
 <p align="center">
-	<img src="docs/header.png" alt="ovos codesafe — the WordPress client: from the first error to the verified fix" width="940">
+	<img src="docs/header.png" alt="ovos codesafe — the WordPress client: from the first threat to the verified patch" width="940">
 </p>
 
 # ovos codesafe — error monitoring and cyberdefence for WordPress
 
-This plugin sends a WordPress site's PHP errors, JavaScript errors, failed logins and scanner probes to [ovos codesafe](https://ovos.github.io/codesafe/), which ranks what broke, proposes the fix, and reads the attacks on your site as a map of your weak spots. You get **your own codesafe instance** — run for you by ovos, or set up on your own infrastructure for larger organisations. **The plugin is the client, and it is free** — GPL-2.0, no telemetry of its own. [Talk to us](#talk-to-us) about getting an instance, or [try the live demo](https://console-demo.ovos.at/) first.
+[ovos codesafe](https://ovos.github.io/codesafe/) works around the clock, end to end: it detects the attacks on your site and the errors in your code, shields against the attack pattern while the fix ships, and proves the fix held. Built for a time when AI writes the exploits.
+
+This plugin sends a WordPress site's PHP errors, JavaScript errors, failed logins and scanner probes to codesafe, and judges each request against codesafe's Shield rules before your plugins run. You get **your own codesafe instance** — run for you by ovos, or set up on your own infrastructure for larger organisations. **The plugin is the client, and it is free** — GPL-2.0, no telemetry of its own. [Talk to us](#talk-to-us) about getting an instance, or [try the live demo](https://codesafe-demo.ovos.at/) first.
 
 **Roughly half of what a public WordPress site reports is not a bug** — it is scanners looking for a way in. codesafe counts those apart from real errors, folds them into attack waves, matches your installed plugins against the vulnerability feeds so "vulnerable **and** being probed" is something you see rather than guess, and, for a CVE with no patch out yet, lets this plugin **shield** the site against the exploit's request shape until the update lands.
 
@@ -185,10 +187,10 @@ The plugin was called `ovos-console` before 1.0.0. WordPress treats the new dire
 ## What codesafe does with it
 
 <p align="center">
-	<a href="https://console-demo.ovos.at/"><img src="docs/errors.png" alt="The ovos codesafe ERRORS grid: live PHP, JavaScript, Node, Python, security and 404 events from several sites with project, priority, message, URI and occurrence counts, and scanner probes from 31 addresses folded into one attack series" width="940"></a>
+	<a href="https://codesafe-demo.ovos.at/"><img src="docs/ops.png" alt="OPS, codesafe's landing view: the attacks in progress, the AI's latest checks, the open vulnerabilities, the fleet and Shield lines with what each site blocked, and the INBOX of cases ranked by attention" width="940"></a>
 </p>
 
-**[Try the live demo →](https://console-demo.ovos.at/)** — a public instance filled with synthetic errors, no login. One codesafe for everything you run:
+**[Try the live demo →](https://codesafe-demo.ovos.at/)** — a public instance filled with synthetic errors, no login. One codesafe for everything you run:
 
 - **Issues, not noise** — the same error a thousand times is one row with a count and an open → resolved → regressed lifecycle; a failed browser request and the PHP error behind it share one trace id.
 - **OPS** — the INBOX, one list of what needs a person now, across issues, attack campaigns, probed CVE findings, files nobody shipped, late monitors, releases and the Shield's alarms, most urgent first, each with its one ready action.
@@ -196,6 +198,19 @@ The plugin was called `ovos-console` before 1.0.0. WordPress treats the new dire
 - **Releases and performance** — a release compared against the one before it; response-time trends from the rollups.
 - **Alerting** — throttled mail and chat per project; policies that notify, ticket or assign by themselves.
 - **Ask your AI** — point Claude or any MCP client at codesafe, or hit `◇ AI EXPLAIN` on a row for a root-cause read.
+
+What this plugin's reports turn into, from the demo:
+
+<table>
+	<tr>
+		<td width="50%" valign="top"><a href="docs/threats.png"><img src="docs/threats.png" alt="SECURITY, THREATS: today's and yesterday's attack waves, each with its project, address, attention, the attack shapes it tried, its events and paths, and its first and last hit" width="440"></a><br><b>THREATS</b> — today's attack waves: who, against which site, and what each one tried.</td>
+		<td width="50%" valign="top"><a href="docs/vulnerabilities.png"><img src="docs/vulnerabilities.png" alt="SECURITY, VULNERABILITIES: known vulnerabilities in the plugins and libraries the sites run, with the installed and patched versions, the weakness and the probes already aimed at them" width="440"></a><br><b>VULNERABILITIES</b> — known holes in the software you run, and who is already probing them.</td>
+	</tr>
+	<tr>
+		<td width="50%" valign="top"><a href="docs/shield.png"><img src="docs/shield.png" alt="SECURITY, SHIELD: the live rules every site pulls, each with its project, mode, hits over the hour, the day and its lifetime, and a note on why it exists" width="440"></a><br><b>SHIELD</b> — the rules your sites pull, what each one blocked, and why it is there.</td>
+		<td width="50%" valign="top"><a href="docs/integrity.png"><img src="docs/integrity.png" alt="SECURITY, INTEGRITY: files that should not be there — PHP under uploads, a drop-in no plugin installed, code hidden in a media file — each with its site, severity and attention" width="440"></a><br><b>INTEGRITY</b> — files that should not be there: a shell under uploads, a drop-in nobody installed.</td>
+	</tr>
+</table>
 
 Your own instance, not a shared tenancy — run for you by ovos in Vienna, or on your own infrastructure when the data has to stay there. More on the [product page](https://ovos.github.io/codesafe/).
 
@@ -257,7 +272,7 @@ codesafe is built and run by [ovos](https://ovos.at/) in Vienna. We use it on ou
 
 - **Questions about the plugin, or a bug in it** — open an [issue](https://github.com/ovos/codesafe-client-wordpress/issues).
 - **Want codesafe for your sites?** Write to **[office@ovos.at](mailto:office@ovos.at)**. You get your own instance: we run it for you, or for larger organisations we set one up on your own infrastructure. Happy to just answer whether it fits what you have.
-- **Try it first** — the [live demo](https://console-demo.ovos.at/) needs no login.
+- **Try it first** — the [live demo](https://codesafe-demo.ovos.at/) needs no login.
 
 ## License
 
