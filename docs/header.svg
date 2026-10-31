@@ -40,7 +40,7 @@
 	<g stroke="#1b4450" stroke-width="1">
 		<line x1="119" y1="15" x2="119" y2="30"/><line x1="306" y1="35" x2="306" y2="52"/>
 		<line x1="470" y1="22" x2="470" y2="54"/><line x1="741" y1="25" x2="741" y2="54"/>
-		<line x1="215" y1="168" x2="215" y2="180"/><line x1="402" y1="197" x2="402" y2="222"/>
+		<line x1="215" y1="168" x2="215" y2="180"/><line x1="508" y1="197" x2="508" y2="222"/>
 		<line x1="566" y1="168" x2="566" y2="188"/><line x1="835" y1="190" x2="835" y2="200"/>
 	</g>
 	<line x1="640" y1="49" x2="640" y2="74" stroke="#ff003c" stroke-width="1.5" opacity="0.75"/>
@@ -56,12 +56,12 @@
 	<text x="333.0" y="81" text-anchor="middle" class="display" font-size="11" font-weight="600" letter-spacing="3.6" fill="#8b8ba7">WORDPRESS</text>
 
 	<!-- the claim -->
-	<text x="41" y="134" class="display" font-size="25.5" font-weight="600" fill="#e8e8f0">From the first error</text>
-	<text x="41" y="164" class="display" font-size="25.5" font-weight="600" fill="#e8e8f0">to the <tspan fill="#00f0ff">verified fix</tspan>.</text>
+	<text x="41" y="134" class="display" font-size="25.5" font-weight="600" fill="#e8e8f0">From the first threat</text>
+	<text x="41" y="164" class="display" font-size="25.5" font-weight="600" fill="#e8e8f0">to the <tspan fill="#00f0ff">verified patch</tspan>.</text>
 
 	<rect x="41" y="185" width="440" height="1" fill="url(#rule)"/>
 
-	<text x="41" y="211" class="display" font-size="13.5" font-weight="600" fill="#d8d8e4">Error monitoring and cyberdefence, built for the AI era.</text>
+	<text x="41" y="211" class="display" font-size="13.5" font-weight="600" fill="#d8d8e4">Cyberdefence and error monitoring, built for a time when AI writes the exploits.</text>
 	<text x="41" y="235" class="mono" font-size="10.5" fill="#7c7c98">php errors · browser js · 404 probes · security events · inventory · traffic</text>
 
 	<!-- the loop, as a maker's mark -->
