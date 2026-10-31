@@ -99,7 +99,7 @@ and **not** in GitHub:
 be677491f280143fa438947ae531e8dd72a1d9ae51b2d8cb21f1e7d404d4a8f0
 ```
 
-Both are also published in the console repository's `docs/DEPLOY.md` — a place
+Both are also published in the codesafe repository's `docs/deploy.md` — a place
 this repository cannot edit. If `PUBLIC_KEY` in a future version differs from
 what is published there, something is wrong and the release should not be
 trusted until it is explained.

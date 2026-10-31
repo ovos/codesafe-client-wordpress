@@ -15,7 +15,7 @@
  *
  * Loading async (recommended — a slow or unreachable codesafe then never
  * blocks the page): emit the pre-init stub inline BEFORE the async script
- * tag (canonical snippet in docs/CLIENT.md). The stub buffers window
+ * tag (canonical snippet in docs/public/browser.md). The stub buffers window
  * error/unhandledrejection events (capture phase, so resource failures are
  * seen too), records the init() options and queues manual
  * captureException/captureMessage calls while this file is in flight; on
@@ -173,7 +173,7 @@
 	var SCRUB_PATH = /(\/)([A-Za-z0-9_.-]{20,})(?=[/?#]|$)/g;
 	// E-mail addresses and usernames are NOT masked here:
 	// codesafe masks them on arrival and keeps the original in its identity
-	// vault for an audited reveal (Error\Originals) — a value masked in the
+	// vault for an audited reveal (Event\Originals) — a value masked in the
 	// browser could never be revealed. This client redacts SECRETS only.
 	/* scrubBag's bounds: keys per object — the server keeps 100 too
 		(Scrubber::MAX_ITEMS) — and objects per bag */
@@ -300,7 +300,7 @@
 		}
 		
 		// capped here too: stubs printed before the snippet capped its
-		// calls (docs/CLIENT.md) queue every manual capture, unbounded
+		// calls (docs/public/browser.md) queue every manual capture, unbounded
 		for (i = 0; calls && i < calls.length && i < STUB_MAX; i++) {
 			var call = calls[i];
 			if (call && call[0] === 'captureMessage') {
@@ -587,7 +587,7 @@
 			// Playwright (and the AI browsing agents built on them) set it by
 			// default. Only ever sent as true: absence is the common case and
 			// claims nothing. codesafe lifts it into the indexed `flags`
-			// field (Codesafe\Error\Row), where the issue panel facets it.
+			// field (Codesafe\Event\Row), where the issue panel facets it.
 			if (navigator.webdriver === true) {
 				extra.webdriver = true;
 			}
@@ -1997,7 +1997,7 @@
 		try {
 			value = redactPairs(value, QUERY_PAIR);
 			// no e-mail or username masking: codesafe masks both on arrival
-			// and vaults the original (Scrubber::scrubUrl, Error\Originals)
+			// and vaults the original (Scrubber::scrubUrl, Event\Originals)
 			value = value.replace(SCRUB_PATH, function (match, slash, segment) {
 				return looksSecret(segment) ? slash + '[redacted]' : match;
 			});
@@ -2732,7 +2732,7 @@
 		return;
 	}
 	
-	// Async-loader stub takeover (docs/CLIENT.md): when a page loaded this
+	// Async-loader stub takeover (docs/public/browser.md): when a page loaded this
 	// file async, an inline stub is already on ovosCodesafe (or ovosConsole) — buffering
 	// events and holding the init() options. Detach its blind listeners,
 	// publish the real API over the shim, then init with the recorded

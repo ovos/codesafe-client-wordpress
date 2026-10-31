@@ -694,14 +694,14 @@ it names with other bytes is no verdict, since a bundled plugin or theme
 updates on its own: the table decides.
 
 Executed is a stronger fact than present: where the scan says *high* for a
-plugin's foreign file, this proposes *urgent*. The console decides, as it does
+plugin's foreign file, this proposes *urgent*. codesafe decides, as it does
 for every scan tier.
 
 What is sent: the findings ride the integrity-scan report (`POST
 /api/v1/ingest/files`, `scan.mode: entry`, never complete — it saw a queue,
-not the tree, so the console's ledger never reads a missing path as gone from
+not the tree, so codesafe's ledger never reads a missing path as gone from
 it) with the path, size, mtime and a line like *executed 4× · first 25.09.
-03:12 · last 25.09. 03:14 UTC · from 203.0.113.9 · GET*. The console's INTEGRITY
+03:12 · last 25.09. 03:14 UTC · from 203.0.113.9 · GET*. codesafe's INTEGRITY
 ledger, INBOX case, mail and chat digest, removal advice and it-came-back
 logic are the scan's. Beside it, **one security event per foreign file**
 (kind `file_executed`, `extra.source` uploads or unknown, `extra.file`,
@@ -712,8 +712,8 @@ joins the attack waves. Info rows are listed, not scored.
 
 Consent: the *Executed-file watch* box (on by default — pointing PHP at the
 stub is already the operator's deliberate act, and the watch only reads), or
-`CODESAFE_ENTRY_WATCH` in wp-config.php; the plugin must be connected to a
-console, and the console project's file switch must be on for the report to
+`CODESAFE_ENTRY_WATCH` in wp-config.php; the plugin must be connected to
+codesafe, and the project's file switch in codesafe must be on for the report to
 be taken. The Shield's boxes and kill constant do not gate it. **Nothing is
 blocked, deleted or changed**: a finding is a place to look, and the request
 it came from was served as it would have been.
@@ -863,15 +863,15 @@ default), the plugin reports:
   rewritten, with the deactivating admin's account; a saved settings page
   sends `sensor_settings` naming the keys that changed and the switches that
   went off or on — **names only, never a value**: not the URL, not the key,
-  not an address. A site pointed at another console tells the console it is
-  leaving first, synchronously, with the key that console knew. Both go out
+  not an address. A site pointed at another codesafe tells the old one it is
+  leaving first, synchronously, with the key that one knew. Both go out
   whatever the *Security events* box says (they are about this plugin, not the
   site), and neither becomes an issue: codesafe opens a **sensor case** on its
   INBOX for the project and closes it when the plugin says hello again — the
   goodbye keeps that request's own hello quiet, and the activation hook makes
   the first request after a reactivation say hello at once; a plugin update
   deactivates and reactivates silently, with neither word. The hello itself
-  is sent while the plugin is pointed at a console with a key, even with the
+  is sent while the plugin is pointed at codesafe with a key, even with the
   enabled box unticked or `CODESAFE_ENABLED` false — it then says
   `errors: false`, so codesafe reads the switch-off instead of a day of
   silence. It names the site's host (`home_url`), so codesafe tells two

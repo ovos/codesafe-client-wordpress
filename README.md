@@ -2,18 +2,18 @@
 	<img src="docs/header.png" alt="ovos codesafe — the WordPress client: from the first threat to the verified patch" width="940">
 </p>
 
-# ovos codesafe — error monitoring and cyberdefence for WordPress
+# ovos codesafe for WordPress
 
 [ovos codesafe](https://ovos.github.io/codesafe/) works around the clock, end to end: it detects the attacks on your site and the errors in your code, shields against the attack pattern while the fix ships, and proves the fix held. Built for a time when AI writes the exploits.
 
-This plugin sends a WordPress site's PHP errors, JavaScript errors, failed logins and scanner probes to codesafe, and judges each request against codesafe's Shield rules before your plugins run. You get **your own codesafe instance** — run for you by ovos, or set up on your own infrastructure for larger organisations. **The plugin is the client, and it is free** — GPL-2.0, no telemetry of its own. [Talk to us](#talk-to-us) about getting an instance, or [try the live demo](https://codesafe-demo.ovos.at/) first.
+This plugin connects a WordPress site to codesafe. It judges each request against codesafe's Shield rules before your plugins run, and reports what the site sees: attack probes and failed logins, files nobody shipped, the plugins it runs, and the errors in its code. You get **your own codesafe instance** — run for you by ovos, or set up on your own infrastructure for larger organisations. **The plugin is the client, and it is free** — GPL-2.0, no telemetry of its own. [Talk to us](#talk-to-us) about getting an instance, or [try the live demo](https://codesafe-demo.ovos.at/) first.
 
 **Roughly half of what a public WordPress site reports is not a bug** — it is scanners looking for a way in. codesafe counts those apart from real errors, folds them into attack waves, matches your installed plugins against the vulnerability feeds so "vulnerable **and** being probed" is something you see rather than guess, and, for a CVE with no patch out yet, lets this plugin **shield** the site against the exploit's request shape until the update lands.
 
 ## Contents
 
 - [Requirements](#requirements) · [Quick start](#quick-start) · [Recommended settings](#recommended-settings) · [APCu](#apcu)
-- [Settings reference](#settings-reference) · [What leaves the site](#what-leaves-the-site-and-what-never-does) · [Updates](#updates) · [Coming from ovos-console](#coming-from-ovos-console) · [Troubleshooting](#troubleshooting)
+- [Settings reference](#settings-reference) · [What leaves the site](#what-leaves-the-site-and-what-never-does) · [Updates](#updates) · [Troubleshooting](#troubleshooting)
 - [What codesafe does with it](#what-codesafe-does-with-it) · [Advanced](#advanced) · [For developers](#for-developers) · [Talk to us](#talk-to-us)
 - The long version of every feature: [docs/FEATURES.md](docs/FEATURES.md)
 
@@ -106,7 +106,7 @@ Every value lives under **Settings → ovos codesafe**, or as a constant in `wp-
 | Setting | Constant | Default | |
 |---|---|---|---|
 | Enabled | `CODESAFE_ENABLED` | `false` | master switch for PHP and browser reporting |
-| Console URL | `CODESAFE_URL` | — | the codesafe instance's base URL, e.g. `https://codesafe.example`; http(s) only — the form saves any other scheme as no URL and the plugin's own connections speak nothing else; a private or loopback address works |
+| codesafe URL | `CODESAFE_URL` | — | the codesafe instance's base URL, e.g. `https://codesafe.example`; http(s) only — the form saves any other scheme as no URL and the plugin's own connections speak nothing else; a private or loopback address works |
 | API key | `CODESAFE_API_KEY` | — | the project's secret api_key (PHP errors) |
 | Log level | `CODESAFE_LOG_LEVEL` | `4` | send errors with syslog priority ≤ this (0 emergency … 7 debug) |
 | Report 404s | `CODESAFE_REPORT_404` | `true` | front-end not-found requests, REST routes and admin-ajax actions this site does not have, as access events — rate-limited, static assets ignored, never issues |
@@ -164,20 +164,10 @@ The full account, per feature, is in [docs/FEATURES.md](docs/FEATURES.md#what-ne
 
 The plugin updates itself from this repository through WordPress' own update flow: new versions appear under **Dashboard → Updates** and install like any directory plugin, one click or unattended (**Enable auto-updates** on the Plugins screen, or `wp plugin auto-updates enable ovos-codesafe`). **Every release is signed**, and the plugin verifies the signature before WordPress installs a byte; a package that does not verify is refused, a release without a signature is not offered. Details, and how to pin a version, in [docs/FEATURES.md](docs/FEATURES.md#automatic-signed-updates).
 
-## Coming from ovos-console
-
-The plugin was called `ovos-console` before 1.0.0. WordPress treats the new directory as a different plugin, so a site that runs `ovos-console` installs `ovos-codesafe` beside it and activates it. The rest happens by itself:
-
-- **Settings** are copied from the `ovos_console*` options on first load. The old rows stay until you delete the old plugin.
-- **The old plugin is deactivated** on the next admin page, so nothing is reported twice, and a notice says it can be deleted under Plugins.
-- **`OVOS_CONSOLE_*` constants** in wp-config.php keep working; `CODESAFE_*` wins where both are defined. The settings page names each old one it finds.
-- **`ovos_console()`** and the **`ovos_console_sslverify`** / **`ovos_console_sslverify_wporg`** filters keep working beside `ovos_codesafe()` and the `ovos_codesafe_*` filters.
-- **The Shield before WordPress:** if PHP's `auto_prepend_file` still names `wp-content/ovos-console/prepend.php`, that stub is rewritten to run this plugin, so the layer stays on. Point the directive at `wp-content/ovos-codesafe/codesafe-shield.php` when convenient, and do not delete the old file before you have: PHP fails every request whose prepend file is gone.
-
 ## Troubleshooting
 
-- **"Console unreachable — check the URL."** The site could not reach the instance: a typo in the URL, a firewall between the host and codesafe, or a self-signed certificate — see [Advanced](#advanced) for the TLS switch.
-- **"Console rejected the key."** The API key is not the project's api_key, or belongs to another project. Copy it again from the project in codesafe.
+- **"codesafe unreachable — check the URL."** The site could not reach the instance: a typo in the URL, a firewall between the host and codesafe, or a self-signed certificate — see [Advanced](#advanced) for the TLS switch.
+- **"codesafe rejected the key."** The API key is not the project's api_key, or belongs to another project. Copy it again from the project in codesafe.
 - **Browser errors do not arrive.** *Report JavaScript errors* on, the **JS key** set, JS errors switched on for the project, and this site's exact origin (`https://www.example.com`, no path) in the project's JS origins.
 - **Traffic rollups show nothing.** The APCu line above the switch says *NOT available*, or the project's rollups switch in codesafe is off — the page then says so under the box, and the site asks again every hour. Cached pages served before WordPress boots are never counted, by design.
 - **No CVE findings.** The inventory needs the project's CVE switch in codesafe (on by default) and no `CODESAFE_INVENTORY` set to `false`; the first report goes out at the first request after the plugin is connected, and the matching runs nightly.
@@ -186,7 +176,7 @@ The plugin was called `ovos-console` before 1.0.0. WordPress treats the new dire
 
 ## What codesafe does with it
 
-**[Try the live demo →](https://codesafe-demo.ovos.at/)** — a public instance filled with synthetic errors, no login. The console's screens are on the [product page](https://ovos.github.io/codesafe/#screens). One codesafe for everything you run:
+**[Try the live demo →](https://codesafe-demo.ovos.at/)** — a public instance filled with synthetic errors, no login. codesafe's screens are on the [product page](https://ovos.github.io/codesafe/#screens). One codesafe for everything you run:
 
 - **Issues, not noise** — the same error a thousand times is one row with a count and an open → resolved → regressed lifecycle; a failed browser request and the PHP error behind it share one trace id.
 - **OPS** — the INBOX, one list of what needs a person now, across issues, attack campaigns, probed CVE findings, files nobody shipped, late monitors, releases and the Shield's alarms, most urgent first, each with its one ready action.
@@ -228,9 +218,25 @@ auto_prepend_file = "/var/www/site/wp-content/ovos-codesafe/codesafe-shield.php"
 php_value auto_prepend_file "/var/www/site/wp-content/ovos-codesafe/codesafe-shield.php"
 ```
 
-With it, every anonymous request is judged before WordPress exists. A request carrying a login cookie to a file WordPress runs through (`index.php`, `wp-login.php`, wp-admin's own pages …), or a REST request carrying Basic credentials (an application password, which WordPress checks only later), is judged here with its caller unknown: anyone can send a cookie by that name, and a plugin's own files run before `plugins_loaded`, so a block that refuses whoever asks — a match rule, a virtual patch for anyone — refuses it here; everything else waits for `plugins_loaded`, which judges the request whole, with its user. A REST request with a token another plugin reads (Bearer, JWT, OAuth) and an XML-RPC call are judged here by the rules for anyone, while the rules for anonymous visitors or a capability wait until WordPress has signed the caller in and are judged then. WordPress's installer pages (`wp-admin/install.php`, `upgrade.php`, `setup-config.php`, and `wp-activate.php`) load no plugins, so this layer judges them whole, as it does anywhere else — a direct hit on a plugin's file — cookie or not. The stub is outside the plugin directory and includes the plugin only if it is still there, so removing the plugin never leaves PHP with a missing prepend file; the layer fails open on everything; the settings page says *ACTIVE* once PHP reports the directive. The stub's name says what it is, as Wordfence's `wordfence-waf.php` does; a directive that still names the plugin's earlier stub, `wp-content/ovos-codesafe/prepend.php`, keeps working — the plugin keeps that file current and never deletes it by itself, the settings page asks once for the new line, and you remove the old file once no directory's PHP configuration names it. Before any rule, the layer refuses every PHP file run from WordPress's update working directories (`wp-content/upgrade/`, `upgrade-temp-backup/`), which the updater never requests over HTTP. The plugin never edits your server configuration; the only `.htaccess` files it writes outside its store deny those two directories while WordPress updates (WordPress 6.4 and later, which have the `pre_unzip_file` hook) — layer or not, on every server but nginx, IIS and Caddy, which ignore them; OpenLiteSpeed reads a new `.htaccess` only after a restart unless its auto-load is on. Every file in the store begins with a PHP `exit` and the ruleset's file name is random, so a server that ignores `.htaccess` (nginx, IIS) serves nothing from it — the settings page warns there, and `CODESAFE_STORE_DIR` moves the data out of the document root. **Deactivating** the plugin switches the layer off through its consent file; **uninstalling** removes the store, leaving the stubs in place (doing nothing) while PHP names either of them or the configuration cannot be read, since another directory's `php.ini` or `.user.ini` may name the other — remove the `auto_prepend_file` lines, then the directory. On a **multisite** network the Shield, the executed-file watch and the trusted proxy are one for every site — they share one store — so the watch and the proxy are set on the main site, by a super admin. Details in [docs/FEATURES.md](docs/FEATURES.md#the-shield).
+With it, every anonymous request is judged before WordPress exists. The settings page says *ACTIVE* once PHP reports the directive. Requests that are not plainly anonymous are judged in two steps:
 
-**The executed-file watch** rides the same layer (on by default while it is active; the *Executed-file watch* box or `CODESAFE_ENTRY_WATCH` switches it off): every PHP file the site runs that WordPress did not ship as an entry point is recorded the moment it runs — size, md5, the request's address — and judged on the next request against what wordpress.org shipped. A file nobody shipped becomes an integrity finding in the console, with one security event (`file_executed`) for the address that ran it. Details in [docs/FEATURES.md](docs/FEATURES.md#the-executed-file-watch).
+- **A login cookie or Basic credentials.** A request with a login cookie to a file WordPress runs through (`index.php`, `wp-login.php`, wp-admin's own pages …), or a REST request with Basic credentials (an application password, which WordPress checks only later), arrives with its caller unknown — anyone can send a cookie by that name. A plugin's own files run before `plugins_loaded`, so the blocks that refuse whoever asks (a match rule, a virtual patch for anyone) refuse it here. Everything else waits for `plugins_loaded`, which judges the request whole, with its user.
+- **A token or XML-RPC.** A REST request with a token another plugin reads (Bearer, JWT, OAuth) and an XML-RPC call meet the rules for anyone here. The rules for anonymous visitors or a capability wait until WordPress has signed the caller in.
+- **Pages that load no plugins.** WordPress's installer pages (`wp-admin/install.php`, `upgrade.php`, `setup-config.php`) and `wp-activate.php` are judged whole here, cookie or not, as is a direct hit on a plugin's file.
+- **Update directories.** Before any rule, the layer refuses every PHP file run from WordPress's update working directories (`wp-content/upgrade/`, `upgrade-temp-backup/`); the updater never requests them over HTTP.
+
+What the layer leaves on your server, and what it never touches:
+
+- **It fails open.** Any failure lets the request through. The stub sits outside the plugin directory and includes the plugin only while it is there, so removing the plugin never leaves PHP with a missing prepend file.
+- **The earlier stub.** The stub's name says what it is, as Wordfence's `wordfence-waf.php` does. A directive that still names the earlier stub, `wp-content/ovos-codesafe/prepend.php`, keeps working: the plugin keeps that file current and never deletes it by itself, and the settings page asks once for the new line. Remove the old file once no directory's PHP configuration names it.
+- **Your server configuration.** The plugin never edits it. The only `.htaccess` files it writes outside its store deny the two update directories while WordPress updates (WordPress 6.4 and later, which have the `pre_unzip_file` hook), with the layer or without it. nginx, IIS and Caddy ignore them; OpenLiteSpeed reads a new `.htaccess` only after a restart unless its auto-load is on.
+- **The store.** Every file in it begins with a PHP `exit` and the ruleset's file name is random, so a server that ignores `.htaccess` (nginx, IIS) serves nothing from it. The settings page warns there, and `CODESAFE_STORE_DIR` moves the data out of the document root.
+- **Deactivating and uninstalling.** Deactivating switches the layer off through its consent file. Uninstalling removes the store but leaves the stubs in place, doing nothing, while PHP names either of them or the configuration cannot be read — another directory's `php.ini` or `.user.ini` may name the other. Remove the `auto_prepend_file` lines, then the directory.
+- **Multisite.** The Shield, the executed-file watch and the trusted proxy are one for every site of a network, in one store, so a super admin sets the watch and the proxy on the main site.
+
+Details in [docs/FEATURES.md](docs/FEATURES.md#the-shield).
+
+**The executed-file watch** rides the same layer. It is on by default while the layer is active; the *Executed-file watch* box or `CODESAFE_ENTRY_WATCH` switches it off. Every PHP file the site runs that WordPress did not ship as an entry point is recorded the moment it runs (size, md5, the request's address) and checked on the next request against what wordpress.org shipped. A file nobody shipped becomes an integrity finding in codesafe, with one security event (`file_executed`) for the address that ran it. Details in [docs/FEATURES.md](docs/FEATURES.md#the-executed-file-watch).
 
 **Pinning or rolling back** to one version, for a fleet:
 
@@ -243,10 +249,9 @@ wp plugin install https://github.com/ovos/codesafe-client-wordpress/releases/dow
 ## For developers
 
 - The repository root **is** the plugin directory — junction or symlink it into `wp-content/plugins/ovos-codesafe`.
-- `assets/console-client.js` is a byte-identical copy of codesafe's browser client (intentionally ES5), and `src/Shield/Kernel.php` and `src/Shield/Wordpress.php` of its request-side kernel, the platform-neutral core and WordPress's module; all are synced from the console repository, never edited here. `Adapter.php` and `Prepend.php` require the module right after the core, by path, and hand it to every kernel and Facts they build. `Tests\Shield` holds both kernel files to php-library's copies (and to the console's `client-php/Shield.php` and `client-php/Shield/Wordpress.php` when a checkout is beside this one), checks that both layers read the module, and smokes a judge without WordPress.
-- Tests run on php-library's harness, the way the console's do, and on every push (`.github/workflows/tests.yml`, PHP 8.3–8.5): `cd ci && composer install && cp .env.tests .env && php cli.php tests run`. `ci/` is a test-only application and `tests/` holds the classes — the Updater's signed-update path, the Shield kernel and the prepend layer, and `Tests\Sanitizer`, which drives a WooCommerce checkout through the plugin's real request path so no password, cookie or nonce leaves the site raw. Neither directory ships in the release zip.
-- Two classes skip themselves unless pointed somewhere: `Tests\SanitizerStored` runs the same checkout through the console's own scrubbing (`OVOS_CONSOLE_PATH`, or `../console` beside this repository), and `Tests\WordPressLive` drives the signed update on a real WordPress with this plugin active (`OVOS_WP_PATH`).
-- The product is codesafe; the identifiers stay: the `ovos-codesafe` slug and directory, the text domain, the `CODESAFE_*` constants, the `ovos_codesafe_*` filters and the `ovos-codesafe.zip` asset every install URL and updater knows.
+- `assets/codesafe-client.js` is a byte-identical copy of codesafe's browser client, `project/public/js/codesafe-client.js` (intentionally ES5), and `src/Shield/Kernel.php` and `src/Shield/Wordpress.php` of its request-side kernel, the platform-neutral core and WordPress's module; all are synced from the codesafe repository, never edited here. `Adapter.php` and `Prepend.php` require the module right after the core, by path, and hand it to every kernel and Facts they build. `Tests\Shield` holds both kernel files to php-library's copies (and to codesafe's `client-php/Shield.php` and `client-php/Shield/Wordpress.php` when a checkout is beside this one), checks that both layers read the module, and smokes a judge without WordPress.
+- Tests run on php-library's harness, the way codesafe's do, and on every push (`.github/workflows/tests.yml`, PHP 8.3–8.5): `cd ci && composer install && cp .env.tests .env && php cli.php tests run`. `ci/` is a test-only application and `tests/` holds the classes — the Updater's signed-update path, the Shield kernel and the prepend layer, and `Tests\Sanitizer`, which drives a WooCommerce checkout through the plugin's real request path so no password, cookie or nonce leaves the site raw. Neither directory ships in the release zip.
+- Two classes skip themselves unless pointed somewhere: `Tests\SanitizerStored` runs the same checkout through codesafe's own scrubbing (`OVOS_CONSOLE_PATH`, or `../console` beside this repository), and `Tests\WordPressLive` drives the signed update on a real WordPress with this plugin active (`OVOS_WP_PATH`).
 - Releasing: [`docs/RELEASE.md`](docs/RELEASE.md) — the four version spots, the changelog, one `v*` tag; the workflow verifies, builds, signs and publishes.
 
 ## Talk to us
