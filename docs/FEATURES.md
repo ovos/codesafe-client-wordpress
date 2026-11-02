@@ -784,25 +784,40 @@ the plugin arrived, used once and left behind, does none of that. The integrity
 scan asks the tree directly.
 
 What it looks for, in a read-only walk (root → uploads → wp-content → plugins →
-core → themes, so an interrupted pass has already covered the urgent part):
+core → themes, so an interrupted pass has already covered the urgent part). The
+root is walked into its folders too, `wp-content/cache` is walked, and
+`wp-config.php` is read whole (all three bounded, below):
 
 | finding | tier | what it catches |
 |---------|------|-----------------|
-| executable-shaped file under uploads (`x.php`, `shell.php.jpg`, `.phtml`, `.phar`) | urgent | the classic drop — the `index.php` listing stubs plugins write there are recognised and skipped, judged by PHP's own tokenizer (a `//` comment ended by a bare CR, a `?>` inside a comment or a `#[` attribute line is code, not a stub); a known writer's data file with its plugin installed (Ultimate Addons' and ConvertPlug's `smile_fonts/*/charmap.php`, nothing in it but literal assignments) is listed as `uploads_php_owned` info |
+| executable-shaped file under uploads (`x.php`, `shell.php.jpg`, `.phtml`, `.phar`) | urgent | the classic drop — the `index.php` listing stubs plugins write there are recognised and skipped, judged by PHP's own tokenizer (a `//` comment ended by a bare CR, a `?>` inside a comment or a `#[` attribute line is code, not a stub); a known writer's data file with its plugin installed (Ultimate Addons' and ConvertPlug's `smile_fonts/*/charmap.php`, nothing in it but literal assignments), and a template WPML's Twig compiled into `cache/wpml/twig/` while WPML or WooCommerce Multilingual is installed (a class declared, nothing run when requested, no code shape in it), are listed as `uploads_php_owned` info |
 | media file whose first kilobyte carries a PHP opener (`<?php` in any case, `<?=`) whose code up to its closer PHP could compile (`.ico .jpg .png .gif .webp .bmp .pdf .svg`; `.txt .log .csv` under uploads) | urgent | the `favicon_a1b2.ico` family, the image behind an `AddHandler` — the `<?=` that compressed image data happens to contain, followed by a byte PHP refuses, is no opener |
 | PHP in the document root that is not one of core's own root files | urgent | `about.php`, `wp-conflg.php`; Wordfence's `wordfence-waf.php` and AIOS's `aios-bootstrap.php` are recognised when their plugin is installed |
 | `.htaccess` / `.user.ini` / `php.ini` directives: `auto_prepend_file` / `auto_append_file` to a file no installed plugin owns, `AddHandler`/`AddType` mapping PHP to another extension, `SetHandler` to PHP, `engine on` or CGI under uploads, `RewriteRule`/`Redirect`/`ErrorDocument` to another host | urgent / high | persistence, the polyglot's trigger, the redirect hack — reported as directive kind, file and line, never the line's text |
 | the live `auto_prepend_file` / `auto_append_file` of the PHP configuration | urgent | the `.user.ini` trick from the running interpreter's point of view |
 | PHP in a hidden path (`.x.php`, `.well-known/…`) | high | the hidden drop — dotfile tool configs in vendored packages are recognised |
-| PHP in `wp-content` outside any plugin, theme, mu-plugin or upload path | high | `wp-content/strange/s.php`; WordPress' own `.l10n.php` translations are recognised |
+| PHP in `wp-content` outside any plugin, theme, mu-plugin or upload path | high | `wp-content/strange/s.php`; WordPress' own `.l10n.php` translations are recognised while they return literals — a translation's name over code is a stranger too. A file there that only returns or assigns data — Breeze's `breeze-config/`, WP-Optimize's `wpo-cache/config/`, Cache Enabler's `settings/cache-enabler/`, each behind a guard — is `inert_php` (info) |
 | PHP under uploads or in `wp-content` that stops before any code runs: its first statement is `__halt_compiler()`, or an `exit` / `die` that is bare or takes a literal | info | `inert_php` — the data files plugins keep under PHP names (AIOS's firewall settings, a W3 Total Cache config); an exit after other code, a conditional one or `exit(system(…))` is no guard |
 | this plugin's own store (`wp-content/ovos-codesafe/`, the legacy `ovos-console/`, a `CODESAFE_STORE_DIR` inside `wp-content`) and its mu-plugin, held against what the plugin writes: the prepend stub and the mu-plugin byte for byte, the data files by their exit guard and JSON body | urgent / high | `store_modified` — urgent for the stub and the mu-plugin, which run on every request, high for a data file; verified files are silent and any other PHP in the store is a stranger |
-| a drop-in (`object-cache.php`, `advanced-cache.php`, `db.php`, `wp-cache-config.php`) with none of its known plugins installed and no vendor header | high | the shell disguised as a cache config — a drop-in with a vendor header or an installed owner is listed as `info` |
+| a drop-in (`object-cache.php`, `advanced-cache.php`, `db.php`, `wp-cache-config.php`, Autoptimize's `autoptimize_404_handler.php`) with none of its known plugins installed and no vendor header | high | the shell disguised as a cache config — a drop-in with a vendor header or an installed owner is listed as `info`, and read for the code shapes below all the same |
 | a plugin data directory (`wflogs`, `w3tc-config`, `updraft`, …) whose plugin is not installed | high | listed and never descended: the directory is the finding |
 | must-use plugins, drop-ins with an owner, `install.php` | info / high | listed for the operator (this plugin's own mu-plugin is verified instead); `install.php` on a live site is high |
 | **checksums** — a core file that differs from wordpress.org's list for this version, or a PHP file under `wp-admin/` / `wp-includes/` the list never had | urgent | the backdoored `wp-load.php`, the `class-wp-helper.php` nobody shipped — `core_modified` / `core_foreign` |
-| **checksums** — the same two verdicts inside a wp.org plugin's directory, against the plugin's own list for its installed version | high | `plugin_modified` / `plugin_foreign`; a file the list names under several md5s matches any of them; a premium or custom plugin has no list and is not judged, themes are never judged this way |
-| **database** — administrators (registration date, sessions, last login), application passwords on admins, active plugins whose file is gone, scheduled hooks nobody listens to, uninstall callables of gone plugins, options carrying code markers, foreign scripts / iframes / obfuscation in published content and widgets (posts and pages, plus the rows a block theme keeps its markup in: Site Editor templates and template parts, global styles, the Customizer's Additional CSS — none of them files), a site URL disagreeing with its constant, registration into a role above subscriber | info – high | the attacker's other filesystem; ids, option names and hook names only — never a login, an e-mail, a value or a post body |
+| **checksums** — the same two verdicts inside a wp.org plugin's directory, against the plugin's own list for its installed version | high | `plugin_modified` / `plugin_foreign`; a file the list names under several md5s matches any of them; a premium or custom plugin, a single-file plugin and every theme have no list and are read for the shapes below instead |
+| **where no list vouches** — request input fed to `eval`, `assert`, `create_function` or a shell command (`system`, `exec`, `passthru`, `shell_exec`, `proc_open`, `popen`, `pcntl_exec`, backticks); request input called as a function (`$_POST['f']($_POST['x'])`, in parentheses, past a comment), handed as the callable to a function that calls it (`call_user_func`, `array_map`, `usort`, `preg_replace_callback`, `register_shutdown_function`, `ob_start` …), or included; a runner a literal names or builds (`call_user_func('assert', $_POST['x'])`, `('sys' . 'tem')($_GET['c'])`) fed request input | urgent, high where an escaper, a sanitizer or a cast wraps the input (`escapeshellarg`, `sanitize_key`, `(int)` …) or the code dispatches on it through its own object or a literal prefix | `request_exec` — the one-line webshell, with or without the word `eval`. Request input is `$_GET`, `$_POST`, `$_REQUEST`, `$_COOKIE`, `$_FILES`, `$GLOBALS['_GET']` and its kin, the raw body (`php://input`), `getallheaders()`, `apache_request_headers()`, `filter_input()`, and of `$_SERVER` the request's own fields: the headers (`HTTP_*`), the query string, the URI, the path info, `PHP_SELF`, the content type, `argv` — `DOCUMENT_ROOT`, `SCRIPT_FILENAME` and `SCRIPT_NAME` are the server's. Read with PHP's tokenizer: `$this->assert(…)` is a method, a definition is no call, `array_map('absint', $_POST['ids'])` hands a sanitizer the input, and a closure the code writes is its own callable whatever its body reads (`array_map(fn($k) => $_GET[$k], $keys)`; what the body runs is read where it stands). A callback that runs its own parameter — a closure, an arrow function or a function the file defines, before or after the call, whose parameter reaches `eval`, a command, an include or a call of it — is a runner when request input stands in an argument its parameters come from: `array_map`'s arrays, `array_walk`'s, `usort`'s and `array_reduce`'s array, `preg_replace_callback`'s subject, `call_user_func`'s arguments (`array_map(function($x) { eval($x); }, $_POST)`); fed the code's own data, or input where no parameter comes from, it is nothing. In every PHP file no list vouches for: themes, premium, custom and single-file plugins, must-use plugins at every depth, drop-ins (with an owner too), folders of the document root, `wp-config.php`, core when its list is not at hand |
+| the same files: an `include` / `require` of a stream (`http://`, `ftp://`, `data:`, `expect://` …), of a file under uploads (`wp-content/uploads/`, the site's own uploads root, `wp_upload_dir()`) or in a temp directory (`/tmp`, `/var/tmp`, `/dev/shm`, PHP's temp and upload temp directories, `sys_get_temp_dir()`), of a media file (`.ico .jpg .png .gif .webp .bmp .pdf .txt .log .csv`) | urgent; high for a fixed `.php` file under uploads (a plugin's own config there), nothing for one in an uploads folder whose writer is installed | `include_foreign` — the `@include "\057…favicon_a1b2.ico";` loader; literals are read as PHP reads them, octal and hex escapes resolved, the file's name from the literals that end the expression however they are split, a subscript's key left out. `.svg` is left out (themes inline their icons by `include`), and so is `phar://` (vendored libraries' phar stubs include their own archive; an uploaded phar is named by its upload path or its extension). In `wp-config.php` anything under uploads is urgent |
+| the same files: a decoder's output (`base64_decode`, `gzinflate`, `gzuncompress`, `str_rot13` — the markers the option check uses — and `strrev`, `hex2bin`, `gzdecode`, `urldecode`, `rawurldecode`, `convert_uudecode`, `bzdecompress`) or a stream's content (`file_get_contents('data:…')`, an `http://` read) fed to any of those runners | high | `eval_chain` — the obfuscated or fetched payload |
+| in a theme, a premium plugin, a must-use plugin or a folder of the root: PHP that does something of its own when requested by URL, at any depth below a folder named for assets (`images`, `img`, `icons`, `fonts`, `css`, `scss`, `svg`, `audio`, `video`, `languages` …) that holds at least one image, font, style, script or translation | high | `asset_php` — the shell among a theme's images, or in a new folder below them. The folder's name alone is no proof (a PSR-4 `Css/` namespace, a view's `icons/`, a theme's `inc/css/` generators hold only PHP), and nothing runs from a stub, an exit first, a first statement that exits unless WordPress defined its constant (while that exit runs nothing itself: `exit(('sys'.'tem')(…))` is code), a first statement that calls a function only WordPress defines (`add_action()`: requested by URL, PHP stops there — unless the file defines or imports a function of that name itself, `function wp_boot() {…} wp_boot();`), returned literals (a build's `*.asset.php`, a `.l10n.php`, a table of strings through `__()` / `_n()`), or declarations alone (namespaces, classes, functions) |
+| in the same places: a file named like one of core's `wp-` entry files (`wp-login.php`, `wp-load.php`, `wp-settings.php` …) in a directory with no `wp-settings.php` and `wp-includes/version.php` beside it | high | `mimic_core` — the copy of `wp-login.php` in a theme; a WordPress install in a folder of the root keeps its own, known by those two files (two empty directories of the right names are no install). `xmlrpc.php` is left out: libraries name class files so |
+| a PHP file no list vouches for that is larger than 4 MiB | info | `oversize_php` — the first 4 MiB are read and judged, the rest is not, and the finding says so |
+| a file the scan died judging — a chunk ran out of memory or time on it | high | `scan_crash` — before a PHP file larger than 256 KB is judged its name alone is kept in an option of its own (`ovos_codesafe_scan_judging`: area, path, size — a small write, nothing of the pass) and dropped once the file is judged; the chunk after a dead one resumes the pass where the dead chunk began it, names the file, passes over it and walks on, so no file can stop the scan for good, and a chunk that dies on a later file blames none. The database's checks are named and passed over the same way (`checks` in the database area), and cleared once they ran. Read it by hand |
+| a call to a runner longer than the scan reads at once (32,768 tokens) whose verdict hangs on an argument's place — the callable of `array_map()`, `call_user_func()` and their kin — or a call on what a call returns, in a file that draws no other verdict | high | `oversize_call` — below that length a runner's call is never cut between the slices the tokenizer reads; past it `eval`, an include, a command and the decoders and sanitizers inside them are still judged by all their arguments, these alone cannot be. Read it by hand |
+| **`wp-config.php`** — the one WordPress loads: ABSPATH's own, else the one a level up unless a `wp-settings.php` stands beside it there (which WordPress then never loads) | urgent / high | the three code shapes above, each with its line: the include of an uploads or temp file or of an image, the remote include, `eval(gzinflate(base64_decode(…)))`, `eval($_SERVER['HTTP_X'])`. Read once per pass, first, before the root's files |
+| **`wp-content/cache`** — PHP that runs code where caches keep data | high | `cache_php`. What caches and template engines write there reads clean: an exit or a die first, after any header comment (WP Super Cache's pages, metas and debug log, LiteSpeed's guards), W3 Total Cache's four-byte expiry before its `<?php exit; ?>`, no PHP opener at all (W3 Total Cache's JSON blog map), returned literals, a compiled Twig, Blade or Smarty template by its compiler's own mark, and Docket Cache's object files and Autoptimize's gzip wrappers while their plugin is installed. The code shapes, polyglots, hidden PHP and `.htaccess` directives are reported there as anywhere; pages, styles and scripts are counted without being opened |
+| **database** — administrators (registration date, sessions, last login), application passwords on admins, active plugins whose file is gone, scheduled hooks nobody listens to, uninstall callables of gone plugins, options carrying code markers (every row but the ones this plugin writes, by their exact names — a row an intruder names `ovos_codesafe_…` is read like any other), foreign scripts / iframes / obfuscation in content and widgets (posts and pages, plus the rows a block theme keeps its markup in: Site Editor templates and template parts, global styles, the Customizer's Additional CSS, synced patterns and block-theme navigation menus — none of them files; published, draft, pending, private and scheduled alike, the status named in the detail; each pass reads first the rows the last pass reported, so a finding stays listed while it stands, then the 100 newest rows that carry a marker and 100 more onward by id from where the last pass stopped, so a row a site's embeds crowd out of the newest is read a few passes later), a site URL disagreeing with its constant, registration into a role above subscriber | info – high | the attacker's other filesystem; ids, option names and hook names only — never a login, an e-mail, a value or a post body |
+| **database** — a scheduled hook whose listener was defined in a file under uploads or `wp-content/cache` or in `eval()`'d code (urgent), or outside every installed component — core, an installed plugin (one with a Plugin Name header; a folder under `plugins/` none heads is nobody's), must-use plugins, themes in any registered theme directory, drop-ins, a Composer `vendor` tree (high) | urgent / high | `cron_listener_foreign` — the backdoor that schedules its own hook and listens to it, which the orphan check passes. Each listener is resolved by Reflection in every form WordPress takes (closure, function, `Class::method`, `[class, method]`, `[object, method]`, an invokable); a method only `__call` or `__callStatic` answers is judged by its class's file. Dated by the file |
+| **database** — a scheduled hook whose listener is one of PHP's own functions | urgent / high / info | `cron_listener_builtin` — urgent for `system()`, `exec()`, `assert()` and their kin, high for one that calls what it is handed, writes a file or rebuilds objects (`call_user_func`, `file_put_contents`, `unserialize` …), info for any other |
+| **database** — a scheduled hook whose listener names nothing PHP can find | info | `cron_listener_unresolved` — WordPress fails on it when the event runs, and nothing says whose it is |
 | a directory under uploads or in the root that changed after its newest file | info | something was removed or renamed here recently — dated, so codesafe can hold it against the waves |
 | a file owned by another uid than its siblings; a symlink leaving the site | high | the web server writing among the deploy user's files; the symlink attack (silent on Windows and single-uid hosting) |
 
@@ -841,15 +856,80 @@ can be acted on without disclosing anything private: `users/<id>` with the regis
 date (codesafe holds it against the attack waves of the same hours —
 *admin #57 was registered forty seconds after 27.0.113.86 stopped probing*),
 `options/<name>` with the length and the marker, `options/cron/<hook>` with
-its schedule and next run in the detail and no date (a next run is no write),
-`posts/<id>` with the foreign host.
+its schedule and next run in the detail and no date (a next run is no write) —
+or, for a foreign listener, the listener's file in the detail and that file's
+date — and `posts/<id>` with the foreign host. Leftover hooks and foreign
+listeners keep twenty findings each, and so does every other database
+check; what a cap leaves out is counted in `scan.truncated`, never dropped
+unsaid. A `..` in a name an intruder chose (a
+hook, an active-plugin entry) is written `%2E%2E`: codesafe refuses a whole
+report over one path with a `..` segment.
+
+The walks that could grow without end are bounded per pass. The root's
+folders: six levels below the root and 20,000 names — enough for the
+`images/x.php` or `.well-known/x.php` a shell is dropped as, not for the whole
+of a second application in a folder; `wp-admin`, `wp-includes`, `wp-content`
+and the plugin, theme, upload and must-use roots wherever they stand are left
+to their own phases, `.git` and `node_modules` are skipped, and core's list
+and the dated-directory check speak for the root's top alone. The cache:
+sixteen levels and 50,000 names, a page cache mirroring its URLs; only
+PHP-named, media and directive files are opened. A bounded walk reads its
+directories in name order and a pass that runs out of names hands the next
+pass the last name it read: the next pass lists what came before it again,
+reads nothing of it, and goes on from there, so a cache larger than one pass
+is read across passes (a walk that reaches its end, or whose place has gone
+since, starts over). The stop is named first in `scan.skipped`, and the
+report's `scan.bounded` says per walk what was read (`read`, `limit`, `depth`,
+`deep` — the directories past the depth), where the pass began (`from`) and
+where the next one will (`next`, empty when the walk reached its end). The
+files and links an earlier pass found something in, in a part of a bounded
+walk this pass does not reach, are read again before the database
+(`scan.rechecked` counts them), so every report carries every finding it
+knows and codesafe can take what a complete report leaves out for gone: a
+file gone or cleaned since drops out, one still there stays listed. A chunk
+keeps to its time between files as between directories. A PHP file no list
+vouches for is read up to 4 MiB, tokenized only when an unrolled pattern
+says a shape could be in it — a pattern PCRE cannot finish reads as a yes —
+and then in slices of 32 KB cut at a statement's end, never inside a string
+and never inside a runner's call or an include below 32,768 tokens, so a
+dense file never becomes one token array (a 1 MB dense file peaks near
+14 MB) and a call is never split from its arguments.
+
+When the report is full (200 findings), a finding outranks the last listed
+one of a lower tier, which is counted in `scan.truncated` in its place: an
+urgent file is never lost behind a folder of high ones. Every area of the
+report says how many of its own findings were made and not listed
+(`truncated`, 0 included) — what the report's cap gave up where it stood,
+and the database's caps for the database — so the per-area counts add up
+to `scan.truncated`'s tiers and codesafe can judge gone area by area. The pass in progress,
+the name of the file it is judging, the resume points and the cached checksum lists are kept in
+the options table and share its trust: whoever can write there can also read
+the API key a seal would be made with — and any core or plugin file a planted
+list could hide is one only code running as the site can write — so they are
+not sealed.
 
 What it never does: write, delete, rename, quarantine or touch `.htaccess`;
-follow a symlink; descend into `.git`, `node_modules`, `wp-content/cache` or
-`wp-content/upgrade`; read more than the first kilobyte of a media file,
-64 KB of a directive file or 256 KB of a PHP file judged as data; send a
-file's content. Findings are paths, sizes
-and dates. A finding is a place to look, not a verdict.
+follow a symlink; descend into `.git`, `node_modules` or `wp-content/upgrade`;
+read more than the first kilobyte of a media file, 64 KB of a directive file,
+256 KB of a PHP file judged as data under uploads or 4 MiB of a PHP file no
+list vouches for; send a file's content. Findings are paths, sizes and dates.
+A finding is a place to look, not a verdict.
+
+What it still does not read: the part of a PHP file past its first 4 MiB
+(named, oversize_php); what lies past a walk's depth (counted in
+`scan.bounded`); core's upgrade staging; `.inc` files in packages and folders
+of the root (they run only when included, and vendored code sniffers ship
+their bad-code fixtures under that extension); request input that reaches its
+runner through a variable, or a runner's name built at run time
+(`extract($_REQUEST); eval($code);`, `$f = 'assert'; $f($_POST['x'])`: the
+shapes are what one expression says); a file whose date was set back to its
+siblings' (droppers copy a neighbour's time, and honest deploys and editors
+leave a package's dates apart, so no date-based finding is drawn); a PHP file
+nothing includes (autoloaders reach any file under `src/`); trash, revisions,
+auto-drafts and content types other than the ones above; the network's own
+options on a multisite. A compiled template or a cache writer's file is read
+for its shapes, never judged a stranger, and a cached checksum list is trusted
+for its month (see above).
 
 **Scan now** — the button under Settings → ovos codesafe → Integrity scan. Each
 round spends up to fifteen seconds (always five short of `max_execution_time`)

@@ -4,12 +4,24 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use Closure;
+use Generator;
 use Ovos\Codesafe\Shield\Adapter;
 use Ovos\Codesafe\Shield\Prepend;
 
 use function apply_filters;
+use function array_diff;
 use function array_filter;
+use function array_flip;
+use function array_intersect;
+use function array_key_exists;
+use function array_keys;
 use function array_pop;
+use function array_search;
+use function array_slice;
+use function array_splice;
+use function array_sum;
+use function array_unshift;
 use function array_unique;
 use function array_values;
 use function basename;
@@ -19,10 +31,12 @@ use function count;
 use function defined;
 use function did_action;
 use function dirname;
+use function end;
 use function explode;
 use function fclose;
 use function file_get_contents;
 use function fileperms;
+use function filesize;
 use function fopen;
 use function fread;
 use function function_exists;
@@ -48,11 +62,14 @@ use function is_link;
 use function is_multisite;
 use function is_string;
 use function json_validate;
+use function ltrim;
 use function max;
 use function md5_file;
 use function method_exists;
 use function microtime;
+use function min;
 use function preg_match;
+use function preg_quote;
 use function preg_replace;
 use function preg_split;
 use function random_bytes;
@@ -62,15 +79,20 @@ use function round;
 use function rtrim;
 use function sanitize_text_field;
 use function scandir;
+use function sort;
 use function stat;
 use function str_contains;
 use function str_replace;
 use function str_starts_with;
+use function stripcslashes;
 use function strlen;
 use function strpos;
+use function substr_count;
 use function strrpos;
 use function strtolower;
+use function strtr;
 use function substr;
+use function sys_get_temp_dir;
 use function time;
 use function token_get_all;
 use function trim;
@@ -83,25 +105,88 @@ use function wp_unslash;
 
 use const ABSPATH;
 use const DIRECTORY_SEPARATOR;
+use const PHP_FLOAT_MAX;
+use const PHP_INT_MAX;
 use const PHP_URL_HOST;
 use const PHP_VERSION;
 use const PREG_OFFSET_CAPTURE;
 use const SCANDIR_SORT_NONE;
+use const SORT_STRING;
+use const T_ABSTRACT;
+use const T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG;
+use const T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG;
 use const T_ARRAY;
+use const T_AS;
+use const T_ATTRIBUTE;
 use const T_BAD_CHARACTER;
+use const T_BOOL_CAST;
+use const T_BOOLEAN_AND;
+use const T_BOOLEAN_OR;
+use const T_CATCH;
+use const T_CLASS;
 use const T_CLOSE_TAG;
+use const T_COALESCE;
 use const T_COMMENT;
+use const T_CONCAT_EQUAL;
+use const T_CONST;
 use const T_CONSTANT_ENCAPSED_STRING;
+use const T_CURLY_OPEN;
+use const T_DECLARE;
+use const T_DIR;
 use const T_DNUMBER;
 use const T_DOC_COMMENT;
+use const T_DOLLAR_OPEN_CURLY_BRACES;
 use const T_DOUBLE_ARROW;
+use const T_DOUBLE_CAST;
+use const T_DOUBLE_COLON;
+use const T_ELSEIF;
+use const T_EMPTY;
+use const T_ENCAPSED_AND_WHITESPACE;
+use const T_END_HEREDOC;
+use const T_ENUM;
+use const T_EVAL;
 use const T_EXIT;
+use const T_FILE;
+use const T_FINAL;
+use const T_FN;
+use const T_FOR;
+use const T_FOREACH;
+use const T_FUNCTION;
 use const T_HALT_COMPILER;
+use const T_IF;
+use const T_INCLUDE;
+use const T_INCLUDE_ONCE;
 use const T_INLINE_HTML;
+use const T_INT_CAST;
+use const T_INTERFACE;
+use const T_ISSET;
+use const T_LINE;
+use const T_LIST;
 use const T_LNUMBER;
+use const T_LOGICAL_AND;
+use const T_LOGICAL_OR;
+use const T_MATCH;
+use const T_NAME_FULLY_QUALIFIED;
+use const T_NAME_QUALIFIED;
+use const T_NAME_RELATIVE;
+use const T_NAMESPACE;
+use const T_NEW;
+use const T_NULLSAFE_OBJECT_OPERATOR;
+use const T_OBJECT_OPERATOR;
 use const T_OPEN_TAG;
+use const T_READONLY;
+use const T_REQUIRE;
+use const T_REQUIRE_ONCE;
+use const T_RETURN;
+use const T_START_HEREDOC;
+use const T_STATIC;
 use const T_STRING;
+use const T_SWITCH;
+use const T_TRAIT;
+use const T_UNSET;
+use const T_USE;
 use const T_VARIABLE;
+use const T_WHILE;
 use const T_WHITESPACE;
 
 /**
@@ -130,6 +215,14 @@ use const T_WHITESPACE;
  * itself — so an interrupted pass has already shipped the urgent part. A
  * checksum list that still has to be fetched can YIELD a chunk: the
  * directory goes back on the stack and the next request pays for the fetch.
+ * The two walks that can grow without end — the document root's folders, a
+ * second application among them, and wp-content/cache — are BOUNDED in
+ * depth and in names per pass (limit()), and say where they stopped.
+ *
+ * WHERE NO LIST VOUCHES — a theme, a premium plugin, a must-use plugin, a
+ * folder of the document root, wp-config.php, a cache — a file is read for
+ * what a backdoor looks like and honest code does not (codeVerdict(),
+ * inspectPackage()): Database's code markers in the shapes that run them.
  *
  * PRECISION FIRST: a scanner that names something innocent gets switched
  * off, which is worse than one that is late. Every heuristic here carries
@@ -184,6 +277,41 @@ class Scan
 	
 	/** a PHP-named data file is read whole up to this to judge it; a larger one is not judged data (the executed-file judge reads the same) */
 	public const DATA_BYTES = 262144;
+	
+	/**
+	 * A PHP file read for its code shapes, or judged as data where no list
+	 * vouches for it, is read up to this; past it the file is named
+	 * oversize_php. The tokenizer reads it in slices (slices()), so the limit
+	 * costs read time, never a token array of the whole file
+	 */
+	protected const CODE_BYTES = 4194304;
+	
+	/** the source the tokenizer reads at once (slices()), and the tokens a slice without a statement's end may hold before it is cut */
+	protected const SLICE_BYTES = 32768;
+	
+	protected const SLICE_TOKENS = 8192;
+	
+	/** the tokens a slice grows to rather than cut a runner's call, and past which it cuts and hands the next slice the call's head (cut()) */
+	protected const CALL_TOKENS = 32768;
+	
+	/** a PHP file larger than this is judged only after the pass is checkpointed with it named (checkpoint()) */
+	protected const CHECKPOINT_BYTES = 262144;
+	
+	/**
+	 * The bounded walks (limit()): how many levels below its top a walk
+	 * descends and how many names it reads per pass. The document root's
+	 * folders reach a second application — a shell sits a level or two down
+	 * (images/, .well-known/), not twenty — and a page cache holds a page
+	 * per URL, a hundred thousand on a large site, mirroring the URLs'
+	 * depth. Past either, the directory is named in scan.skipped
+	 */
+	protected const ROOT_DEPTH = 6;
+	
+	protected const ROOT_ENTRIES = 20000;
+	
+	protected const CACHE_DEPTH = 16;
+	
+	protected const CACHE_ENTRIES = 50000;
 	
 	/** how long the database phase waits for a WP-Cron or admin request before any loaded one will do */
 	protected const DATABASE_WAIT = 86400;
@@ -242,11 +370,126 @@ class Scan
 	protected const SKIP_DIRS = ['.git', '.svn', '.hg', 'node_modules'];
 	
 	/**
-	 * wp-content directories skipped whole: page caches (caching plugins
-	 * write PHP-named cache files by the thousand) and core's own upgrade
-	 * staging
+	 * wp-content directories skipped whole: core's own upgrade staging (the
+	 * cache is walked, bounded: inspectCacheExecutable())
 	 */
-	protected const CONTENT_SKIP = ['cache', 'upgrade', 'upgrade-temp-backup'];
+	protected const CONTENT_SKIP = ['upgrade', 'upgrade-temp-backup'];
+	
+	/**
+	 * Directories a package keeps images, fonts, styles, media and
+	 * translations in, by name at any depth of a theme, a plugin, a
+	 * must-use plugin or a folder of the document root: code that runs
+	 * there, among more ASSET_FILES than PHP, stands where its package keeps
+	 * none (asset_php). The name alone is no proof — a PSR-4 `Css/`
+	 * namespace, a view's `icons/`, a theme's `inc/css/` generators hold PHP
+	 * and nothing else — and the data files honest packages keep among their
+	 * assets — a build's `*.asset.php`, a `.l10n.php` translation, a guarded
+	 * settings array — return literals and run nothing
+	 */
+	protected const ASSET_DIRS = ['images', 'image', 'img', 'imgs', 'icons', 'fonts', 'webfonts', 'css', 'scss',
+		'sass', 'less', 'svg', 'sounds', 'audio', 'video', 'videos', 'languages', 'lang', 'langs'];
+	
+	/** what an asset folder holds: images, fonts, styles, scripts, translations, media */
+	protected const ASSET_FILES = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'ico', 'bmp', 'woff', 'woff2', 'ttf',
+		'eot', 'otf', 'css', 'scss', 'sass', 'less', 'map', 'js', 'mjs', 'mo', 'po', 'pot', 'json', 'mp3', 'mp4', 'webm',
+		'ogg', 'wav'];
+	
+	/** WordPress's translation functions: they hand a string back, or echo it, and run nothing else */
+	protected const I18N = ['__', '_e', '_x', '_ex', '_n', '_nx', '_n_noop', '_nx_noop', 'esc_html__', 'esc_html_e', 'esc_html_x',
+		'esc_attr__', 'esc_attr_e', 'esc_attr_x'];
+	
+	/**
+	 * Functions only WordPress defines, none of them PHP's: the hooks, the
+	 * registrations (PHP's own register_shutdown_function and
+	 * register_tick_function left out), the wp_ and esc_ families, the
+	 * translation functions
+	 */
+	protected const WORDPRESS_CALLS = '~^(?:add_(?:action|filter|shortcode|theme_support|image_size|menu_page|submenu_page|meta_box)|remove_(?:action|filter)|do_action|apply_filters|register_(?!shutdown_function$|tick_function$)\w+|wp_\w+|esc_\w+|__|_e)$~';
+	
+	/** the calls data may make (dataOnly()): a guard's defined(), json_decode() of a literal, the translation functions */
+	protected const DATA_CALLS = ['defined', 'json_decode', ...self::I18N];
+	
+	/** the tokens data is made of (dataOnly()), besides the names, a guard's exit and the parentheses */
+	protected const DATA_TOKENS = [T_VARIABLE, T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER, T_ARRAY, T_RETURN, T_IF, T_EXIT,
+		T_BOOLEAN_OR, T_LOGICAL_OR, T_BOOLEAN_AND, T_LOGICAL_AND, T_COALESCE, T_DIR, T_FILE, T_LINE, T_START_HEREDOC,
+		T_ENCAPSED_AND_WHITESPACE, T_END_HEREDOC, T_DOUBLE_ARROW, '!', '{', '}', '=', ';', '[', ']', ',', ')', '-', '+', '*', '/',
+		'%', '|', '&', T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG, T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG, '~', '.', '?', ':'];
+	
+	/** PHP's request input: what a remote caller writes */
+	protected const REQUEST_INPUT = ['$_GET', '$_POST', '$_REQUEST', '$_COOKIE', '$_SERVER', '$_FILES'];
+	
+	/**
+	 * The fields of $_SERVER a request writes, besides its headers (HTTP_*):
+	 * the query string, the URI and its path info, PHP_SELF, the body's
+	 * type, argv (the query string again where register_argc_argv is on).
+	 * SCRIPT_NAME, SCRIPT_FILENAME, DOCUMENT_ROOT and SERVER_NAME are the
+	 * server's own: the request picks a script, it writes no content there
+	 */
+	protected const SERVER_INPUT = ['QUERY_STRING', 'REQUEST_URI', 'PATH_INFO', 'ORIG_PATH_INFO', 'PATH_TRANSLATED', 'PHP_SELF',
+		'CONTENT_TYPE', 'argv', 'REDIRECT_URL', 'REDIRECT_QUERY_STRING', 'UNENCODED_URL'];
+	
+	/** the functions that hand over the request without a superglobal's name */
+	protected const INPUT_FUNCTIONS = ['getallheaders', 'apache_request_headers', 'filter_input', 'filter_input_array'];
+	
+	/**
+	 * The functions that call a callable they are handed, by the position of
+	 * that argument: request input there runs whatever the caller names, a
+	 * literal there that names a runner hands it the other arguments
+	 */
+	protected const CALLABLES = [
+		'call_user_func' => 0, 'call_user_func_array' => 0, 'forward_static_call' => 0, 'forward_static_call_array' => 0,
+		'array_map' => 0, 'array_filter' => 1, 'array_walk' => 1, 'array_walk_recursive' => 1, 'array_reduce' => 1,
+		'usort' => 1, 'uasort' => 1, 'uksort' => 1, 'preg_replace_callback' => 1, 'iterator_apply' => 1,
+		'register_shutdown_function' => 0, 'register_tick_function' => 0, 'header_register_callback' => 0, 'ob_start' => 0,
+		'set_error_handler' => 0, 'set_exception_handler' => 0, 'spl_autoload_register' => 0,
+	];
+	
+	/**
+	 * The arguments a callback's parameters come from, by position, per
+	 * function of CALLABLES (null: every argument after the callable): what
+	 * request input must stand in for a callback that runs its parameter to
+	 * run it (callback()). The others hand their callback the output, an
+	 * error or a class name
+	 */
+	protected const CALLBACK_DATA = [
+		'call_user_func' => null, 'call_user_func_array' => [1], 'forward_static_call' => null, 'forward_static_call_array' => [1],
+		'array_map' => null, 'array_filter' => [0], 'array_walk' => [0, 2], 'array_walk_recursive' => [0, 2], 'array_reduce' => [0, 2],
+		'usort' => [0], 'uasort' => [0], 'uksort' => [0], 'preg_replace_callback' => [2], 'iterator_apply' => [0, 2],
+		'register_shutdown_function' => null, 'register_tick_function' => null,
+	];
+	
+	/** what makes request input fit for a command, a path or a name: an escaper, a sanitizer, a number */
+	protected const SANITIZERS = ['escapeshellarg', 'escapeshellcmd', 'sanitize_key', 'sanitize_text_field', 'sanitize_file_name',
+		'sanitize_title', 'sanitize_user', 'sanitize_email', 'absint', 'intval', 'floatval', 'boolval', 'basename', 'esc_attr',
+		'esc_html', 'esc_url', 'esc_sql', 'preg_quote', 'urlencode', 'rawurlencode', 'md5', 'sha1', 'hash'];
+	
+	/** the decoders a file's obfuscation uses beside the ones an option's value would (Database::CODE_DECODERS) */
+	protected const DECODERS = ['strrev', 'hex2bin', 'gzdecode', 'urldecode', 'rawurldecode', 'convert_uudecode', 'bzdecompress'];
+	
+	/**
+	 * The stream wrappers an include reaches beyond the site's own files
+	 * through. phar:// is left out: vendored libraries ship phar stubs that
+	 * include their own archive, and a phar an intruder uploaded is named by
+	 * its upload path or its media extension
+	 */
+	protected const STREAMS = '~^(?:https?|ftps?|php|data|expect|glob|zlib|zip|rar|ogg|compress\.(?:zlib|bzip2)|ssh2\.\w+)://|^data:~i';
+	
+	/** a template engine's compiled file by its compiler's own mark: Twig's class, Blade's path trailer, Smarty's header */
+	protected const COMPILED = '~\bclass __TwigTemplate_[0-9a-f]{16,}\b|/\*\*PATH .{1,512}? ENDPATH\*\*/|^<\?php\s*/\*\s*Smarty version~';
+	
+	/** what W3 Total Cache writes behind its four-byte expiry into every object and database cache file */
+	protected const W3TC_GUARD = '<?php exit; ?>';
+	
+	/**
+	 * wp-content/cache directories a plugin fills with PHP that runs, by
+	 * design: Docket Cache's object files rebuild objects, Autoptimize's gzip
+	 * wrappers send its files. Read for code shapes alone while their plugin
+	 * is installed; without it they hold strangers
+	 */
+	protected const CACHE_WRITERS = [
+		'docket-cache' => ['docket-cache'],
+		'autoptimize' => ['autoptimize'],
+	];
 	
 	/**
 	 * A "Silence is golden." index.php — the stub WordPress and half its
@@ -275,6 +518,8 @@ class Scan
 		'db.php' => ['query-monitor', 'ludicrousdb', 'hyperdb', 'w3-total-cache',
 			'sqlite-database-integration', 'wp-db-driver'],
 		'wp-cache-config.php' => ['wp-super-cache'],
+		// the fallback Autoptimize copies into wp-content for requests its cache no longer holds
+		'autoptimize_404_handler.php' => ['autoptimize'],
 	];
 	
 	/**
@@ -319,6 +564,16 @@ class Scan
 	];
 	
 	/**
+	 * The uploads folders a template engine compiles into, by the plugins
+	 * whose code puts it there: WPML's Twig cache (WPML_Cache_Directory, the
+	 * uploads root's cache/wpml, `twig` below it), which WooCommerce
+	 * Multilingual ships too
+	 */
+	protected const UPLOAD_COMPILERS = [
+		'cache/wpml/twig' => ['sitepress-multilingual-cms', 'woocommerce-multilingual'],
+	];
+	
+	/**
 	 * PHP files a plugin legitimately puts in the document ROOT (the
 	 * executed-file watch, Entries, asks the same question): Wordfence's
 	 * firewall prepend, and the bootstrap AIOS writes for its firewall and
@@ -334,7 +589,7 @@ class Scan
 	 * login rate limit, a second factor, an upload scanner — by slug among
 	 * the ACTIVE plugins. The console prints the gap where none is found:
 	 * these are commodity features the plugin deliberately does not
-	 * re-implement (docs/plans/wordpress-cyberprotection-brainstorm.md).
+	 * re-implement.
 	 */
 	protected const PROTECTION = [
 		'login_protection' => ['limit-login-attempts-reloaded', 'wordfence', 'better-wp-security', 'ithemes-security-pro',
@@ -369,6 +624,21 @@ class Scan
 	/** the core list for this request, loaded once; false = unavailable this pass */
 	protected array|false|null $coreList = null;
 	
+	/** @var ?array{uploads: string, temp: list<string>, owned: list<string>} places(), once per request */
+	protected ?array $places = null;
+	
+	/**
+	 * Handed the file about to be judged — {area, path, size} — before a
+	 * large one is (checkpoint()), and before the database's checks, and
+	 * null once it is: the runner keeps the name in an option of its own, so
+	 * a chunk that dies there leaves it behind and nothing of the pass is
+	 * written for it
+	 */
+	public ?Closure $checkpoint = null;
+	
+	/** when this chunk's budget runs out (advance()): visit() and recheck() stop between files at it */
+	protected float $deadline = PHP_FLOAT_MAX;
+	
 	protected int $fetchLimit = self::FETCHES_BACKGROUND;
 	
 	public function __construct(
@@ -379,15 +649,19 @@ class Scan
 	
 	/**
 	 * A fresh pass: the phase list, empty counters, no position yet — and
-	 * the plugin versions the checksum lists are keyed by
+	 * the plugin versions the checksum lists are keyed by, and where the last
+	 * pass's bounded walks and content pages stopped
+	 *
+	 * @param array<string, int|string> $resume the last pass's resume_next
 	 */
 	public function start(
 		string $mode,
+		array $resume = [],
 	): array
 	{
 		$roots = $this->roots();
 		
-		$phases = [['root', $roots['root'], false, []]];
+		$phases = [['root', $roots['root'], true, ['bound' => 'root', 'depth' => 0]]];
 		
 		if($roots['uploads'] !== '' && is_dir($roots['uploads']))
 		{
@@ -405,6 +679,7 @@ class Scan
 		$phases[] = ['core', $roots['root'] . '/wp-admin', true, []];
 		$phases[] = ['core', $roots['root'] . '/wp-includes', true, []];
 		$phases[] = ['themes', $roots['themes'], true, []];
+		$phases[] = ['recheck', '', false, []];
 		$phases[] = [Database::AREA, '', false, []];
 		$phases[] = ['posture', '', false, []];
 		
@@ -446,6 +721,17 @@ class Scan
 			'opened' => false,
 			'stack' => [],
 			'yield' => false,
+			// each bounded walk's ledger this pass (bounded()), where the last pass stopped and where this one does
+			'bounded' => [],
+			'resume' => $resume,
+			'resume_next' => [],
+			// files a chunk died judging: named once, never judged again this pass
+			'poisoned' => [],
+			// the files this pass found something in inside a bounded walk, by path, and the earlier ones judged again (recheck())
+			'recheck_next' => [],
+			'recheck_at' => 0,
+			'rechecked' => 0,
+			'config_read' => false,
 			'areas' => $areas,
 			'findings' => [],
 			'counts' => [self::TIER_URGENT => 0, self::TIER_HIGH => 0, self::TIER_INFO => 0],
@@ -487,17 +773,34 @@ class Scan
 		$this->sums ??= new Checksums(($state['mode'] ?? '') === 'manual' ? 4 : 2);
 		$this->sums->fetches = 0;
 		$this->coreList = null;
+		$this->places = null;
 		
+		// a pass the last version stored lacks what this one keeps beside it
+		$state += ['bounded' => [], 'resume' => [], 'resume_next' => [], 'poisoned' => [], 'config_read' => false,
+			'recheck_next' => [], 'recheck_at' => 0, 'rechecked' => 0];
 		$begun = microtime(true);
 		$deadline = $begun + $budgetMs / 1000;
+		$this->deadline = $deadline;
 		$state['chunks']++;
 		$state['yield'] = false;
+		
+		if(isset($state['judging']))
+		{
+			// the last chunk died judging this: it is named, and passed over from here on
+			$judging = (array)$state['judging'];
+			$area = (string)($judging['area'] ?? '');
+			unset($state['judging']);
+			$state['poisoned'][] = (string)($judging['path'] ?? '');
+			$this->finding($state, isset($state['areas'][$area]) ? $area : 'root', (string)($judging['path'] ?? ''), 'scan_crash', self::TIER_HIGH,
+				'the scan died judging this; read it by hand', isset($judging['size']) ? ['size' => (int)$judging['size']] : []);
+		}
 		
 		while($state['done'] === false && microtime(true) < $deadline)
 		{
 			if($state['phase'] >= count($state['phases']))
 			{
 				$state['done'] = true;
+				$state['resume_next'] = $this->resumeNext($state);
 				
 				break;
 			}
@@ -519,7 +822,26 @@ class Scan
 					break;
 				}
 				
-				$this->database($state);
+				if(in_array('checks', $state['poisoned'], true) === false)
+				{
+					$this->mark(['area' => Database::AREA, 'path' => 'checks']);
+					$this->database($state);
+					// they ran: a chunk that dies later blames them not
+					$this->mark(null);
+				}
+				
+				$state['phase']++;
+				
+				continue;
+			}
+			
+			if($area === 'recheck')
+			{
+				if($this->recheck($state) === false)
+				{
+					break;
+				}
+				
 				$state['phase']++;
 				
 				continue;
@@ -614,6 +936,8 @@ class Scan
 				}
 			}
 			
+			// the area's findings made and not listed (finding(), database()), beside scan.truncated's tiers; 0 when none were
+			$entry['truncated'] ??= 0;
 			$areas[$area] = $entry;
 			$files += (int)$stats['files'];
 			$dirs += (int)$stats['dirs'];
@@ -658,6 +982,8 @@ class Scan
 				'skipped' => $state['skipped'],
 				'counts' => $state['counts'],
 				'truncated' => $state['truncated'],
+				'bounded' => $this->boundedReport($state),
+				'rechecked' => (int)($state['rechecked'] ?? 0),
 			],
 			'checksums' => [
 				'core' => $core === 'pending' ? 'skipped' : $core,
@@ -688,11 +1014,51 @@ class Scan
 	}
 	
 	/**
+	 * The bounded walks for the report: per walk the names read and the limit,
+	 * the depth limit and the directories past it, where the pass started
+	 * (`from`, '' = the top) and where the next one will (`next`, '' = the
+	 * walk reached its end), paths relative to the walk's top
+	 *
+	 * @return array<string, array{read: int, limit: int, depth: int, deep: int, from: string, next: string}>
+	 */
+	protected function boundedReport(
+		array $state,
+	): array
+	{
+		$report = [];
+		$next = $this->resumeNext($state);
+		
+		foreach((array)($state['bounded'] ?? []) as $bound => $walk)
+		{
+			if(is_array($walk))
+			{
+				$report[$bound] = [
+					'read' => (int)$walk['read'],
+					'limit' => (int)$walk['limit'],
+					'depth' => (int)$walk['depth'],
+					'deep' => (int)$walk['deep'],
+					'from' => $this->clean((string)$walk['from']),
+					'next' => $this->clean((string)($next[$bound] ?? '')),
+				];
+			}
+		}
+		
+		return $report;
+	}
+	
+	/**
 	 * One directory: files inspected, subdirectories pushed. The root area
-	 * lists its files only (wp-admin and wp-includes are the core area's);
-	 * the wp-content top level classifies each subdirectory instead of
-	 * descending blindly. A plugin's top directory first makes sure its
-	 * checksum list is known — or yields the chunk to fetch it next time.
+	 * walks its folders too, bounded, leaving wp-admin, wp-includes and
+	 * wp-content's roots to their phases; the wp-content top level classifies
+	 * each subdirectory instead of descending blindly. A plugin's top
+	 * directory first makes sure its checksum list is known — or yields the
+	 * chunk to fetch it next time. A bounded walk reads its directories in
+	 * name order, counts the names it reads, stops at its limits and resumes
+	 * where the last pass stopped (bounded()); what it finds is kept for the
+	 * passes it will not reach (keep(), recheck()). Before a large file is
+	 * judged it is named to the checkpoint (checkpoint()), and a file a dead
+	 * chunk left named is passed over (advance()). Past the chunk's deadline
+	 * the directory goes back on the walk with the names it has judged
 	 */
 	protected function visit(
 		array &$state,
@@ -710,6 +1076,19 @@ class Scan
 			return;
 		}
 		
+		$bound = (string)($flags['bound'] ?? '');
+		$depth = (int)($flags['depth'] ?? 0);
+		
+		if($bound !== '' && $this->bounded($state, $bound)['stopped'])
+		{
+			return;
+		}
+		
+		if($area === 'root' && $dir === $this->roots['root'])
+		{
+			$this->inspectConfig($state);
+		}
+		
 		$entries = @scandir($dir, SCANDIR_SORT_NONE);
 		
 		if($entries === false)
@@ -719,13 +1098,32 @@ class Scan
 			return;
 		}
 		
-		$state['areas'][$area]['dirs']++;
+		if($bound !== '')
+		{
+			// the order a resumed pass finds its place by, the same on every file system
+			sort($entries, SORT_STRING);
+		}
 		
+		// a directory walked again after a dead chunk: what that chunk judged is in the pass already
+		$done = array_flip((array)($flags['done'] ?? []));
+		
+		if(isset($flags['done']) === false)
+		{
+			$state['areas'][$area]['dirs']++;
+		}
+		
+		unset($flags['done']);
 		$top = $area === 'content' && $dir === $this->roots['content'];
 		$recursive = (bool)($flags['recursive'] ?? false);
+		// the root's own top level is read whole, as it always was; below it, and in the cache, every name counts
+		$counted = $bound === 'cache' || ($bound === 'root' && $depth > 0);
+		// an asset folder is named for assets and holds one, and everything below it is in it
+		$asset = $flags['asset'] ?? (in_array(strtolower(basename($dir)), self::ASSET_DIRS, true) && $this->holdsAssets($entries) ? $dir : null);
 		$names = [];
 		$newest = 0;
 		$owners = [];
+		
+		$progress = false;
 		
 		foreach($entries as $name)
 		{
@@ -734,12 +1132,63 @@ class Scan
 				continue;
 			}
 			
+			// a chunk keeps to its deadline between files: the directory goes back on the walk with the names it has judged
+			if($progress && microtime(true) >= $this->deadline)
+			{
+				$state['stack'][] = [$area, $dir, $flags + ['done' => array_keys($names)]];
+				$state['yield'] = true;
+				
+				return;
+			}
+			
 			$path = $dir . '/' . $name;
 			$names[$name] = true;
 			
+			if(isset($done[$name]) || in_array($path, $state['poisoned'], true))
+			{
+				continue;
+			}
+			
+			$progress = true;
+			
+			// read by the last pass when it stood before the place that pass stopped after
+			$known = false;
+			
+			if($counted)
+			{
+				$walk = $this->bounded($state, $bound);
+				
+				if($walk['passed'] === false)
+				{
+					$known = true;
+					$state['bounded'][$bound]['passed'] = $this->relative($path, $walk['top']) === $walk['from'];
+				}
+				elseif($walk['read'] >= $walk['limit'])
+				{
+					$this->boundReached($state, $bound, $area, $dir);
+					
+					break;
+				}
+				else
+				{
+					$state['bounded'][$bound]['read']++;
+					$state['bounded'][$bound]['last'] = $this->relative($path, $walk['top']);
+				}
+			}
+			
+			$before = array_sum($state['counts']);
+			
 			if(@is_link($path))
 			{
-				$this->inspectSymlink($state, $area, $path);
+				if($known === false)
+				{
+					$this->inspectSymlink($state, $area, $path);
+				}
+				
+				if($counted && array_sum($state['counts']) > $before)
+				{
+					$this->keep($state, 'link', $area, $path, []);
+				}
 				
 				continue;
 			}
@@ -748,7 +1197,8 @@ class Scan
 			{
 				if(in_array($name, self::SKIP_DIRS, true))
 				{
-					if($area === 'root' && $name !== 'node_modules')
+					// the posture's line is the document root's own: a nested checkout is skipped and named
+					if($area === 'root' && $depth === 0 && $name !== 'node_modules')
 					{
 						$state['vcs'][] = $name;
 					}
@@ -765,7 +1215,7 @@ class Scan
 					continue;
 				}
 				
-				if($recursive === false)
+				if($recursive === false || ($area === 'root' && $this->walkedElsewhere($path, $name, $depth)))
 				{
 					continue;
 				}
@@ -777,12 +1227,49 @@ class Scan
 					$child['hidden'] = true;
 				}
 				
+				if($asset !== null)
+				{
+					$child['asset'] = $asset;
+				}
+				
+				if($bound !== '')
+				{
+					$child['depth'] = $depth + 1;
+					
+					// past the walk's depth the directory is named, not read
+					if($child['depth'] > $this->bounded($state, $bound)['depth'])
+					{
+						$state['bounded'][$bound]['deep']++;
+						$this->skip($state, $area, $path);
+						
+						continue;
+					}
+				}
+				
 				$state['stack'][] = [$area, $path, $child];
 				
 				continue;
 			}
 			
-			$stat = $this->inspect($state, $area, $path, $name, $flags);
+			if($known)
+			{
+				continue;
+			}
+			
+			$large = $this->checkpoint($area, $path);
+			$stat = $this->inspect($state, $area, $path, $name, $flags + ['asset' => $asset]);
+			
+			if($large)
+			{
+				// judged: a chunk that dies from here on has no file to blame
+				$this->mark(null);
+			}
+			
+			// what a bounded walk finds is read again by a later pass that does not reach it
+			if($counted && array_sum($state['counts']) > $before)
+			{
+				$this->keep($state, 'file', $area, $path, $flags + ['asset' => $asset]);
+			}
 			
 			if($stat !== null)
 			{
@@ -793,15 +1280,281 @@ class Scan
 		
 		$this->missing($state, $area, $dir, $names);
 		$this->dirChanged($state, $area, $dir, $newest, count($owners) > 0);
-		$this->ownerAnomaly($state, $area, $dir, $owners);
+		
+		// a second application's folders and a cache are written by the web server by design
+		if($bound === '' || ($bound === 'root' && $depth === 0))
+		{
+			$this->ownerAnomaly($state, $area, $dir, $owners);
+		}
+	}
+	
+	/**
+	 * Names an executable-shaped file larger than `checkpoint_bytes` to the
+	 * checkpoint before it is judged — area, path and size, nothing of the
+	 * pass, a small write — and says so; the caller clears the name once the
+	 * file is judged (mark(null)). A chunk that dies on the file — out of
+	 * memory, out of time — leaves the name with the runner, and the next
+	 * chunk, resumed from the pass as the last chunk began it, names the file
+	 * scan_crash and passes over it (advance(), visit()); a chunk that dies
+	 * on a later file blames none
+	 */
+	protected function checkpoint(
+		string $area,
+		string $path,
+	): bool
+	{
+		$size = $this->checkpoint !== null && preg_match(self::EXECUTABLE, basename($path)) === 1 ? @filesize($path) : false;
+		
+		if($size === false || $size <= $this->limit('checkpoint_bytes'))
+		{
+			return false;
+		}
+		
+		$this->mark(['area' => $area, 'path' => $path, 'size' => $size]);
+		
+		return true;
+	}
+	
+	/** hands the checkpoint what is about to be judged, null once it is */
+	protected function mark(
+		?array $judging,
+	): void
+	{
+		if($this->checkpoint !== null)
+		{
+			($this->checkpoint)($judging);
+		}
+	}
+	
+	/**
+	 * A file or link this pass found something in inside a bounded walk, kept
+	 * by path with the flags it was judged with: the next pass reads it again
+	 * when its walk does not reach it (recheck()). Twice the report's cap at
+	 * most
+	 */
+	protected function keep(
+		array &$state,
+		string $kind,
+		string $area,
+		string $path,
+		array $flags,
+	): void
+	{
+		if(isset($state['recheck_next'][$path]) || count($state['recheck_next']) < 2 * self::MAX_FINDINGS)
+		{
+			$state['recheck_next'][$path] = [$kind, $area, $path, $flags];
+		}
+	}
+	
+	/**
+	 * The files and links earlier passes found something in inside a bounded
+	 * walk (resume `recheck`), read again before the database unless this
+	 * pass found the same one already: a pass whose walk stops before them,
+	 * or resumes past them, still reports every finding it knows — the
+	 * console takes what a complete report leaves out for gone — and one gone
+	 * or cleaned since drops out. Each read counts in `rechecked`, not in its
+	 * area's files, and a file that still draws a finding is kept for the
+	 * next pass. False when the chunk's deadline stops it, its place kept
+	 */
+	protected function recheck(
+		array &$state,
+	): bool
+	{
+		$entries = array_values((array)($state['resume']['recheck'] ?? []));
+		$from = (int)($state['recheck_at'] ?? 0);
+		
+		for($at = $from; isset($entries[$at]); $at++)
+		{
+			if($at > $from && microtime(true) >= $this->deadline)
+			{
+				$state['recheck_at'] = $at;
+				
+				return false;
+			}
+			
+			// the resume points are the stored pass's, read as data
+			[$kind, $area, $path, $flags] = array_values((array)$entries[$at]) + ['', '', '', []];
+			$area = (string)$area;
+			$path = (string)$path;
+			
+			if(isset($state['areas'][$area]) === false || isset($state['recheck_next'][$path]) || in_array($path, $state['poisoned'], true))
+			{
+				continue;
+			}
+			
+			$before = array_sum($state['counts']);
+			$files = $state['areas'][$area]['files'];
+			
+			if($kind === 'link' && @is_link($path))
+			{
+				$this->inspectSymlink($state, $area, $path);
+			}
+			elseif($kind === 'file' && @is_link($path) === false && @is_file($path))
+			{
+				$large = $this->checkpoint($area, $path);
+				$this->inspect($state, $area, $path, basename($path), (array)$flags);
+				
+				if($large)
+				{
+					$this->mark(null);
+				}
+			}
+			else
+			{
+				continue;
+			}
+			
+			$state['areas'][$area]['files'] = $files;
+			$state['rechecked']++;
+			
+			if(array_sum($state['counts']) > $before)
+			{
+				$this->keep($state, (string)$kind, $area, $path, (array)$flags);
+			}
+		}
+		
+		$state['recheck_at'] = count($entries);
+		
+		return true;
+	}
+	
+	/**
+	 * A bounded walk's ledger for this pass, opened on first use: the names
+	 * read and the limit, the depth limit and the directories past it, the
+	 * place the last pass stopped after (`from`, relative to the walk's top)
+	 * and whether this pass has passed it yet, the last name read, whether the
+	 * walk stopped
+	 *
+	 * @return array{read: int, limit: int, depth: int, deep: int, from: string, passed: bool, last: string, stopped: bool, top: string}
+	 */
+	protected function bounded(
+		array &$state,
+		string $bound,
+	): array
+	{
+		if(is_array($state['bounded'][$bound] ?? null) === false)
+		{
+			$from = (string)($state['resume'][$bound] ?? '');
+			$state['bounded'][$bound] = [
+				'read' => 0,
+				'limit' => $this->limit($bound . '_entries'),
+				'depth' => $this->limit($bound . '_depth'),
+				'deep' => 0,
+				'from' => $from,
+				'passed' => $from === '',
+				'last' => '',
+				'stopped' => false,
+				'top' => $bound === 'cache' ? $this->roots['content'] . '/cache' : $this->roots['root'],
+			];
+		}
+		
+		return $state['bounded'][$bound];
+	}
+	
+	/**
+	 * Where each bounded walk hands over to the next pass: the last name it
+	 * read when it stopped, '' when it reached its end — or never found the
+	 * place it was to resume after, the tree having changed — so the next
+	 * pass starts over
+	 *
+	 * @return array<string, string>
+	 */
+	protected function resumeNext(
+		array $state,
+	): array
+	{
+		$next = (array)($state['resume_next'] ?? []);
+		$next['recheck'] = array_values((array)($state['recheck_next'] ?? []));
+		
+		foreach((array)($state['bounded'] ?? []) as $bound => $walk)
+		{
+			if(is_array($walk))
+			{
+				$next[$bound] = $walk['stopped'] ? (string)$walk['last'] : '';
+			}
+		}
+		
+		return $next;
+	}
+	
+	/**
+	 * Whether a directory's names hold at least one asset (ASSET_FILES) —
+	 * however many PHP files and listing stubs stand beside it
+	 *
+	 * @param list<string> $entries
+	 */
+	protected function holdsAssets(
+		array $entries,
+	): bool
+	{
+		foreach($entries as $name)
+		{
+			if(in_array(self::extension(strtolower($name)), self::ASSET_FILES, true))
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * A folder of the document root another phase walks: core's two at its
+	 * top, wp-content and the plugin, theme, upload and must-use roots
+	 * wherever they stand
+	 */
+	protected function walkedElsewhere(
+		string $path,
+		string $name,
+		int $depth,
+	): bool
+	{
+		return ($depth === 0 && in_array($name, ['wp-admin', 'wp-includes'], true))
+			|| in_array($path, [$this->roots['content'], $this->roots['plugins'], $this->roots['themes'],
+				$this->roots['uploads'], $this->roots['mu']], true);
+	}
+	
+	/**
+	 * A bounded walk out of names: it stops for this pass, and the directory
+	 * it stopped in is named first in scan.skipped — ahead of anything a
+	 * full list would otherwise keep it from
+	 */
+	protected function boundReached(
+		array &$state,
+		string $bound,
+		string $area,
+		string $dir,
+	): void
+	{
+		$state['bounded'][$bound]['stopped'] = true;
+		
+		array_unshift($state['skipped'], $area . ':' . $this->clean($this->relative($dir, (string)$state['areas'][$area]['root'])));
+		$state['skipped'] = array_slice($state['skipped'], 0, self::MAX_SKIPPED);
+	}
+	
+	/** a walk bound by name (ROOT_DEPTH, ROOT_ENTRIES, CACHE_DEPTH, CACHE_ENTRIES, CODE_BYTES, CHECKPOINT_BYTES) */
+	protected function limit(
+		string $name,
+	): int
+	{
+		return match($name)
+		{
+			'root_depth' => self::ROOT_DEPTH,
+			'root_entries' => self::ROOT_ENTRIES,
+			'cache_depth' => self::CACHE_DEPTH,
+			'cache_entries' => self::CACHE_ENTRIES,
+			'code_bytes' => self::CODE_BYTES,
+			'checkpoint_bytes' => self::CHECKPOINT_BYTES,
+			default => PHP_INT_MAX,
+		};
 	}
 	
 	/**
 	 * A wp-content subdirectory: the four areas walked on their own are
-	 * skipped here, caches and upgrade staging are skipped whole, a
-	 * plugin-owned data directory is one finding and never descended,
-	 * anything else is walked as content — where executable code is a
-	 * stranger.
+	 * skipped here, upgrade staging is skipped whole, the cache is walked
+	 * bounded and judged by what caches write, a plugin-owned data directory
+	 * is one finding and never descended, anything else is walked as content
+	 * — where executable code is a stranger.
 	 */
 	protected function classifyContentDir(
 		array &$state,
@@ -818,6 +1571,13 @@ class Scan
 		if(in_array($name, self::CONTENT_SKIP, true))
 		{
 			$this->skip($state, 'content', $path);
+			
+			return;
+		}
+		
+		if($name === 'cache')
+		{
+			$state['stack'][] = ['content', $path, ['recursive' => true, 'bound' => 'cache', 'depth' => 0]];
 			
 			return;
 		}
@@ -861,6 +1621,17 @@ class Scan
 		array $flags,
 	): ?array
 	{
+		$lower = strtolower($name);
+		
+		// a cache holds pages by the thousand: only a name that can run, or point PHP elsewhere, is worth a stat
+		if(($flags['bound'] ?? '') === 'cache' && preg_match(self::EXECUTABLE, $name) !== 1
+			&& in_array($lower, self::DIRECTIVE_FILES, true) === false && in_array(self::extension($lower), self::MEDIA, true) === false)
+		{
+			$state['areas'][$area]['files']++;
+			
+			return null;
+		}
+		
 		$stat = @stat($path);
 		$size = $stat !== false ? (int)$stat['size'] : 0;
 		$mtime = $stat !== false ? (int)$stat['mtime'] : 0;
@@ -870,7 +1641,6 @@ class Scan
 		$state['areas'][$area]['bytes'] += $size;
 		
 		$meta = ['size' => $size, 'mtime' => $mtime];
-		$lower = strtolower($name);
 		$answer = $stat === false ? null : ['size' => $size, 'mtime' => $mtime, 'uid' => $uid];
 		
 		if(preg_match(self::EXECUTABLE, $name) === 1)
@@ -896,10 +1666,12 @@ class Scan
 	
 	/**
 	 * Executable-shaped, judged by where it stands. Hidden anywhere is a
-	 * finding; under uploads anything but a listing stub is; in the root
-	 * anything core did not ship is; at the wp-content top level a drop-in
-	 * is judged by its owner and anything else is a stranger; in plugins,
-	 * themes and core the checksum list is the judge where one exists.
+	 * finding; under uploads anything but a listing stub is; at the root's
+	 * top anything core did not ship is, deeper its shapes are; at the
+	 * wp-content top level a drop-in is judged by its owner and anything else
+	 * is a stranger; in plugins and core the checksum list is the judge where
+	 * one exists, and where none does — themes, premium plugins — the shapes
+	 * are (inspectPackage()).
 	 */
 	protected function inspectExecutable(
 		array &$state,
@@ -913,6 +1685,12 @@ class Scan
 	{
 		if(($flags['hidden'] ?? false) === true || $name[0] === '.')
 		{
+			// a dotfile wordpress.org's list ships with the plugin is the plugin's, whatever it is named
+			if($area === 'plugins' && $this->listedInPlugin($state, $path, $meta))
+			{
+				return;
+			}
+			
 			if(preg_match(self::HIDDEN_TOOLING, $name) !== 1)
 			{
 				$this->finding($state, $area, $path, 'hidden_php', self::TIER_HIGH, '', $meta);
@@ -932,6 +1710,20 @@ class Scan
 				return;
 			
 			case 'root':
+				if(dirname($path) !== $this->roots['root'])
+				{
+					// a folder of the document root: a second application's code is no finding for being code
+					$this->inspectPackage($state, $area, $path, $name, $size, $meta, $this->roots['root'], $flags['asset'] ?? null);
+					
+					return;
+				}
+				
+				if($name === 'wp-config.php')
+				{
+					// read whole as the file WordPress loads (inspectConfig())
+					return;
+				}
+				
 				if(in_array($name, Sender::CORE_ROOT_FILES, true))
 				{
 					// compared when listed; wp-config.php is core's own root file
@@ -964,7 +1756,7 @@ class Scan
 				return;
 			
 			case 'plugins':
-				$this->verifyInside($state, $path, $meta);
+				$this->verifyInside($state, $path, $name, $size, $meta, $flags['asset'] ?? null);
 				
 				return;
 				
@@ -972,6 +1764,9 @@ class Scan
 				// no list vouches for a theme: wp.org has no theme checksums, and
 				// the core list's bundled themes are the VERSIONS shipped with that
 				// core release, which the theme updater has long since replaced
+				$this->inspectPackage($state, $area, $path, $name, $size, $meta, $this->packageBase($path, $this->roots['themes']),
+					$flags['asset'] ?? null);
+				
 				return;
 			
 			default:
@@ -990,14 +1785,29 @@ class Scan
 	{
 		$parent = dirname($path);
 		
+		if(($flags['bound'] ?? '') === 'cache')
+		{
+			$this->inspectCacheExecutable($state, $path, $size, $meta);
+			
+			return;
+		}
+		
 		if(($flags['mu'] ?? false) === true)
 		{
-			// only the top level of mu-plugins is loaded; deeper files are
-			// its includes and belong to the file that requires them
-			if($parent === $this->roots['mu'] && $this->ownMuPlugin($state, $path, $name, $size, $meta) === false)
+			// only the top level of mu-plugins is loaded and listed; deeper
+			// files are its includes, and no list vouches for either
+			if($parent === $this->roots['mu'])
 			{
+				if($this->ownMuPlugin($state, $path, $name, $size, $meta))
+				{
+					return;
+				}
+				
 				$this->finding($state, 'content', $path, 'mu_plugin', self::TIER_INFO, '', $meta);
 			}
+			
+			$this->inspectPackage($state, 'content', $path, $name, $size, $meta, $this->packageBase($path, $this->roots['mu']),
+				$flags['asset'] ?? null);
 			
 			return;
 		}
@@ -1015,9 +1825,11 @@ class Scan
 		{
 			// core's PHP translation files live under languages/ and its
 			// plugins/ and themes/ subdirectories, named for their text domain
-			// and locale; anything else executable there is a stranger
+			// and locale, and return literals; anything else executable there,
+			// or a translation's name over code, is a stranger
 			$translation = str_starts_with($path, $this->roots['content'] . '/languages/')
-				&& preg_match(self::TRANSLATION, $name) === 1;
+				&& preg_match(self::TRANSLATION, $name) === 1
+				&& $this->translationData($path, $size);
 			
 			if($translation === false && $this->isStub($path, $size) === false)
 			{
@@ -1040,6 +1852,8 @@ class Scan
 			{
 				$this->finding($state, 'content', $path, 'dropin', self::TIER_INFO,
 					'owned by ' . $owner, $meta);
+				// an owner's name is no proof of the code under it, and a drop-in runs on every request
+				$this->inspectCode($state, 'content', $path, $meta);
 				
 				return;
 			}
@@ -1051,6 +1865,7 @@ class Scan
 				$this->looksVendored($path) ? 'dropin' : 'dropin_orphan',
 				$this->looksVendored($path) ? self::TIER_INFO : self::TIER_HIGH,
 				'no installed owner', $meta);
+			$this->inspectCode($state, 'content', $path, $meta);
 			
 			return;
 		}
@@ -1063,6 +1878,7 @@ class Scan
 			$this->finding($state, 'content', $path, 'dropin',
 				$name === 'install.php' ? self::TIER_HIGH : self::TIER_INFO,
 				$name === 'install.php' ? 'install drop-in on a live site' : '', $meta);
+			$this->inspectCode($state, 'content', $path, $meta);
 				
 			return;
 		}
@@ -1072,8 +1888,10 @@ class Scan
 	
 	/**
 	 * PHP under uploads that is no stub: listed when it stops before any code
-	 * runs or when it is a known writer's data file with its owner installed,
-	 * URGENT otherwise
+	 * runs, when it is a known writer's data file with its owner installed, or
+	 * a template its owner's engine compiled there (UPLOAD_COMPILERS) that
+	 * declares and runs nothing when requested, read for the code shapes all
+	 * the same; URGENT otherwise
 	 */
 	protected function inspectUploadsPhp(
 		array &$state,
@@ -1082,6 +1900,24 @@ class Scan
 		array $meta,
 	): void
 	{
+		$compiler = $this->uploadCompiler($path);
+		
+		if($compiler !== null && $size <= $this->limit('code_bytes'))
+		{
+			$source = (string)$this->head($path, $this->limit('code_bytes'));
+			
+			if(preg_match(self::COMPILED, $source) === 1 && self::runsOnRequest($source) === false)
+			{
+				if($this->inspectCode($state, 'uploads', $path, $meta, $source) === false)
+				{
+					$this->finding($state, 'uploads', $path, 'uploads_php_owned', self::TIER_INFO,
+						'owned by ' . $compiler . ', a compiled template', $meta);
+				}
+				
+				return;
+			}
+		}
+		
 		$top = explode('/', $this->relative($path, $this->roots['uploads']), 2)[0];
 		$owner = isset(self::UPLOAD_WRITERS[$top]) ? $this->installedOwner(self::UPLOAD_WRITERS[$top]) : null;
 		
@@ -1099,7 +1935,10 @@ class Scan
 	/**
 	 * PHP where none belongs: the stranger's finding, or inert_php INFO when the
 	 * file stops before any code runs — the data files W3 Total Cache and AIOS
-	 * keep under PHP names behind an exit or __halt_compiler()
+	 * keep under PHP names behind an exit or __halt_compiler() — or, in
+	 * wp-content, holds data alone: the guarded configs Breeze, WP-Optimize
+	 * and Cache Enabler keep beside the cache. Under uploads data is still
+	 * PHP where none belongs, unless its writer is known (inspectUploadsPhp())
 	 */
 	protected function stranger(
 		array &$state,
@@ -1111,9 +1950,18 @@ class Scan
 		array $meta,
 	): void
 	{
-		if($size <= self::DATA_BYTES && self::inert((string)$this->head($path, self::DATA_BYTES)))
+		$head = $size <= self::DATA_BYTES ? (string)$this->head($path, self::DATA_BYTES) : '';
+		
+		if($head !== '' && self::inert($head))
 		{
 			$this->finding($state, $area, $path, 'inert_php', self::TIER_INFO, 'stops before any code runs', $meta);
+			
+			return;
+		}
+		
+		if($head !== '' && $area === 'content' && self::dataOnly($head))
+		{
+			$this->finding($state, $area, $path, 'inert_php', self::TIER_INFO, 'data only, runs no code', $meta);
 			
 			return;
 		}
@@ -1258,6 +2106,12 @@ class Scan
 		
 		if(is_array($list) === false)
 		{
+			// no list this pass: core's own files are still read for the shapes no release ships
+			if($kind === 'core')
+			{
+				$this->inspectCode($state, $area, $path, $meta);
+			}
+			
 			return;
 		}
 		
@@ -1301,13 +2155,17 @@ class Scan
 	/**
 	 * A file inside a plugin directory, against the plugin's own wp.org list
 	 * where one exists. A single-file plugin (hello.php) has no directory to
-	 * key a list by and updates apart from core, so it is not verified; a
-	 * premium or custom plugin has no list and is not judged either.
+	 * key a list by and updates apart from core, and a premium or custom
+	 * plugin has no list: both are read for the shapes no list vouches for
+	 * (inspectPackage()).
 	 */
 	protected function verifyInside(
 		array &$state,
 		string $path,
+		string $name,
+		int $size,
 		array $meta,
+		?string $asset = null,
 	): void
 	{
 		$relative = $this->relative($path, $this->roots['plugins']);
@@ -1315,22 +2173,349 @@ class Scan
 		
 		if($slash === false)
 		{
+			$this->inspectPackage($state, 'plugins', $path, $name, $size, $meta, $this->roots['plugins'], $asset);
+			
 			return;
 		}
 		
 		$slug = substr($relative, 0, $slash);
+		$list = ($state['checksums']['plugins'][$slug] ?? '') === 'verified'
+			? $this->sums?->plugin($slug, (string)($state['versions'][$slug] ?? ''))
+			: null;
 		
-		if(($state['checksums']['plugins'][$slug] ?? '') !== 'verified')
+		if($list === null)
+		{
+			$this->inspectPackage($state, 'plugins', $path, $name, $size, $meta, $this->roots['plugins'] . '/' . $slug, $asset);
+			
+			return;
+		}
+		
+		$this->verify($state, 'plugins', $path, substr($relative, $slash + 1), $meta, 'plugin', $list);
+	}
+	
+	/** whether a file is one the plugin's wordpress.org list names, byte for byte: counted verified when it is */
+	protected function listedInPlugin(
+		array &$state,
+		string $path,
+		array $meta,
+	): bool
+	{
+		$relative = $this->relative($path, $this->roots['plugins']);
+		$slash = strpos($relative, '/');
+		$slug = $slash === false ? '' : substr($relative, 0, $slash);
+		$list = $slug !== '' && ($state['checksums']['plugins'][$slug] ?? '') === 'verified'
+			? $this->sums?->plugin($slug, (string)($state['versions'][$slug] ?? ''))
+			: null;
+		$md5 = $list === null ? false : @md5_file($path);
+		
+		if($md5 === false || Checksums::matches((array)$list, substr($relative, $slash + 1), $md5) === false)
+		{
+			return false;
+		}
+		
+		$state['areas']['plugins']['verified']++;
+		
+		return true;
+	}
+	
+	/**
+	 * A PHP file no list vouches for — a theme's, a plugin's wordpress.org
+	 * never had, a must-use plugin's, a folder of the document root's — held
+	 * against what a backdoor looks like and honest code does not, one
+	 * finding at most: its code shapes (codeVerdict()); code where its
+	 * package keeps assets or translations (asset_php); a core entry file's
+	 * name where no WordPress stands (mimic_core: the wp-login.php in a
+	 * theme). A stub, an exit first and literal data run no code. An `.inc`
+	 * is not judged: it runs only when a PHP file includes it, and vendored
+	 * code sniffers ship their bad-code fixtures under that extension
+	 *
+	 * @param string $base the package's own directory, below which an asset folder counts
+	 * @param ?string $asset the asset folder the file stands in, at any depth (visit())
+	 */
+	protected function inspectPackage(
+		array &$state,
+		string $area,
+		string $path,
+		string $name,
+		int $size,
+		array $meta,
+		string $base,
+		?string $asset = null,
+	): void
+	{
+		$lower = strtolower($name);
+		
+		if(self::extension($lower) === 'inc' || $this->isStub($path, $size))
 		{
 			return;
 		}
 		
-		$list = $this->sums?->plugin($slug, (string)($state['versions'][$slug] ?? ''));
+		$source = (string)$this->head($path, $this->limit('code_bytes'));
 		
-		if($list !== null)
+		if($this->inspectCode($state, $area, $path, $meta, $source))
 		{
-			$this->verify($state, 'plugins', $path, substr($relative, $slash + 1), $meta, 'plugin', $list);
+			return;
 		}
+		
+		// the asset folder counts below the package's own directory, never as it
+		$folder = $asset !== null && str_starts_with($asset, $base . '/') ? basename($asset) : null;
+		
+		// past code_bytes the file cannot be read whole, and a guess is no finding
+		if($folder !== null && $size <= $this->limit('code_bytes') && self::runsOnRequest($source))
+		{
+			$this->finding($state, $area, $path, 'asset_php', self::TIER_HIGH,
+				'code in ' . $folder . '/, among its assets', $meta);
+			
+			return;
+		}
+		
+		// core's own entry files, by their wp- names: xmlrpc.php names a class file in many a library
+		if(str_starts_with($lower, 'wp-') && in_array($lower, Sender::CORE_ROOT_FILES, true) && $this->wordpressRoot(dirname($path)) === false)
+		{
+			$this->finding($state, $area, $path, 'mimic_core', self::TIER_HIGH,
+				'named like core\'s ' . $lower . ' where no WordPress stands', $meta);
+		}
+	}
+	
+	/**
+	 * A file no list vouches for, read for its code shapes alone
+	 * (codeVerdict()): true when it drew a finding. A file larger than
+	 * `code_bytes` is read that far and listed as oversize_php, since the
+	 * rest goes unjudged
+	 */
+	protected function inspectCode(
+		array &$state,
+		string $area,
+		string $path,
+		array $meta,
+		?string $source = null,
+	): bool
+	{
+		$size = (int)($meta['size'] ?? 0);
+		
+		if($size > $this->limit('code_bytes'))
+		{
+			$this->finding($state, $area, $path, 'oversize_php', self::TIER_INFO,
+				'read the first ' . $this->limit('code_bytes') . ' of ' . $size . ' bytes; the rest is not judged', $meta);
+		}
+		
+		$verdict = self::codeVerdict($source ?? (string)$this->head($path, $this->limit('code_bytes')), $this->places());
+		
+		if($verdict === null)
+		{
+			return false;
+		}
+		
+		[$detector, $tier, $detail, $line] = $verdict;
+		
+		$this->finding($state, $area, $path, $detector, $tier, $detail, $meta + ['line' => $line]);
+		
+		return true;
+	}
+	
+	/**
+	 * PHP under wp-content/cache, judged by what writes there. Caching
+	 * plugins write data under PHP names: an exit or a die first (WP Super
+	 * Cache's pages, metas and debug log, LiteSpeed's guards), the same
+	 * behind W3 Total Cache's four-byte expiry, no PHP at all (its JSON blog
+	 * map), returned literals (Breeze); template engines write compiled
+	 * templates (Twig, Blade, Smarty), a few plugins code by design
+	 * (CACHE_WRITERS). Code shapes are reported wherever they stand, any
+	 * other code is cache_php
+	 */
+	protected function inspectCacheExecutable(
+		array &$state,
+		string $path,
+		int $size,
+		array $meta,
+	): void
+	{
+		if($this->isStub($path, $size))
+		{
+			return;
+		}
+		
+		$first = (string)$this->head($path, self::DIRECTIVE_BYTES);
+		
+		// the first statement decides, after any header comment: a cached page is read no further than its guard
+		if(self::inert($first) || (strlen($first) > 4 && str_starts_with(substr($first, 4), self::W3TC_GUARD)))
+		{
+			return;
+		}
+		
+		$source = $size > self::DIRECTIVE_BYTES ? (string)$this->head($path, $this->limit('code_bytes')) : $first;
+		
+		// no opener at all is output, never code; literals returned run nothing
+		if($size <= $this->limit('code_bytes') && (str_contains($source, '<?') === false || self::dataOnly($source)))
+		{
+			return;
+		}
+		
+		if($this->inspectCode($state, 'content', $path, $meta, $source)
+			|| preg_match(self::COMPILED, $source) === 1 || $this->cacheWriter($path) !== null)
+		{
+			return;
+		}
+		
+		$this->finding($state, 'content', $path, 'cache_php', self::TIER_HIGH, 'code where caches keep data', $meta);
+	}
+	
+	/** the installed plugin whose engine compiles into the uploads folder that holds $path (UPLOAD_COMPILERS), or null */
+	protected function uploadCompiler(
+		string $path,
+	): ?string
+	{
+		$relative = $this->relative($path, $this->roots['uploads']);
+		
+		foreach(self::UPLOAD_COMPILERS as $folder => $owners)
+		{
+			if(str_starts_with($relative, $folder . '/'))
+			{
+				return $this->installedOwner($owners);
+			}
+		}
+		
+		return null;
+	}
+	
+	/** the installed plugin whose cache directory holds $path by design (CACHE_WRITERS), or null */
+	protected function cacheWriter(
+		string $path,
+	): ?string
+	{
+		$top = explode('/', $this->relative($path, $this->roots['content'] . '/cache'), 2)[0];
+		
+		return isset(self::CACHE_WRITERS[$top]) ? $this->installedOwner(self::CACHE_WRITERS[$top]) : null;
+	}
+	
+	/**
+	 * Whether a translation file holds what WordPress writes there: literals
+	 * returned. One past `code_bytes` is held to its code shapes alone
+	 */
+	protected function translationData(
+		string $path,
+		int $size,
+	): bool
+	{
+		$source = (string)$this->head($path, $this->limit('code_bytes'));
+		
+		return $size <= $this->limit('code_bytes') ? self::dataOnly($source) : self::codeVerdict($source, $this->places()) === null;
+	}
+	
+	/**
+	 * The wp-config.php WordPress loads, read whole for code an intruder adds
+	 * to it: the file every request runs before any plugin, and one no list
+	 * can vouch for. Once per pass, when the walk opens the root
+	 */
+	protected function inspectConfig(
+		array &$state,
+	): void
+	{
+		if(($state['config_read'] ?? false) === true)
+		{
+			return;
+		}
+		
+		$state['config_read'] = true;
+		$config = $this->loadedConfig($this->roots['root']);
+		
+		if($config === null)
+		{
+			return;
+		}
+		
+		$stat = @stat($config);
+		$meta = $stat === false ? [] : ['size' => (int)$stat['size'], 'mtime' => (int)$stat['mtime']];
+		// nothing under uploads belongs in the file every request runs first, however it is named
+		$verdict = self::codeVerdict((string)$this->head($config, $this->limit('code_bytes')), ['strict' => true] + $this->places());
+		
+		if($verdict !== null)
+		{
+			[$detector, $tier, $detail, $line] = $verdict;
+			
+			$this->finding($state, 'root', $config, $detector, $tier, $detail, $meta + ['line' => $line]);
+		}
+	}
+	
+	/**
+	 * The wp-config.php wp-load.php requires: ABSPATH's own, else the one a
+	 * level up — unless a wp-settings.php beside it there says it belongs to
+	 * another install, which WordPress then never loads
+	 */
+	protected function loadedConfig(
+		string $root,
+	): ?string
+	{
+		if(is_file($root . '/wp-config.php'))
+		{
+			return $root . '/wp-config.php';
+		}
+		
+		$parent = $this->normalize(dirname($root));
+		
+		return is_file($parent . '/wp-config.php') && is_file($parent . '/wp-settings.php') === false
+			? $parent . '/wp-config.php'
+			: null;
+	}
+	
+	/** the first folder below a root a file stands in — its package — or the root itself for a file at its top */
+	protected function packageBase(
+		string $path,
+		string $root,
+	): string
+	{
+		$relative = $this->relative($path, $root);
+		$slash = strpos($relative, '/');
+		
+		return $slash === false || $relative === $path ? $root : $root . '/' . substr($relative, 0, $slash);
+	}
+	
+	/** whether a directory is a WordPress install's root: its wp-settings.php and wp-includes/version.php, files, beside it */
+	protected function wordpressRoot(
+		string $dir,
+	): bool
+	{
+		return is_file($dir . '/wp-settings.php') && is_file($dir . '/wp-includes/version.php');
+	}
+	
+	/**
+	 * Where an include reaches what no install keeps its code in: the uploads
+	 * root and the temp directories, lowercase with forward slashes, a prefix
+	 * too short to mean anything left out; and the uploads folders whose
+	 * writer is installed (UPLOAD_WRITERS), whose PHP that plugin includes
+	 *
+	 * @return array{uploads: string, temp: list<string>, owned: list<string>}
+	 */
+	protected function places(): array
+	{
+		if($this->places !== null)
+		{
+			return $this->places;
+		}
+		
+		$temp = [];
+		
+		foreach([sys_get_temp_dir(), (string)ini_get('upload_tmp_dir')] as $dir)
+		{
+			$dir = strtolower($this->normalize($dir));
+			
+			if(strlen($dir) > 4)
+			{
+				$temp[] = $dir;
+			}
+		}
+		
+		$owned = [];
+		
+		foreach(self::UPLOAD_WRITERS as $folder => $owners)
+		{
+			if($this->installedOwner($owners) !== null)
+			{
+				$owned[] = strtolower($folder);
+			}
+		}
+		
+		return $this->places = ['uploads' => strtolower($this->roots['uploads'] ?? ''), 'temp' => $temp, 'owned' => $owned];
 	}
 	
 	/**
@@ -1350,7 +2535,8 @@ class Scan
 		$list = null;
 		$directory = '';
 		
-		if($area === 'core' || $area === 'root')
+		// the core list speaks for the root's top level alone, never for a folder in it
+		if($area === 'core' || ($area === 'root' && $dir === $this->roots['root']))
 		{
 			$list = $this->coreList($state);
 			$directory = $area === 'root' ? '' : $this->relative($dir, $this->roots['root']);
@@ -1385,9 +2571,10 @@ class Scan
 	}
 	
 	/**
-	 * B9 — a directory changed after its newest file: something was deleted
+	 * A directory changed after its newest file: something was deleted
 	 * or renamed here recently (the shell the attacker removed, dated).
-	 * Uploads and the root only, the last thirty days only, info.
+	 * Uploads and the root itself only (an application in a folder of the
+	 * root rewrites its own), the last thirty days only, info.
 	 */
 	protected function dirChanged(
 		array &$state,
@@ -1397,7 +2584,7 @@ class Scan
 		bool $hasFiles,
 	): void
 	{
-		if(($area !== 'uploads' && $area !== 'root') || $hasFiles === false
+		if(($area !== 'uploads' && ($area !== 'root' || $dir !== $this->roots['root'])) || $hasFiles === false
 			|| $state['polish']['dir_changed'] >= self::MAX_PER_POLISH)
 		{
 			return;
@@ -1417,7 +2604,7 @@ class Scan
 	}
 	
 	/**
-	 * B11 — a file whose owner differs from its directory's siblings: the
+	 * A file whose owner differs from its directory's siblings: the
 	 * web server wrote among the deploy user's files. Silent on Windows and
 	 * on shared hosting, where everything is one uid.
 	 *
@@ -1479,7 +2666,7 @@ class Scan
 	}
 	
 	/**
-	 * B12 — a symlink is counted, never followed; one that leaves the site
+	 * A symlink is counted, never followed; one that leaves the site
 	 * (another vhost's tree, /etc) is the symlink attack and a finding
 	 */
 	protected function inspectSymlink(
@@ -1537,8 +2724,7 @@ class Scan
 			return;
 		}
 		
-		$dot = strrpos($lower, '.');
-		$extension = $dot === false ? '' : substr($lower, $dot + 1);
+		$extension = self::extension($lower);
 		
 		if(in_array($extension, self::MEDIA, true) === false
 			&& ($area !== 'uploads' || in_array($extension, self::MEDIA_TEXT, true) === false))
@@ -1737,7 +2923,7 @@ class Scan
 	}
 	
 	/**
-	 * The database phase (WS3): the attacker's other filesystem, read by
+	 * The database phase: the attacker's other filesystem, read by
 	 * Database — every finding an id, an option name or a hook, never a
 	 * name or a value
 	 */
@@ -1745,7 +2931,21 @@ class Scan
 		array &$state,
 	): void
 	{
-		$result = (new Database)->scan();
+		$result = (new Database($this->roots, (int)($state['resume']['posts'] ?? 0), (array)($state['resume']['posts_found'] ?? [])))->scan();
+		$state['resume_next']['posts'] = (int)($result['stats']['posts_cursor'] ?? 0);
+		$state['resume_next']['posts_found'] = (array)($result['posts'] ?? []);
+		unset($result['stats']['posts_cursor']);
+		
+		// what the detectors' caps left out was found and not listed: the report says so
+		foreach((array)($result['truncated'] ?? []) as $tier => $count)
+		{
+			if(isset($state['truncated'][$tier]))
+			{
+				$state['counts'][$tier] += (int)$count;
+				$state['truncated'][$tier] += (int)$count;
+				$state['areas'][Database::AREA]['truncated'] = ($state['areas'][Database::AREA]['truncated'] ?? 0) + (int)$count;
+			}
+		}
 		
 		foreach($result['findings'] as $finding)
 		{
@@ -1996,16 +3196,31 @@ class Scan
 		
 		if(count($state['findings']) >= self::MAX_FINDINGS)
 		{
-			$state['truncated'][$tier]++;
+			$victim = $this->outranked($state['findings'], $tier);
 			
-			return;
+			if($victim === null)
+			{
+				$state['truncated'][$tier]++;
+				$state['areas'][$area]['truncated'] = ($state['areas'][$area]['truncated'] ?? 0) + 1;
+				
+				return;
+			}
+			
+			// the last listed finding of the lowest tier below this one gives up its place, counted where it was, by tier and by area
+			$given = $state['findings'][$victim];
+			$state['truncated'][$given['tier']]++;
+			$state['areas'][$given['area']]['truncated'] = ($state['areas'][$given['area']]['truncated'] ?? 0) + 1;
+			array_splice($state['findings'], $victim, 1);
 		}
 		
 		$finding = [
 			'detector' => $detector,
 			'tier' => $tier,
 			'area' => $area,
-			'path' => $this->clean($this->relative($path, (string)$state['areas'][$area]['root'])),
+			// codesafe refuses a whole report over one path with a `..` segment, and an
+			// intruder names a cron hook or an active plugin entry; either separator counts
+			'path' => $this->clean((string)preg_replace('~(?<=^|[/\\\\])\.\.(?=$|[/\\\\])~', '%2E%2E',
+				$this->relative($path, (string)$state['areas'][$area]['root']))),
 		];
 		
 		if(isset($meta['size']))
@@ -2029,6 +3244,33 @@ class Scan
 		}
 		
 		$state['findings'][] = $finding;
+	}
+	
+	/**
+	 * The index of the last listed finding of the lowest tier below $tier,
+	 * or null when every listed finding ranks as high
+	 *
+	 * @param list<array<string, mixed>> $findings
+	 */
+	protected function outranked(
+		array $findings,
+		string $tier,
+	): ?int
+	{
+		$rank = [self::TIER_INFO => 1, self::TIER_HIGH => 2, self::TIER_URGENT => 3];
+		$victim = null;
+		
+		foreach($findings as $index => $finding)
+		{
+			$their = $rank[$finding['tier']] ?? 0;
+			
+			if($their < $rank[$tier] && ($victim === null || $their <= $rank[$findings[$victim]['tier']]))
+			{
+				$victim = $index;
+			}
+		}
+		
+		return $victim;
 	}
 	
 	protected function skip(
@@ -2132,7 +3374,9 @@ class Scan
 	 * Whether PHP stops before any code in $source runs: after the opener the
 	 * first statement is __halt_compiler(), or an exit or die whose argument
 	 * is a literal or nothing (an expression there runs before the exit).
-	 * Without the tokenizer nothing is judged inert
+	 * Read slice by slice (slices()): a long header comment is one token, and
+	 * no first block of bytes decides. Without the tokenizer nothing is judged
+	 * inert
 	 */
 	public static function inert(
 		string $source,
@@ -2146,52 +3390,80 @@ class Scan
 		$opened = false;
 		$statement = [];
 		
-		foreach(token_get_all($source) as $token)
+		foreach(self::slices($source) as $tokens)
 		{
-			$id = is_array($token) ? $token[0] : $token;
-			
-			if(in_array($id, [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)
-				|| ($opened === false && $id === T_INLINE_HTML && trim($token[1]) === ''))
+			foreach($tokens as [$id, $text])
 			{
-				continue;
-			}
-			
-			if($opened === false)
-			{
-				if($id !== T_OPEN_TAG)
+				if($opened === false)
 				{
-					return false;
+					if($id === T_INLINE_HTML && trim($text) === '')
+					{
+						continue;
+					}
+					
+					if($id !== T_OPEN_TAG)
+					{
+						return false;
+					}
+					
+					$opened = true;
+					
+					continue;
 				}
 				
-				$opened = true;
+				$statement[] = $id;
 				
-				continue;
-			}
-			
-			$statement[] = $id;
-			
-			if(count($statement) === 5)
-			{
-				break;
+				if(count($statement) === 5)
+				{
+					break 2;
+				}
 			}
 		}
 		
-		[$first, $second, $third, $fourth, $fifth] = $statement + [null, null, null, null, null];
-		$end = [';', T_CLOSE_TAG];
-		
-		return $first === T_HALT_COMPILER
-			|| ($first === T_EXIT && (in_array($second, $end, true)
-				|| ($second === '(' && $third === ')' && in_array($fourth, $end, true))
-				|| ($second === '(' && in_array($third, [T_LNUMBER, T_CONSTANT_ENCAPSED_STRING], true)
-					&& $fourth === ')' && in_array($fifth, $end, true))));
+		return ($statement[0] ?? null) === T_HALT_COMPILER
+			|| (($statement[0] ?? null) === T_EXIT && self::exitsCleanly($statement, 0));
 	}
 	
 	/**
-	 * Whether $source only assigns literal data: variables, strings, numbers,
-	 * true, false, null and arrays, nothing that can call or include code — a
-	 * `(` is allowed only right after `array`, so `$f('x')` is refused. What
-	 * Ultimate Addons writes into its icon sets' charmap.php. Without the
-	 * tokenizer nothing is judged data
+	 * Whether the tokens from $at are an exit or die that runs nothing first —
+	 * bare, empty or taking one literal, then the statement's end — or a bare
+	 * `return`, which ends a requested file alike
+	 *
+	 * @param list<int|string> $ids token ids
+	 */
+	protected static function exitsCleanly(
+		array $ids,
+		int $at,
+	): bool
+	{
+		$end = [';', T_CLOSE_TAG];
+		$next = $ids[$at + 1] ?? null;
+		
+		return match($ids[$at] ?? null)
+		{
+			T_RETURN => in_array($next, $end, true),
+			T_EXIT => in_array($next, $end, true)
+				|| ($next === '(' && ($ids[$at + 2] ?? null) === ')' && in_array($ids[$at + 3] ?? null, $end, true))
+				|| ($next === '(' && in_array($ids[$at + 2] ?? null, [T_LNUMBER, T_CONSTANT_ENCAPSED_STRING], true)
+					&& ($ids[$at + 3] ?? null) === ')' && in_array($ids[$at + 4] ?? null, $end, true)),
+			default => false,
+		};
+	}
+	
+	/**
+	 * Whether $source only assigns or returns data: variables, strings,
+	 * numbers, constants (PHP_INT_MAX, ABSPATH, __DIR__), heredocs, arrays and
+	 * the arithmetic that combines them, behind an optional
+	 * `defined('ABSPATH') || exit` guard in any of its spellings — nothing
+	 * that can call or include code but the calls in DATA_CALLS. A `(` after
+	 * a value would call it and is refused, after an operator it groups, so
+	 * `$f('x')`, `'system'('id')` and `[$o, 'm']()` stay code, and so do a
+	 * method, a static and an interpolated call. What Ultimate Addons writes
+	 * into its icon sets' charmap.php, a build into `*.asset.php`, WordPress
+	 * into `.l10n.php`, the i18n tools into a plugin's table of its scripts'
+	 * strings, caching plugins into their config files. Read element by
+	 * element (slices()), so a large array is never one token array. Without
+	 * the tokenizer nothing is judged data
 	 */
 	public static function dataOnly(
 		string $source,
@@ -2205,57 +3477,1653 @@ class Scan
 		// 0 before the opener, 1 inside PHP, 2 after the closer
 		$phase = 0;
 		$previous = null;
+		$values = [T_VARIABLE, T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER, T_DIR, T_FILE, T_LINE, T_END_HEREDOC,
+			')', ']', '}', '"', 'constant'];
 		
-		foreach(token_get_all($source) as $token)
+		foreach(self::slices($source, true) as $tokens)
 		{
-			$id = is_array($token) ? $token[0] : $token;
-			
-			if($phase !== 1 && $id === T_INLINE_HTML && trim($token[1]) === '')
+			foreach($tokens as $index => [$id, $text])
 			{
-				continue;
-			}
-			
-			if($phase !== 1)
-			{
-				if($phase === 2 || $id !== T_OPEN_TAG)
+				if($phase !== 1 && $id === T_INLINE_HTML && trim($text) === '')
+				{
+					continue;
+				}
+				
+				if($phase !== 1)
+				{
+					if($phase === 2 || $id !== T_OPEN_TAG)
+					{
+						return false;
+					}
+					
+					$phase = 1;
+					
+					continue;
+				}
+				
+				if($id === T_CLOSE_TAG)
+				{
+					$phase = 2;
+					
+					continue;
+				}
+				
+				$name = $id === T_STRING || $id === T_NAME_FULLY_QUALIFIED ? strtolower(ltrim($text, '\\')) : null;
+				$next = $tokens[$index + 1][0] ?? null;
+				$allowed = match(true)
+				{
+					$id === '(' => in_array($previous, [T_ARRAY, T_IF, T_EXIT, ...self::DATA_CALLS], true)
+						|| in_array($previous, $values, true) === false,
+					// a name is a call only where DATA_CALLS allows one, else a constant: never called, never a class
+					$name !== null => in_array($name, self::DATA_CALLS, true) ? $next === '(' : $next !== '(' && $next !== T_DOUBLE_COLON,
+					default => in_array($id, self::DATA_TOKENS, true),
+				};
+				
+				if($allowed === false)
 				{
 					return false;
 				}
 				
-				$phase = 1;
-				
-				continue;
+				$previous = match(true)
+				{
+					$name !== null && in_array($name, self::DATA_CALLS, true) => $name,
+					$name !== null => 'constant',
+					default => $id,
+				};
 			}
-			
-			if(in_array($id, [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true))
-			{
-				continue;
-			}
-			
-			if($id === T_CLOSE_TAG)
-			{
-				$phase = 2;
-				
-				continue;
-			}
-			
-			$allowed = match(true)
-			{
-				$id === '(' => $previous === T_ARRAY,
-				$id === T_STRING => in_array(strtolower($token[1]), ['true', 'false', 'null'], true),
-				default => in_array($id, [T_VARIABLE, T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER, T_ARRAY,
-					T_DOUBLE_ARROW, '=', ';', '[', ']', ',', ')', '-', '.'], true),
-			};
-			
-			if($allowed === false)
-			{
-				return false;
-			}
-			
-			$previous = $id;
 		}
 		
 		return $phase !== 0;
+	}
+	
+	/**
+	 * What code in $source does that honest code does not, read with the
+	 * tokenizer in Database's code markers, PHP's command functions and the
+	 * functions that call what they are handed: request input reaching an
+	 * executor or a command, called as a function or handed as the function
+	 * another calls, run by backticks or included (request_exec — urgent, high
+	 * where an escaper or a sanitizer wraps it or the code dispatches on it
+	 * through its own object or a literal prefix); an include of a stream
+	 * URL, of a file under uploads or in a temp directory, of a media file
+	 * (include_foreign — urgent, high for a fixed PHP file under uploads
+	 * outside wp-config.php, nothing for one in an uploads folder an installed
+	 * plugin writes); a decoder's output or a stream's content fed to an
+	 * executor or a command (eval_chain, high). The worst shape wins, the
+	 * first of it names the line. A method of the same name
+	 * (`$this->assert(`) or a function's definition is not PHP's own. A
+	 * callback that runs its parameter, handed request input, is a runner
+	 * (callback()); one named by a string resolves once the file defines it,
+	 * before or after the call. Read slice by slice (slices()); a call cut
+	 * past CALL_TOKENS whose verdict hangs on an argument's place is
+	 * oversize_call (high) when the file draws no other verdict. Without the
+	 * tokenizer nothing is judged
+	 *
+	 * @param array{uploads?: string, temp?: list<string>, owned?: list<string>, strict?: bool} $places places()
+	 * @return ?array{0: string, 1: string, 2: string, 3: int} detector, tier, detail, line
+	 */
+	public static function codeVerdict(
+		string $source,
+		array $places = [],
+	): ?array
+	{
+		if(function_exists('token_get_all') === false || self::suspect($source, $places) === false)
+		{
+			return null;
+		}
+		
+		$found = null;
+		$oversize = null;
+		// the functions the file defines that run their parameter, and the calls that hand one request input before it is defined
+		$context = ['runs' => [], 'pending' => [], 'shells' => 0];
+		
+		foreach(self::slices($source) as $label => $tokens)
+		{
+			// a slice never ends inside a string, so its backticks pair up within it
+			$context['shells'] = 0;
+			
+			foreach($tokens as $index => [$id, , $line])
+			{
+				$name = $id === T_FUNCTION ? self::functionName($tokens, $index) : null;
+				$sink = $name === null ? null : self::parameterSink($tokens, $index);
+				
+				if($sink !== null)
+				{
+					$context['runs'][$name] = $sink;
+				}
+				
+				// a call made before the definition is judged now
+				$verdict = $sink === null ? null : ($context['pending'][$name] ?? null);
+				$verdict ??= self::shapeAt($tokens, $index, $places, $context);
+				
+				if($verdict === null)
+				{
+					continue;
+				}
+				
+				$verdict[3] ??= $line;
+				
+				if($verdict[1] === self::TIER_URGENT)
+				{
+					return $verdict;
+				}
+				
+				$found ??= $verdict;
+			}
+			
+			if($label !== '')
+			{
+				$oversize ??= ['oversize_call', self::TIER_HIGH, ($label === ')' ? 'a call on a call' : 'a call to ' . $label . '()')
+					. ' longer than the scan reads at once; read it by hand', (int)($tokens[count($tokens) - 1][2] ?? 1)];
+			}
+		}
+		
+		return $found ?? $oversize;
+	}
+	
+	/**
+	 * The shape that starts at the token at $index, or null
+	 *
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function shapeAt(
+		array $tokens,
+		int $index,
+		array $places,
+		array &$context,
+	): ?array
+	{
+		$id = $tokens[$index][0];
+		
+		if($id === T_EVAL)
+		{
+			return self::fed($tokens, $index, 'eval', $context);
+		}
+		
+		// the backtick that closes a shell command opens none
+		if($id === '`')
+		{
+			return $context['shells']++ % 2 === 0 ? self::backticked($tokens, $index) : null;
+		}
+		
+		if(in_array($id, [T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE], true))
+		{
+			return self::included($tokens, $index, $places);
+		}
+		
+		$runner = self::runnerAt($tokens, $index);
+		
+		if($runner !== null)
+		{
+			return self::fed($tokens, $index, $runner, $context);
+		}
+		
+		$input = self::inputAt($tokens, $index);
+		
+		return $input === null ? null : self::requestCalled($tokens, $index, $input);
+	}
+	
+	/**
+	 * Whether $source can hold a code shape at all, by pattern, before the
+	 * tokenizer is paid for: a runner's call — a comment may stand before its
+	 * parenthesis — beside request input or a decoder's call; request input
+	 * called or in backticks; an include beside request input, a stream, an
+	 * upload or temp path, an escaped byte or a quoted media file, however
+	 * far apart.
+	 * The comment group is unrolled, so no input makes PCRE backtrack, and a
+	 * PCRE error reads as suspect: the tokenizer judges instead
+	 *
+	 * @param array{uploads?: string, temp?: list<string>} $places
+	 */
+	protected static function suspect(
+		string $source,
+		array $places = [],
+	): bool
+	{
+		$comment = '(?:/\*[^*]*\*+(?:[^/*][^*]*\*+)*/\s*|(?://|#)[^\n]*\n\s*)*';
+		$call = '\s*' . $comment . '\(';
+		$input = self::matches('~\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|\$GLOBALS\s*\[\s*[\'"]_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b'
+			. '|php://input|\b(?:' . implode('|', self::INPUT_FUNCTIONS) . ')\s*\(~i', $source);
+		
+		if(self::matches('~\b(?:eval|' . implode('|', self::runners()) . ')' . $call . '~i', $source)
+			&& ($input || self::matches('~\b(?:' . implode('|', self::decoders()) . ')' . $call . '|://|\bdata:~i', $source)))
+		{
+			return true;
+		}
+		
+		if($input && (str_contains($source, '`') || self::matches('~[\])]\s*' . $comment . '\(~', $source)))
+		{
+			return true;
+		}
+		
+		$where = [];
+		
+		foreach([(string)($places['uploads'] ?? ''), ...(array)($places['temp'] ?? [])] as $place)
+		{
+			if($place !== '')
+			{
+				$where[] = preg_quote($place, '~');
+			}
+		}
+		
+		// an include and what it may name, each anywhere, as a runner and its input: the tokenizer decides whether one names the other
+		return self::matches('~\b(?:include|require)(?:_once)?\b~i', $source)
+			&& self::matches('~\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|\$GLOBALS|://|\bdata:'
+			. '|\b(?:' . implode('|', self::INPUT_FUNCTIONS) . ')\b|wp-content/uploads|upload_dir|/tmp/|/shm/|temp_dir|\\\\[0-7]{3}|\\\\x[0-9a-f]{2}'
+			. '|\.(?:' . implode('|', self::includeMedia()) . ')[\'"]|[\'"](?:' . implode('|', self::includeMedia()) . ')[\'"]'
+			. ($where === [] ? '' : '|' . implode('|', $where)) . '~i', $source);
+	}
+	
+	/** whether a pattern matches, a PCRE error counted as a match: the caller then reads the source itself */
+	protected static function matches(
+		string $pattern,
+		string $subject,
+	): bool
+	{
+		return preg_match($pattern, $subject) !== 0;
+	}
+	
+	/**
+	 * Whether $source does something of its own when the web server is asked
+	 * for it by URL — what a file planted among a package's assets is for. An
+	 * exit first, a first statement that exits unless WordPress defined its
+	 * constant (`defined('ABSPATH') || exit`, `if(!defined('WPINC')) die;`, a
+	 * bare `return` alike) while that exit runs nothing itself, literal data
+	 * and declarations alone (a namespace, imports, classes, functions,
+	 * constants) run nothing. Without the tokenizer anything runs
+	 */
+	public static function runsOnRequest(
+		string $source,
+	): bool
+	{
+		if(function_exists('token_get_all') === false)
+		{
+			return true;
+		}
+		
+		if(self::inert($source) || self::dataOnly($source))
+		{
+			return false;
+		}
+		
+		$ids = [];
+		
+		// the first statement's ids: a guard is the same few tokens in every spelling
+		foreach(self::slices($source) as $tokens)
+		{
+			foreach($tokens as [$id, $text])
+			{
+				$ids[] = match(true)
+				{
+					$id === T_STRING || $id === T_NAME_FULLY_QUALIFIED => strtolower(ltrim($text, '\\')),
+					$id === T_BOOLEAN_OR || $id === T_LOGICAL_OR => '||',
+					default => $id,
+				};
+			}
+			
+			break;
+		}
+		
+		$ids = array_slice($ids, (int)array_search(T_OPEN_TAG, $ids, true) + 1, 16);
+		$guard = ['defined', '(', T_CONSTANT_ENCAPSED_STRING, ')'];
+		
+		foreach([[...$guard, '||'], [T_IF, '(', '!', ...$guard, ')'], [T_IF, '(', '!', ...$guard, ')', '{']] as $shape)
+		{
+			if(array_slice($ids, 0, count($shape)) === $shape && self::exitsCleanly($ids, count($shape)))
+			{
+				return false;
+			}
+		}
+		
+		return self::declaresOnly($source) === false;
+	}
+	
+	/**
+	 * Whether $source runs nothing alone at its top level: every statement
+	 * there declares — a namespace, imports, declare(), constants, classes,
+	 * interfaces, traits, enums and functions with their attributes, whose
+	 * bodies run only when something calls them — up to a first statement
+	 * that calls a function only WordPress defines (WORDPRESS_CALLS) and the
+	 * file does not (definedNames()): requested by URL, without WordPress
+	 * loaded, PHP stops at that call
+	 */
+	protected static function declaresOnly(
+		string $source,
+	): bool
+	{
+		$declarations = [T_NAMESPACE, T_USE, T_DECLARE, T_CONST, T_CLASS, T_INTERFACE, T_TRAIT, T_ENUM, T_FUNCTION,
+			T_ABSTRACT, T_FINAL, T_READONLY, T_ATTRIBUTE];
+		$depth = 0;
+		$start = true;
+		
+		foreach(self::slices($source) as $tokens)
+		{
+			foreach($tokens as $index => [$id, $text])
+			{
+				if(in_array($id, [T_OPEN_TAG, T_CLOSE_TAG], true) || ($id === T_INLINE_HTML && $depth === 0 && $start))
+				{
+					continue;
+				}
+				
+				if($depth === 0 && $start && in_array($id, $declarations, true) === false)
+				{
+					$name = strtolower(ltrim((string)$text, '\\'));
+					
+					// a function of that name the file defines or imports itself is the file's own, and runs
+					return ($id === T_STRING || $id === T_NAME_FULLY_QUALIFIED)
+						&& ($tokens[$index + 1][0] ?? null) === '('
+						&& preg_match(self::WORDPRESS_CALLS, $name) === 1
+						&& in_array($name, self::definedNames($source), true) === false;
+				}
+				
+				$start = false;
+				
+				if(in_array($id, ['{', T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true))
+				{
+					$depth++;
+				}
+				elseif($id === '}')
+				{
+					$depth--;
+					// a declaration's body closed: the next token starts a statement
+					$start = $depth === 0;
+				}
+				elseif($id === ';' && $depth === 0)
+				{
+					$start = true;
+				}
+			}
+		}
+		
+		return true;
+	}
+	
+	/**
+	 * The names of the functions $source defines anywhere — PHP hoists them,
+	 * so one defined after its call is there for it — and the names it
+	 * imports anything as (`use function … as …`), lowercase
+	 *
+	 * @return list<string>
+	 */
+	protected static function definedNames(
+		string $source,
+	): array
+	{
+		$names = [];
+		
+		foreach(self::slices($source) as $tokens)
+		{
+			foreach($tokens as $index => [$id])
+			{
+				$name = match(true)
+				{
+					$id === T_FUNCTION => self::functionName($tokens, $index),
+					$id === T_AS && ($tokens[$index + 1][0] ?? null) === T_STRING => strtolower($tokens[$index + 1][1]),
+					default => null,
+				};
+				
+				if($name !== null)
+				{
+					$names[] = $name;
+				}
+			}
+		}
+		
+		return $names;
+	}
+	
+	/**
+	 * $source's significant tokens — comments and whitespace left out, each
+	 * as [id, text, line] — in slices the tokenizer reads one at a time, so a
+	 * dense file is never one token array: about SLICE_BYTES each, ending
+	 * where cut() says — never inside a string, never inside a runner's call
+	 * or an include's expression but past CALL_TOKENS, data element by
+	 * element with $elements. The next slice is read from there in PHP mode,
+	 * on the source's own lines. A cut inside a string or a comment the
+	 * tokenizer read whole reads as one string or comment token, so a `;` the
+	 * tokenizer saw is a real one. A slice cut inside a runner's call begins
+	 * the next one with the open calls' heads, so what follows is read as
+	 * their arguments, and is keyed by the call whose verdict the heads
+	 * cannot carry (cut()'s label; '' for every other slice)
+	 *
+	 * @return Generator<string, list<array{0: int|string, 1: string, 2: int}>>
+	 */
+	protected static function slices(
+		string $source,
+		bool $elements = false,
+	): Generator
+	{
+		$length = strlen($source);
+		$start = 0;
+		$line = 1;
+		// the brackets the last slice was cut inside, past CALL_TOKENS
+		$open = [];
+		
+		while($start < $length)
+		{
+			$prefix = $start === 0 ? '' : '<?php ';
+			$size = self::SLICE_BYTES;
+			
+			while(true)
+			{
+				$end = min($length, $start + $size);
+				$raw = token_get_all($prefix . substr($source, $start, $end - $start));
+				$cut = $end >= $length ? ['at' => count($raw), 'open' => [], 'label' => ''] : self::cut($raw, $elements, $open);
+				
+				// the opener a later slice is given is no progress of its own
+				if($cut !== null && $cut['at'] > ($prefix === '' ? 0 : 1))
+				{
+					break;
+				}
+				
+				$size *= 2;
+			}
+			
+			$tokens = [];
+			
+			// the heads of the calls the last slice was cut inside: what follows is their arguments
+			foreach($open as [, $head])
+			{
+				foreach($head as [$id, $text])
+				{
+					$tokens[] = [$id, $text, $line];
+				}
+			}
+			
+			$consumed = 0;
+			$at = $line;
+			
+			for($index = 0; $index < $cut['at']; $index++)
+			{
+				$token = $raw[$index];
+				$consumed += strlen(is_array($token) ? $token[1] : $token);
+				$at = is_array($token) ? $line + (int)$token[2] - 1 : $at;
+				
+				if(($index === 0 && $prefix !== '') || (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)))
+				{
+					continue;
+				}
+				
+				$tokens[] = is_array($token) ? [$token[0], $token[1], $at] : [$token, $token, $at];
+			}
+			
+			unset($raw);
+			$consumed -= strlen($prefix);
+			$line += substr_count($source, "\n", $start, $consumed);
+			$start += $consumed;
+			$open = $cut['open'];
+			
+			yield $cut['label'] => $tokens;
+		}
+	}
+	
+	/**
+	 * Where a slice's tokens end (slices()): never inside a string, and but
+	 * for data ($elements) never inside a runner's call (owner()) or an
+	 * include's expression — after the last `;` outside every bracket, else
+	 * after the last `;` or `,`, else, past SLICE_TOKENS, after the last
+	 * operator; null while there is none and the slice may grow. A runner's
+	 * call grows its slice up to CALL_TOKENS and past that is cut after its
+	 * last operator anyway, handing the next slice the brackets open there
+	 * (`open`: each [owner, the tokens its head is carried as, whether it is
+	 * an include without parentheses]) and naming the outermost call whose
+	 * verdict hangs on an argument's place (`label`: a function of
+	 * CALLABLES, `)` for a call on a call), which its head cannot carry
+	 *
+	 * @param list<mixed> $raw token_get_all()'s
+	 * @param list<array{0: string, 1: list<array{0: int|string, 1: string}>, 2: bool}> $open the brackets the last slice was cut inside
+	 * @return ?array{at: int, open: list<array{0: string, 1: list<array{0: int|string, 1: string}>, 2: bool}>, label: string}
+	 */
+	protected static function cut(
+		array $raw,
+		bool $elements,
+		array $open = [],
+	): ?array
+	{
+		$read = self::read($raw, $elements, $open, count($raw));
+		$cut = $elements ? $read['any'] : ($read['statement'] ?? $read['any']);
+		
+		if($cut !== null)
+		{
+			return ['at' => $cut, 'open' => [], 'label' => ''];
+		}
+		
+		if(count($raw) <= self::SLICE_TOKENS)
+		{
+			return null;
+		}
+		
+		if($elements || $read['owned'] === 0)
+		{
+			return ['at' => $read['operator'] ?? count($raw) - 1, 'open' => [], 'label' => ''];
+		}
+		
+		if(count($raw) <= self::CALL_TOKENS)
+		{
+			return null;
+		}
+		
+		$at = $read['forced'] ?? count($raw) - 1;
+		// what is open where the cut falls, read again up to it: rare enough not to be kept on every operator
+		$stack = self::read($raw, $elements, $open, $at)['stack'];
+		$label = '';
+		
+		foreach($stack as [$owner])
+		{
+			if($owner === ')' || isset(self::CALLABLES[$owner]))
+			{
+				$label = $owner;
+				
+				break;
+			}
+		}
+		
+		return ['at' => $at, 'open' => $stack, 'label' => $label];
+	}
+	
+	/**
+	 * cut()'s reading of $raw's first $until tokens: the brackets open at
+	 * the end (`stack`) and how many of them a runner's call or an include
+	 * owns, and the places a slice may end — after the last `;` outside
+	 * every bracket (`statement`), after the last `;` or `,` outside a
+	 * runner's call and every string (`any`), after the last operator there
+	 * (`operator`) and after the last operator outside every string
+	 * (`forced`)
+	 *
+	 * @param list<array{0: string, 1: list<array{0: int|string, 1: string}>, 2: bool}> $open
+	 * @return array{stack: list<array{0: string, 1: list<array{0: int|string, 1: string}>, 2: bool}>, owned: int, statement: ?int, any: ?int, operator: ?int, forced: ?int}
+	 */
+	protected static function read(
+		array $raw,
+		bool $elements,
+		array $open,
+		int $until,
+	): array
+	{
+		$runners = array_flip(self::runners());
+		$stack = $open;
+		$owned = count(array_filter($open, static fn(array $entry): bool => $entry[0] !== ''));
+		$quotes = [];
+		$statement = null;
+		$any = null;
+		$operator = null;
+		$forced = null;
+		$lastId = null;
+		$lastText = '';
+		$beforeId = null;
+		
+		for($index = 0; $index < $until; $index++)
+		{
+			$token = $raw[$index];
+			
+			if(is_array($token))
+			{
+				[$id, $text] = $token;
+				
+				if($id === T_WHITESPACE || $id === T_COMMENT || $id === T_DOC_COMMENT)
+				{
+					continue;
+				}
+				
+				// a name, a variable, a literal: only the next bracket asks for it
+				if(isset(self::CUT_MARKS[$id]) === false)
+				{
+					$beforeId = $lastId;
+					$lastId = $id;
+					$lastText = $text;
+					
+					continue;
+				}
+			}
+			else
+			{
+				$id = $text = $token;
+			}
+			
+			if($id === T_START_HEREDOC || (($id === '"' || $id === '`') && end($quotes) !== $id))
+			{
+				$quotes[] = $id;
+			}
+			elseif($id === T_END_HEREDOC || $id === '"' || $id === '`')
+			{
+				array_pop($quotes);
+			}
+			elseif($quotes !== [])
+			{
+				// an interpolation's tokens stand inside the string: no place to cut
+			}
+			elseif($id === '[')
+			{
+				$stack[] = ['', [['[', '[']], false];
+			}
+			elseif($id === '(')
+			{
+				$owner = self::owner([$lastId, $lastText], [$beforeId, ''], $runners);
+				$stack[] = [$owner, self::carried('(', $owner, [$lastId, $lastText], [$beforeId, '']), false];
+				$owned += $owner === '' ? 0 : 1;
+			}
+			elseif($id === ')' || $id === ']' || $id === ';' || $id === ',' || $id === T_CLOSE_TAG)
+			{
+				// an include without parentheses ends with its expression
+				while($stack !== [] && end($stack)[2])
+				{
+					array_pop($stack);
+					$owned--;
+				}
+				
+				if(($id === ')' || $id === ']') && $stack !== [])
+				{
+					$owned -= array_pop($stack)[0] === '' ? 0 : 1;
+				}
+				elseif(($id === ';' || $id === ',') && ($elements || $owned === 0))
+				{
+					$any = $index + 1;
+					$statement = $id === ';' && $stack === [] ? $index + 1 : $statement;
+				}
+			}
+			elseif($id === T_INCLUDE || $id === T_INCLUDE_ONCE || $id === T_REQUIRE || $id === T_REQUIRE_ONCE)
+			{
+				$stack[] = [strtolower($text), [[$id, $text]], true];
+				$owned++;
+			}
+			
+			if($quotes === [] && isset(self::CUT_AFTER[$id]))
+			{
+				$forced = $index + 1;
+				$operator = $elements || $owned === 0 ? $index + 1 : $operator;
+			}
+			
+			$beforeId = $lastId;
+			$lastId = $id;
+			$lastText = $text;
+		}
+		
+		return ['stack' => $stack, 'owned' => $owned, 'statement' => $statement, 'any' => $any, 'operator' => $operator, 'forced' => $forced];
+	}
+	
+	/**
+	 * The runner whose call the `(` after $last opens, $before standing before
+	 * that: eval, a runner by its name (no method, no definition), `)` for a
+	 * call on what a call or a group returns; '' for any other parenthesis —
+	 * an include's own entry holds its parenthesis (read())
+	 *
+	 * @param array{0: int|string|null, 1: string} $last
+	 * @param array{0: int|string|null, 1: string} $before
+	 * @param array<string, int> $runners runners(), flipped
+	 */
+	protected static function owner(
+		array $last,
+		array $before,
+		array $runners,
+	): string
+	{
+		[$id, $text] = $last;
+		$name = strtolower(ltrim($text, '\\'));
+		
+		return match(true)
+		{
+			$id === T_EVAL => 'eval',
+			($id === T_STRING || $id === T_NAME_FULLY_QUALIFIED) && self::called($before[0]) && isset($runners[$name]) => $name,
+			$id === ')' => ')',
+			default => '',
+		};
+	}
+	
+	/** whether a name after a token of $id is a function's call: no method, static, definition or constructor */
+	protected static function called(
+		int|string|null $id,
+	): bool
+	{
+		return in_array($id, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION, T_CONST, T_NEW], true) === false;
+	}
+	
+	/**
+	 * The tokens a bracket is carried into the next slice as (cut()): eval
+	 * and a function by its name with their parenthesis — a decoder or a
+	 * sanitizer still wraps what follows — and a bare bracket for the rest,
+	 * an include's keyword being carried by its own entry; a call whose
+	 * verdict hangs on an argument's place is carried bare, since the places
+	 * before the cut are gone
+	 *
+	 * @param array{0: int|string|null, 1: string} $last
+	 * @param array{0: int|string|null, 1: string} $before
+	 * @return list<array{0: int|string, 1: string}>
+	 */
+	protected static function carried(
+		string $bracket,
+		string $owner,
+		array $last,
+		array $before,
+	): array
+	{
+		$named = $last[0] === T_EVAL || (($last[0] === T_STRING || $last[0] === T_NAME_FULLY_QUALIFIED) && self::called($before[0]));
+		
+		return $bracket === '(' && $named && $owner !== ')' && isset(self::CALLABLES[$owner]) === false
+			? [[$last[0], $last[1]], ['(', '(']]
+			: [[$bracket, $bracket]];
+	}
+	
+	/** the tokens read() looks at besides the one-character ones: strings' bounds, includes, the closing tag and CUT_AFTER's */
+	protected const CUT_MARKS = [T_START_HEREDOC => 1, T_END_HEREDOC => 1, T_INCLUDE => 1, T_INCLUDE_ONCE => 1, T_REQUIRE => 1, T_REQUIRE_ONCE => 1,
+		T_CLOSE_TAG => 1, T_DOUBLE_ARROW => 1, T_BOOLEAN_AND => 1, T_BOOLEAN_OR => 1, T_LOGICAL_AND => 1, T_LOGICAL_OR => 1, T_COALESCE => 1,
+		T_CONCAT_EQUAL => 1];
+	
+	/** the tokens after which a slice cut past SLICE_TOKENS may end (cut()): an operator, an opening bracket, a separator */
+	protected const CUT_AFTER = ['.' => 1, '+' => 1, '-' => 1, '*' => 1, '/' => 1, '%' => 1, '=' => 1, '?' => 1, ':' => 1, '(' => 1, '[' => 1,
+		',' => 1, T_DOUBLE_ARROW => 1, T_BOOLEAN_AND => 1, T_BOOLEAN_OR => 1, T_LOGICAL_AND => 1, T_LOGICAL_OR => 1, T_COALESCE => 1, T_CONCAT_EQUAL => 1];
+	
+	/** the functions that run what they are given: Database's executors but eval (a language construct), PHP's commands, and the functions that call the callable they are handed (CALLABLES) */
+	protected static function runners(): array
+	{
+		return [...self::literalRunners(), ...array_keys(self::CALLABLES)];
+	}
+	
+	/** the runners a string may name: Database's executors but eval, which is no function, and PHP's commands */
+	protected static function literalRunners(): array
+	{
+		$runners = Database::COMMANDS;
+		
+		foreach(Database::CODE_EXECUTORS as $marker)
+		{
+			if($marker !== 'eval(')
+			{
+				$runners[] = substr($marker, 0, -1);
+			}
+		}
+		
+		return $runners;
+	}
+	
+	/** @return list<string> Database's decoders by name, and the ones a file's obfuscation uses beside them (DECODERS) */
+	protected static function decoders(): array
+	{
+		$decoders = self::DECODERS;
+		
+		foreach(Database::CODE_DECODERS as $marker)
+		{
+			$decoders[] = substr($marker, 0, -1);
+		}
+		
+		return $decoders;
+	}
+	
+	/** the media an include has no honest reason to name: the probed media but SVG (themes inline their icons by include) and the text formats */
+	protected static function includeMedia(): array
+	{
+		return [...array_diff(self::MEDIA, ['svg']), ...self::MEDIA_TEXT];
+	}
+	
+	/** whether the token at $index calls one of PHP's own $names: followed by `(`, not a method, a static, a definition or a constructor */
+	protected static function callsOneOf(
+		array $tokens,
+		int $index,
+		array $names,
+	): bool
+	{
+		[$id, $text] = $tokens[$index];
+		
+		return ($id === T_STRING || $id === T_NAME_FULLY_QUALIFIED)
+			&& in_array(strtolower(ltrim($text, '\\')), $names, true)
+			&& ($tokens[$index + 1][0] ?? null) === '('
+			&& in_array($tokens[$index - 1][0] ?? null, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION, T_CONST, T_NEW], true) === false;
+	}
+	
+	/**
+	 * The runner a call at $index makes, or null: a runner by its name, or
+	 * one a parenthesised concatenation of literals builds — `('sys' .
+	 * 'tem')(…)` — at the group's closing parenthesis
+	 */
+	protected static function runnerAt(
+		array $tokens,
+		int $index,
+	): ?string
+	{
+		[$id, $text] = $tokens[$index];
+		
+		if(self::callsOneOf($tokens, $index, self::runners()))
+		{
+			return strtolower(ltrim($text, '\\'));
+		}
+		
+		if($id !== ')' || ($tokens[$index + 1][0] ?? null) !== '(')
+		{
+			return null;
+		}
+		
+		$name = '';
+		
+		for($i = $index - 1; $i >= 0 && $tokens[$i][0] !== '('; $i--)
+		{
+			if($tokens[$i][0] === T_CONSTANT_ENCAPSED_STRING)
+			{
+				$name = self::literal($tokens[$i][1]) . $name;
+			}
+			elseif($tokens[$i][0] !== '.')
+			{
+				return null;
+			}
+		}
+		
+		$name = strtolower($name);
+		
+		return $i >= 0 && self::groups($tokens, $i) && in_array($name, self::literalRunners(), true) ? $name : null;
+	}
+	
+	/**
+	 * Whether the `(` at $index groups rather than calls or opens a
+	 * construct: what stands before it is no callee, keyword or string
+	 */
+	protected static function groups(
+		array $tokens,
+		int $index,
+	): bool
+	{
+		return in_array($tokens[$index - 1][0] ?? null, [T_STRING, T_NAME_FULLY_QUALIFIED, T_NAME_QUALIFIED, T_NAME_RELATIVE, T_VARIABLE,
+			T_CONSTANT_ENCAPSED_STRING, ')', ']', '}', '"', T_ARRAY, T_LIST, T_ISSET, T_EMPTY, T_UNSET, T_EVAL, T_EXIT, T_IF, T_ELSEIF,
+			T_WHILE, T_FOR, T_FOREACH, T_SWITCH, T_MATCH, T_FUNCTION, T_FN, T_USE, T_CATCH, T_DECLARE, T_NEW, T_STATIC,
+			T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE], true) === false;
+	}
+	
+	/**
+	 * Request input that begins at $index, as [label, the index of its last
+	 * token]: a superglobal, $GLOBALS['_GET'] and its kin, the raw body
+	 * (php://input), a function that hands over the request (INPUT_FUNCTIONS).
+	 * Of $_SERVER only the request's own fields count (serverInput())
+	 *
+	 * @return ?array{0: string, 1: int}
+	 */
+	protected static function inputAt(
+		array $tokens,
+		int $index,
+	): ?array
+	{
+		[$id, $text] = $tokens[$index];
+		
+		if($id === T_VARIABLE && $text === '$GLOBALS')
+		{
+			$key = ($tokens[$index + 1][0] ?? null) === '[' && ($tokens[$index + 2][0] ?? null) === T_CONSTANT_ENCAPSED_STRING
+				&& ($tokens[$index + 3][0] ?? null) === ']' ? '$' . self::literal($tokens[$index + 2][1]) : '';
+			
+			if(in_array($key, self::REQUEST_INPUT, true) === false)
+			{
+				return null;
+			}
+			
+			$label = '$GLOBALS[' . substr($key, 1) . ']';
+			
+			return $key === '$_SERVER' ? self::serverInput($tokens, $index + 3, $label) : [$label, $index + 3];
+		}
+		
+		if($id === T_VARIABLE && in_array($text, self::REQUEST_INPUT, true))
+		{
+			return $text === '$_SERVER' ? self::serverInput($tokens, $index, $text) : [$text, $index];
+		}
+		
+		if($id === T_CONSTANT_ENCAPSED_STRING && strtolower(self::literal($text)) === 'php://input')
+		{
+			return ['php://input', $index];
+		}
+		
+		if(self::callsOneOf($tokens, $index, self::INPUT_FUNCTIONS))
+		{
+			$close = self::closing($tokens, $index + 1);
+			
+			return [strtolower(ltrim($text, '\\')) . '()', $close];
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * $_SERVER, ending at $at, as input: its request fields — the headers
+	 * (HTTP_*) and SERVER_INPUT — and a key that is no literal, since it may
+	 * be a header; null for the server's own fields (DOCUMENT_ROOT,
+	 * SCRIPT_FILENAME, SERVER_NAME …)
+	 *
+	 * @return ?array{0: string, 1: int}
+	 */
+	protected static function serverInput(
+		array $tokens,
+		int $at,
+		string $label,
+	): ?array
+	{
+		$key = $tokens[$at + 2] ?? null;
+		
+		if(($tokens[$at + 1][0] ?? null) !== '[' || ($key[0] ?? null) !== T_CONSTANT_ENCAPSED_STRING || ($tokens[$at + 3][0] ?? null) !== ']')
+		{
+			return [$label, $at];
+		}
+		
+		$name = self::literal($key[1]);
+		
+		return str_starts_with($name, 'HTTP_') || in_array($name, self::SERVER_INPUT, true) ? [$label . '[' . $name . ']', $at + 3] : null;
+	}
+	
+	/** the index of the token closing the bracket at $open, or the last one */
+	protected static function closing(
+		array $tokens,
+		int $open,
+	): int
+	{
+		$depth = 0;
+		
+		for($i = $open; isset($tokens[$i]); $i++)
+		{
+			$id = $tokens[$i][0];
+			$depth += in_array($id, ['(', '[', '{', T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true) ? 1 : (in_array($id, [')', ']', '}'], true) ? -1 : 0);
+			
+			if($depth === 0)
+			{
+				return $i;
+			}
+		}
+		
+		return count($tokens) - 1;
+	}
+	
+	/**
+	 * The arguments of the call whose `(` stands at $open, as index ranges
+	 * [from, to], empty ones left out
+	 *
+	 * @return list<array{0: int, 1: int}>
+	 */
+	protected static function arguments(
+		array $tokens,
+		int $open,
+	): array
+	{
+		$close = self::closing($tokens, $open);
+		$arguments = [];
+		$from = $open + 1;
+		$depth = 0;
+		
+		for($i = $open + 1; $i < $close; $i++)
+		{
+			$id = $tokens[$i][0];
+			$depth += in_array($id, ['(', '[', '{', T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true) ? 1 : (in_array($id, [')', ']', '}'], true) ? -1 : 0);
+			
+			if($depth === 0 && $id === ',')
+			{
+				$arguments[] = [$from, $i - 1];
+				$from = $i + 1;
+			}
+		}
+		
+		$arguments[] = [$from, $close - 1];
+		
+		return array_values(array_filter($arguments, static fn(array $range): bool => $range[0] <= $range[1]));
+	}
+	
+	/**
+	 * The runner at $index judged by what it is given. A function that calls
+	 * the callable it is handed (CALLABLES) is judged by that argument:
+	 * request input as the callable is urgent, a dispatch on request input
+	 * through the code's own object or a literal prefix high, a runner the
+	 * literal names is fed the other arguments, and any other callable is
+	 * read for what it does with its parameters (callback()). Any other
+	 * runner is fed all of them (fedBy())
+	 *
+	 * @param array{runs: array<string, string>, pending: array<string, array>, shells: int} $context codeVerdict()'s
+	 * @return ?array{0: string, 1: string, 2: string, 3?: int}
+	 */
+	protected static function fed(
+		array $tokens,
+		int $index,
+		string $runner,
+		array &$context = ['runs' => [], 'pending' => [], 'shells' => 0],
+	): ?array
+	{
+		if(($tokens[$index + 1][0] ?? null) !== '(')
+		{
+			return null;
+		}
+		
+		$arguments = self::arguments($tokens, $index + 1);
+		$position = self::CALLABLES[$runner] ?? null;
+		
+		if($position === null)
+		{
+			return self::fedBy($tokens, $arguments, $runner . '()');
+		}
+		
+		$callable = $arguments[$position] ?? null;
+		
+		if($callable === null)
+		{
+			return null;
+		}
+		
+		$verdict = self::callableIn($tokens, $callable[0], $callable[1]);
+		$all = $arguments;
+		unset($arguments[$position]);
+		
+		return match(true)
+		{
+			$verdict === 'input' => ['request_exec', self::TIER_URGENT, 'request input handed to ' . $runner . '() as the function it calls'],
+			$verdict === 'dispatch' => ['request_exec', self::TIER_HIGH, $runner . '() dispatches on request input'],
+			$verdict !== null => self::fedBy($tokens, $arguments, $verdict . '() through ' . $runner . '()'),
+			default => self::callback($tokens, $index, $runner, $all, $context),
+		};
+	}
+	
+	/**
+	 * A callable that is neither request input nor a runner's name, read for
+	 * what it does with its parameters: a closure or arrow function the code
+	 * writes, or a string naming a function this file defines, whose
+	 * parameter reaches a runner (parameterSink()) is fed the arguments its
+	 * parameters come from (CALLBACK_DATA). A string naming a function the
+	 * file has not defined yet waits in `pending` until it does
+	 * (codeVerdict())
+	 *
+	 * @param list<array{0: int, 1: int}> $arguments the call's arguments by position, the callable's included
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function callback(
+		array $tokens,
+		int $index,
+		string $runner,
+		array $arguments,
+		array &$context,
+	): ?array
+	{
+		if(array_key_exists($runner, self::CALLBACK_DATA) === false)
+		{
+			return null;
+		}
+		
+		$position = self::CALLABLES[$runner];
+		$feeds = self::CALLBACK_DATA[$runner];
+		[$from, $to] = $arguments[$position];
+		$data = [];
+		
+		foreach($arguments as $at => $range)
+		{
+			if($feeds === null ? $at > $position : in_array($at, $feeds, true))
+			{
+				$data[] = $range;
+			}
+		}
+		
+		$first = $tokens[$from][0] === T_STATIC ? ($tokens[$from + 1][0] ?? null) : $tokens[$from][0];
+		
+		if($first === T_FUNCTION || $first === T_FN)
+		{
+			$sink = self::parameterSink($tokens, $from);
+			
+			return $sink === null ? null : self::fedBy($tokens, $data, $sink . ' in ' . $runner . '()\'s callback');
+		}
+		
+		if($from !== $to || $tokens[$from][0] !== T_CONSTANT_ENCAPSED_STRING)
+		{
+			return null;
+		}
+		
+		$name = strtolower(ltrim(self::literal($tokens[$from][1]), '\\'));
+		$verdict = self::fedBy($tokens, $data, $name . '() through ' . $runner . '()');
+		
+		if($verdict === null || isset($context['runs'][$name]))
+		{
+			return $verdict;
+		}
+		
+		$context['pending'][$name] ??= [...$verdict, (int)$tokens[$index][2]];
+		
+		return null;
+	}
+	
+	/** the name a `function` at $index defines, lowercase; null for a closure and for `use function` */
+	protected static function functionName(
+		array $tokens,
+		int $index,
+	): ?string
+	{
+		if(($tokens[$index - 1][0] ?? null) === T_USE)
+		{
+			return null;
+		}
+		
+		$next = in_array($tokens[$index + 1][0] ?? null, ['&', T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG, T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG], true)
+			? $index + 2
+			: $index + 1;
+		
+		return ($tokens[$next][0] ?? null) === T_STRING ? strtolower($tokens[$next][1]) : null;
+	}
+	
+	/**
+	 * What the function or closure whose `function`, `fn` or `static` stands
+	 * at $at hands one of its parameters to (sinkOf()), or null. Its body is
+	 * read within the slice it stands in
+	 */
+	protected static function parameterSink(
+		array $tokens,
+		int $at,
+	): ?string
+	{
+		$open = $at;
+		
+		// past `static`, `&` and the name to the parameter list
+		while(isset($tokens[$open]) && $tokens[$open][0] !== '(')
+		{
+			$open++;
+		}
+		
+		if(isset($tokens[$open]) === false)
+		{
+			return null;
+		}
+		
+		$close = self::closing($tokens, $open);
+		$parameters = [];
+		
+		for($i = $open + 1; $i < $close; $i++)
+		{
+			if($tokens[$i][0] === T_VARIABLE)
+			{
+				$parameters[] = $tokens[$i][1];
+			}
+		}
+		
+		[$from, $to] = self::body($tokens, $close);
+		
+		for($i = $from; $parameters !== [] && $i < $to; $i++)
+		{
+			$sink = self::sinkOf($tokens, $i, $parameters);
+			
+			if($sink !== null)
+			{
+				return $sink;
+			}
+			
+			// a shell command's tokens are its content: the backtick closing it opens none
+			$i = $tokens[$i][0] === '`' ? self::quoteEnd($tokens, $i) : $i;
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * The body of a function whose parameter list closes at $close, as an
+	 * index range [from, to): its braces, or an arrow function's expression
+	 * up to the `,`, `;` or bracket that ends it; empty for an abstract one
+	 *
+	 * @return array{0: int, 1: int}
+	 */
+	protected static function body(
+		array $tokens,
+		int $close,
+	): array
+	{
+		for($i = $close + 1; isset($tokens[$i]); $i++)
+		{
+			$id = $tokens[$i][0];
+			
+			if($id === '{')
+			{
+				return [$i + 1, self::closing($tokens, $i)];
+			}
+			
+			if($id === ';')
+			{
+				return [$i, $i];
+			}
+			
+			if($id === T_DOUBLE_ARROW)
+			{
+				return [$i + 1, self::expressionEnd($tokens, $i + 1)];
+			}
+		}
+		
+		return [count($tokens), count($tokens)];
+	}
+	
+	/** the index of the `,`, `;`, `?>` or closing bracket that ends the expression starting at $from, or the slice's end */
+	protected static function expressionEnd(
+		array $tokens,
+		int $from,
+	): int
+	{
+		$depth = 0;
+		
+		for($i = $from; isset($tokens[$i]); $i++)
+		{
+			$id = $tokens[$i][0];
+			
+			if(in_array($id, ['(', '[', '{', T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true))
+			{
+				$depth++;
+			}
+			elseif(in_array($id, [')', ']', '}'], true) && --$depth < 0)
+			{
+				return $i;
+			}
+			elseif($depth === 0 && in_array($id, [',', ';', T_CLOSE_TAG], true))
+			{
+				return $i;
+			}
+		}
+		
+		return count($tokens);
+	}
+	
+	/**
+	 * What the token at $i hands one of $parameters to: eval(), an include,
+	 * a shell command in backticks, a runner by its name — a function that
+	 * calls a callable only with the parameter as that callable — or the
+	 * parameter called itself; null for none
+	 *
+	 * @param list<string> $parameters the variables' names, `$` included
+	 */
+	protected static function sinkOf(
+		array $tokens,
+		int $i,
+		array $parameters,
+	): ?string
+	{
+		$id = $tokens[$i][0];
+		
+		if($id === T_VARIABLE && in_array($tokens[$i][1], $parameters, true) && ($tokens[$i + 1][0] ?? null) === '(')
+		{
+			return 'a call of its parameter';
+		}
+		
+		[$sink, $ranges] = match(true)
+		{
+			$id === T_EVAL => ['eval()', self::arguments($tokens, $i + 1)],
+			in_array($id, [T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE], true) => ['an include', [[$i + 1, self::expressionEnd($tokens, $i + 1) - 1]]],
+			$id === '`' => ['a shell command in backticks', [[$i + 1, self::quoteEnd($tokens, $i) - 1]]],
+			default => [null, []],
+		};
+		
+		$runner = $sink === null ? self::runnerAt($tokens, $i) : null;
+		
+		if($runner !== null && ($tokens[$i + 1][0] ?? null) === '(')
+		{
+			$arguments = self::arguments($tokens, $i + 1);
+			$sink = $runner . '()';
+			$ranges = isset(self::CALLABLES[$runner]) ? array_values(array_filter([$arguments[self::CALLABLES[$runner]] ?? null])) : $arguments;
+		}
+		
+		foreach($ranges as [$from, $to])
+		{
+			for($j = $from; $j <= $to; $j++)
+			{
+				if($tokens[$j][0] === T_VARIABLE && in_array($tokens[$j][1], $parameters, true))
+				{
+					return $sink;
+				}
+			}
+		}
+		
+		return null;
+	}
+	
+	/** the index of the backtick that closes the one at $open, or the slice's end */
+	protected static function quoteEnd(
+		array $tokens,
+		int $open,
+	): int
+	{
+		for($i = $open + 1; isset($tokens[$i]) && $tokens[$i][0] !== '`'; $i++)
+		{
+		}
+		
+		return $i;
+	}
+	
+	/**
+	 * What a callable argument between $from and $to is: request input alone
+	 * ('input'), a literal naming a runner (its name), request input beside
+	 * the code's own (`[$this, $_GET['a']]`, `'prefix_' . $_GET['a']`:
+	 * 'dispatch'), or null. A closure the code writes is its own callable,
+	 * whatever its body reads; what that body runs is read where it stands
+	 */
+	protected static function callableIn(
+		array $tokens,
+		int $from,
+		int $to,
+	): ?string
+	{
+		$first = $tokens[$from][0] === T_STATIC ? ($tokens[$from + 1][0] ?? null) : $tokens[$from][0];
+		
+		if($first === T_FUNCTION || $first === T_FN)
+		{
+			return null;
+		}
+		
+		$input = self::inputAt($tokens, $from);
+		$end = $input[1] ?? -1;
+		
+		// the input's own subscripts are still the input
+		while($input !== null && ($tokens[$end + 1][0] ?? null) === '[')
+		{
+			$end = self::closing($tokens, $end + 1);
+		}
+		
+		if($input !== null && $end >= $to)
+		{
+			return 'input';
+		}
+		
+		$name = '';
+		
+		for($i = $from; $i <= $to; $i++)
+		{
+			if(self::inputAt($tokens, $i) !== null)
+			{
+				return 'dispatch';
+			}
+			
+			$name = $tokens[$i][0] === T_CONSTANT_ENCAPSED_STRING ? $name . self::literal($tokens[$i][1]) : ($tokens[$i][0] === '.' ? $name : '-');
+		}
+		
+		return in_array(strtolower($name), self::literalRunners(), true) ? strtolower($name) : null;
+	}
+	
+	/**
+	 * A runner judged by its arguments: request input in them is urgent,
+	 * high where an escaper, a sanitizer or a cast wraps it (SANITIZERS); a
+	 * decoder's call or a stream's content in them is eval_chain
+	 *
+	 * @param array<int, array{0: int, 1: int}> $arguments arguments()'s ranges
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function fedBy(
+		array $tokens,
+		array $arguments,
+		string $label,
+	): ?array
+	{
+		$raw = null;
+		$cleaned = null;
+		$decoder = null;
+		
+		foreach($arguments as [$from, $to])
+		{
+			$callees = [];
+			
+			for($i = $from; $i <= $to; $i++)
+			{
+				[$id, $text] = $tokens[$i];
+				
+				if($id === '(')
+				{
+					$callees[] = in_array($tokens[$i - 1][0] ?? null, [T_STRING, T_NAME_FULLY_QUALIFIED], true) ? strtolower(ltrim($tokens[$i - 1][1], '\\')) : '';
+					
+					continue;
+				}
+				
+				if($id === ')')
+				{
+					array_pop($callees);
+					
+					continue;
+				}
+				
+				$input = self::inputAt($tokens, $i);
+				
+				if($input !== null)
+				{
+					$wrapper = array_values(array_intersect($callees, self::SANITIZERS))[0]
+						?? (in_array($tokens[$i - 1][0] ?? null, [T_INT_CAST, T_DOUBLE_CAST, T_BOOL_CAST], true) ? 'a cast' : null);
+					
+					if($wrapper === null)
+					{
+						$raw ??= $input[0];
+					}
+					else
+					{
+						$cleaned ??= [$input[0], $wrapper];
+					}
+					
+					$i = max($i, $input[1]);
+					
+					continue;
+				}
+				
+				if(self::callsOneOf($tokens, $i, self::decoders()))
+				{
+					$decoder ??= strtolower(ltrim($text, '\\')) . '()';
+				}
+				elseif($id === T_CONSTANT_ENCAPSED_STRING && preg_match(self::STREAMS, self::literal($text), $match) === 1)
+				{
+					$decoder ??= 'a ' . rtrim(strtolower($match[0]), ':/') . ' stream';
+				}
+			}
+		}
+		
+		return match(true)
+		{
+			$raw !== null => ['request_exec', self::TIER_URGENT, $label . ' fed by request input (' . $raw . ')'],
+			$cleaned !== null => ['request_exec', self::TIER_HIGH, $label . ' fed by request input through ' . $cleaned[1] . ' (' . $cleaned[0] . ')'],
+			$decoder !== null => ['eval_chain', self::TIER_HIGH, $label . ' fed by ' . $decoder],
+			default => null,
+		};
+	}
+	
+	/**
+	 * A shell command in backticks, opened at $index, fed by request input
+	 *
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function backticked(
+		array $tokens,
+		int $index,
+	): ?array
+	{
+		for($i = $index + 1; isset($tokens[$i]) && $tokens[$i][0] !== '`'; $i++)
+		{
+			$input = self::inputAt($tokens, $i);
+			
+			if($input !== null)
+			{
+				return ['request_exec', self::TIER_URGENT, 'a shell command in backticks fed by request input (' . $input[0] . ')'];
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * Request input at $index called as a function — `$_POST['f']($x)`,
+	 * `($_POST['f'])($x)`, the one-line shell that needs no executor's name
+	 *
+	 * @param array{0: string, 1: int} $input inputAt()'s
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function requestCalled(
+		array $tokens,
+		int $index,
+		array $input,
+	): ?array
+	{
+		$i = $input[1] + 1;
+		$subscripts = 0;
+		
+		while(($tokens[$i][0] ?? null) === '[')
+		{
+			$i = self::closing($tokens, $i) + 1;
+			$subscripts++;
+		}
+		
+		// parentheses that only group the input close after it
+		for($open = $index - 1; ($tokens[$open][0] ?? null) === '(' && self::groups($tokens, $open) && ($tokens[$i][0] ?? null) === ')'; $open--)
+		{
+			$i++;
+		}
+		
+		return $subscripts > 0 && ($tokens[$i][0] ?? null) === '('
+			? ['request_exec', self::TIER_URGENT, 'request input called as a function (' . $input[0] . ')']
+			: null;
+	}
+	
+	/**
+	 * The include at $index judged by what its expression names: request
+	 * input (request_exec); a stream URL, a path under uploads or in a temp
+	 * directory, a media file (include_foreign). Literals are read as PHP
+	 * reads them, escapes resolved, so an octal-spelled path is the path; a
+	 * subscript's key names no path; the file's name is the literals that end
+	 * the expression, however they are split. A fixed PHP file under uploads
+	 * is high (urgent in wp-config.php, with `strict`), nothing in an uploads
+	 * folder an installed plugin writes (`owned`)
+	 *
+	 * @param array{uploads?: string, temp?: list<string>, owned?: list<string>, strict?: bool} $places
+	 * @return ?array{0: string, 1: string, 2: string}
+	 */
+	protected static function included(
+		array $tokens,
+		int $index,
+		array $places,
+	): ?array
+	{
+		$parts = [];
+		$names = [];
+		$input = null;
+		$tail = '';
+		$depth = 0;
+		
+		for($i = $index + 1; isset($tokens[$i]); $i++)
+		{
+			[$id, $text] = $tokens[$i];
+			
+			if($depth === 0 && in_array($id, [';', ',', T_CLOSE_TAG], true))
+			{
+				break;
+			}
+			
+			if(in_array($id, ['(', '['], true))
+			{
+				$depth++;
+				
+				continue;
+			}
+			
+			if(in_array($id, [')', ']'], true))
+			{
+				// `if(include 'x')`: the parenthesis closing round the include ends it
+				if($depth-- === 0)
+				{
+					break;
+				}
+				
+				continue;
+			}
+			
+			// the quotes round an interpolated string and the concatenation say nothing of the path
+			if($id === '"' || $id === '.')
+			{
+				continue;
+			}
+			
+			$found = self::inputAt($tokens, $i);
+			
+			if($found !== null)
+			{
+				$input ??= $found[0];
+				$i = max($i, $found[1]);
+				
+				continue;
+			}
+			
+			if(($id === T_CONSTANT_ENCAPSED_STRING || $id === T_ENCAPSED_AND_WHITESPACE) && ($tokens[$i - 1][0] ?? null) !== '[')
+			{
+				$part = $id === T_CONSTANT_ENCAPSED_STRING ? self::literal($text) : stripcslashes($text);
+				$parts[] = strtolower(str_replace('\\', '/', $part));
+				$tail .= $part;
+				
+				continue;
+			}
+			
+			$tail = '';
+			
+			if($id === T_STRING || $id === T_NAME_FULLY_QUALIFIED)
+			{
+				$names[] = strtolower(ltrim($text, '\\'));
+			}
+		}
+		
+		if($input !== null)
+		{
+			return ['request_exec', self::TIER_URGENT, 'include of request input (' . $input . ')'];
+		}
+		
+		foreach($parts as $part)
+		{
+			if(preg_match(self::STREAMS, ltrim($part), $match) === 1)
+			{
+				return ['include_foreign', self::TIER_URGENT, 'include of a ' . rtrim($match[0], ':/') . ' stream'];
+			}
+		}
+		
+		$joined = implode('', $parts);
+		$uploads = (string)($places['uploads'] ?? '');
+		$after = null;
+		
+		foreach(['wp-content/uploads/', $uploads === '' ? null : $uploads . '/'] as $marker)
+		{
+			$at = $marker === null ? false : strpos($joined, $marker);
+			$after ??= $at === false ? null : substr($joined, $at + strlen($marker));
+		}
+		
+		if($after === null && array_intersect($names, ['wp_upload_dir', 'wp_get_upload_dir']) !== [])
+		{
+			$after = ltrim($joined, '/');
+		}
+		
+		if($after !== null)
+		{
+			// a fixed PHP file a plugin keeps under uploads, unless wp-config.php includes it
+			if(($places['strict'] ?? false) === false && preg_match('~/[^/]+\.php$~i', '/' . str_replace('\\', '/', $tail)) === 1)
+			{
+				return in_array(explode('/', ltrim($after, '/'), 2)[0], (array)($places['owned'] ?? []), true)
+					? null
+					: ['include_foreign', self::TIER_HIGH, 'include of a PHP file under uploads'];
+			}
+			
+			return ['include_foreign', self::TIER_URGENT, 'include of a file under uploads'];
+		}
+		
+		$temp = (array)($places['temp'] ?? []);
+		
+		foreach($parts as $part)
+		{
+			if(preg_match('~^(?:/tmp|/var/tmp|/dev/shm)/~', $part) === 1
+				|| array_filter($temp, static fn(string $dir): bool => str_starts_with($part, $dir . '/')) !== [])
+			{
+				return ['include_foreign', self::TIER_URGENT, 'include of a file in a temp directory'];
+			}
+		}
+		
+		if(array_intersect($names, ['sys_get_temp_dir', 'get_temp_dir']) !== [])
+		{
+			return ['include_foreign', self::TIER_URGENT, 'include of a file in a temp directory'];
+		}
+		
+		$extension = self::extension(strtolower($tail));
+		
+		return in_array($extension, self::includeMedia(), true)
+			? ['include_foreign', self::TIER_URGENT, 'include of a .' . $extension . ' file']
+			: null;
+	}
+	
+	/** a quoted literal as PHP reads it: a single-quoted one knows two escapes, a double-quoted one C's */
+	protected static function literal(
+		string $token,
+	): string
+	{
+		$token = ltrim($token, 'bB');
+		$body = substr($token, 1, -1);
+		
+		return ($token[0] ?? '') === "'" ? strtr($body, ['\\\\' => '\\', "\\'" => "'"]) : stripcslashes($body);
+	}
+	
+	/** the extension of a lowercase file name, '' for none */
+	protected static function extension(
+		string $lower,
+	): string
+	{
+		$dot = strrpos($lower, '.');
+		
+		return $dot === false ? '' : substr($lower, $dot + 1);
 	}
 	
 	/**
@@ -2263,9 +5131,7 @@ class Scan
 	 * installed plugin's directory, or a known root file whose plugin is
 	 * installed (Wordfence's prepend), or this plugin's own prepend stub in
 	 * its store directory (wp-content/ovos-codesafe/, or ovos-console/ under its
-	 * first name; ovos/console docs/plans/shield-prepend.md) while the plugin is
-	 * installed. Anything else is
-	 * nobody's.
+	 * first name) while the plugin is installed. Anything else is nobody's.
 	 */
 	protected function ownerOfPath(
 		string $target,

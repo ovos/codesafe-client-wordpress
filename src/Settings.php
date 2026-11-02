@@ -1233,6 +1233,18 @@ class Settings
 			'owner_anomaly' => __('file owned by another uid than its siblings', 'ovos-codesafe'),
 			'symlink_outside' => __('symlink leaving the site', 'ovos-codesafe'),
 			'debug_log_public' => __('debug.log written to a web-reachable path', 'ovos-codesafe'),
+			'request_exec' => __('request input run as code, as a command or as a function', 'ovos-codesafe'),
+			'include_foreign' => __('include of a remote, upload, temp or media file', 'ovos-codesafe'),
+			'eval_chain' => __('decoded payload run as code', 'ovos-codesafe'),
+			'asset_php' => __('PHP that runs among a package\'s images, fonts or styles', 'ovos-codesafe'),
+			'mimic_core' => __('file named like a core entry file where no WordPress stands', 'ovos-codesafe'),
+			'cache_php' => __('PHP that runs code in wp-content/cache', 'ovos-codesafe'),
+			'cron_listener_foreign' => __('scheduled hook whose listener lives outside every installed component', 'ovos-codesafe'),
+			'cron_listener_builtin' => __('scheduled hook whose listener is one of PHP\'s own functions', 'ovos-codesafe'),
+			'cron_listener_unresolved' => __('scheduled hook whose listener names nothing PHP can find', 'ovos-codesafe'),
+			'oversize_php' => __('PHP file too large to be judged whole', 'ovos-codesafe'),
+			'oversize_call' => __('call to a runner too long to be judged whole', 'ovos-codesafe'),
+			'scan_crash' => __('file the scan died judging', 'ovos-codesafe'),
 			default => $detector,
 		};
 	}

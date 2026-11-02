@@ -16,6 +16,9 @@ const HOUR_IN_SECONDS = 3600;
 
 const DAY_IN_SECONDS = 86400;
 
+// what $wpdb->get_results() is asked to answer with: rows as associative arrays
+const ARRAY_A = 'ARRAY_A';
+
 function wp_shim_reset(): void
 {
 	$GLOBALS['wp_version'] = '6.8';
@@ -98,6 +101,8 @@ function wp_shim_reset(): void
 	];
 	// WordPress's own: whether the login cookie settled the current user (rest_cookie_collect_status())
 	unset($GLOBALS['wp_rest_auth_cookie'], $GLOBALS['pagenow']);
+	// the hooks' callbacks as WordPress keeps them (WP_Hook::$callbacks), by hook name
+	$GLOBALS['wp_filter'] = [];
 }
 
 wp_shim_reset();
@@ -516,6 +521,15 @@ function wp_unslash(
 	return is_array($value)
 		? array_map('wp_unslash', $value)
 		: (is_string($value) ? stripslashes($value) : $value);
+}
+
+/** core's: PHP's parse_url() */
+function wp_parse_url(
+	string $url,
+	int $component = -1,
+): mixed
+{
+	return parse_url($url, $component);
 }
 
 // the real one's damage, restated: tags out, whitespace collapsed, and every

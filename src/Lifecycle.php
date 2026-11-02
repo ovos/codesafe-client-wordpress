@@ -75,6 +75,7 @@ final class Lifecycle
 		Plugin::OPTION_ANNOUNCED,
 		ScanRunner::OPTION,
 		ScanRunner::LOCK,
+		ScanRunner::JUDGING,
 		Entries::OPTION,
 		Entries::LOCK,
 		Hello::OPTION,
