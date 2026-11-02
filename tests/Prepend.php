@@ -92,7 +92,7 @@ class Prepend extends Test
 	protected const string SEAL = '7c7a00e4abca682d0f5c8a4e2f46c29f036b9f508e73f10e47198eeb605b1099';
 	
 	protected const array ENFORCE = ['detect' => true, 'enforce' => true, 'kill' => false, 'prefix' => '', 'root' => '', 'content' => '', 'entries' => false,
-		'rules' => self::RULES_NAME, 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'wp-json', 'seal' => self::SEAL];
+		'rules' => self::RULES_NAME, 'proxy_header' => '', 'proxies' => [], 'rest_prefix' => 'wp-json', 'seal' => self::SEAL, 'login_cookie' => ''];
 	
 	protected string $dir;
 	

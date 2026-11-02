@@ -16,6 +16,7 @@ use Ovos\Codesafe\Shield\Ruleset;
 use Ovos\Codesafe\Shield\Store;
 use Ovos\Codesafe\Shield\Verdict;
 use Ovos\Codesafe\Shield\Wordpress;
+use ReflectionFunction;
 use Throwable;
 use WP_Application_Passwords;
 use WP_User;
@@ -39,6 +40,8 @@ use function function_exists;
 use function get_current_user_id;
 use function get_option;
 use function get_user_by;
+use function has_filter;
+use function hash_equals;
 use function header;
 use function headers_sent;
 use function human_time_diff;
@@ -84,14 +87,18 @@ use function wp_remote_get;
 use function wp_remote_retrieve_body;
 use function wp_remote_retrieve_headers;
 use function wp_remote_retrieve_response_code;
+use function wp_salt;
 use function wp_unslash;
 use function wp_verify_nonce;
 
+use const ABSPATH;
 use const DIRECTORY_SEPARATOR;
+use const LOGGED_IN_COOKIE;
 use const PHP_INT_MAX;
 use const PHP_SAPI;
 use const PHP_URL_QUERY;
 use const WP_CONTENT_DIR;
+use const WPINC;
 
 // the kernel is one vendored multi-class file (ovos/console client-php/Shield.php,
 // byte-identical here as Kernel.php); a plain class binds at compile time, so
@@ -191,6 +198,9 @@ final class Adapter
 	/** what checking an application password needs of WordPress — all of it loaded by plugins_loaded */
 	protected const APPLICATION_PASSWORD_FUNCTIONS = ['wp_is_application_passwords_available',
 		'wp_is_application_passwords_available_for_user', 'get_user_by', 'is_email'];
+	
+	/** the pluggable functions WordPress's check of its login cookie runs (wp_validate_logged_in_cookie()) */
+	protected const LOGIN_COOKIE_FUNCTIONS = ['wp_validate_auth_cookie', 'wp_parse_auth_cookie', 'get_user_by', 'wp_hash', 'wp_salt'];
 	
 	protected ?Kernel $kernel = null;
 	
@@ -950,11 +960,13 @@ final class Adapter
 					Prepend::removeMuPlugin((string)constant('WPMU_PLUGIN_DIR'));
 				}
 			}
-			// the REST prefix the early layers tell a REST request by: known only
-			// once the other plugins and the theme have added their filters
+			// the REST prefix the early layers tell a REST request by, and the login
+			// cookie the must-use stage checks: known only once the other plugins
+			// and the theme have added their filters and pluggable functions
 			if($judges)
 			{
 				add_action('init', [self::class, 'syncRestPrefix'], PHP_INT_MAX);
+				add_action('init', [self::class, 'syncLoginCookie'], PHP_INT_MAX);
 			}
 		}
 		catch(Throwable)
@@ -1398,6 +1410,81 @@ final class Adapter
 		catch(Throwable)
 		{
 			return false;
+		}
+	}
+	
+	/**
+	 * init, last: the site's login cookie name (loginCookie()) into the
+	 * consent the early layers read, written only when it changed. $dir is
+	 * the store, storeDir() when empty. Never throws
+	 */
+	public static function syncLoginCookie(
+		string $dir = '',
+	): bool
+	{
+		try
+		{
+			$dir = $dir === '' ? self::storeDir() : $dir;
+			
+			return $dir !== '' && Prepend::writeLoginCookie($dir, self::loginCookie());
+		}
+		catch(Throwable)
+		{
+			return false;
+		}
+	}
+	
+	/**
+	 * The site's login cookie name while WordPress's own check of it runs
+	 * here — the pluggable functions on its path are wp-includes/pluggable.php's,
+	 * no filter changes the salt or the session store, no salt it reads holds
+	 * the sample's placeholder, and the salt the must-use stage reproduces is
+	 * wp_salt('logged_in') — else '': the
+	 * must-use stage reproduces that check alone (Prepend::loginCookieSignsIn())
+	 * and leaves a request carrying a login cookie to plugins_loaded where it
+	 * differs. Asked once every plugin and the theme have loaded
+	 */
+	public static function loginCookie(): string
+	{
+		try
+		{
+			if(defined('LOGGED_IN_COOKIE') === false || defined('ABSPATH') === false || defined('WPINC') === false || function_exists('has_filter') === false)
+			{
+				return '';
+			}
+			$core = realpath(ABSPATH . WPINC . DIRECTORY_SEPARATOR . 'pluggable.php');
+			foreach(self::LOGIN_COOKIE_FUNCTIONS as $function)
+			{
+				// a plugin's own version of one: WordPress checks the cookie its way
+				if($core === false || function_exists($function) === false || realpath((string)(new ReflectionFunction($function))->getFileName()) !== $core)
+				{
+					return '';
+				}
+			}
+			if(has_filter('salt') !== false || has_filter('session_token_manager') !== false)
+			{
+				return '';
+			}
+			// a placeholder left in a salt, in English or in the site's language: WordPress tells a translated one only
+			// once its translations are loaded, so its salt turns on when it was first asked for, and this answer would too
+			// phpcs:ignore WordPress.WP.I18n.MissingArgDomain -- core's own string, in WordPress's text domain
+			if(Prepend::placeholderSalt([Prepend::SAMPLE_PHRASE, (string)__('put your unique phrase here')]))
+			{
+				return '';
+			}
+			// the salt as the must-use stage computes it, before WordPress has loaded its translations, against the one
+			// WordPress keys its cookies with now: a localized placeholder left in wp-config, for one, makes them differ
+			$salt = Prepend::loggedInSalt();
+			if($salt === null || hash_equals((string)wp_salt('logged_in'), $salt) === false)
+			{
+				return '';
+			}
+			
+			return (string)LOGGED_IN_COOKIE;
+		}
+		catch(Throwable)
+		{
+			return '';
 		}
 	}
 	

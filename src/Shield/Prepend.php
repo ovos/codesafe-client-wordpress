@@ -10,8 +10,10 @@ use Ovos\Codesafe\Shield\Store;
 use Ovos\Codesafe\Shield\Wordpress;
 use stdClass;
 use Throwable;
+use WP_Session_Tokens;
 
 use function array_filter;
+use function array_key_exists;
 use function array_keys;
 use function array_map;
 use function array_reverse;
@@ -20,6 +22,7 @@ use function array_values;
 use function basename;
 use function bin2hex;
 use function class_exists;
+use function constant;
 use function count;
 use function define;
 use function defined;
@@ -27,7 +30,12 @@ use function dirname;
 use function explode;
 use function file_get_contents;
 use function file_put_contents;
+use function function_exists;
+use function get_site_option;
 use function glob;
+use function hash_equals;
+use function hash_hmac;
+use function has_filter;
 use function header;
 use function headers_sent;
 use function http_response_code;
@@ -38,10 +46,13 @@ use function is_array;
 use function is_dir;
 use function is_file;
 use function is_int;
+use function is_object;
+use function is_scalar;
 use function is_string;
 use function json_decode;
 use function json_encode;
 use function max;
+use function md5;
 use function md5_file;
 use function mkdir;
 use function parse_str;
@@ -71,8 +82,11 @@ use function time;
 use function trim;
 use function unlink;
 use function var_export;
+use function wp_doing_ajax;
 
 use const DIRECTORY_SEPARATOR;
+use const LOCK_EX;
+use const PHP_SAPI;
 
 // the kernel is one vendored multi-class file; a plain class binds at compile
 // time, so the guard sits at the require, never inside the file
@@ -118,12 +132,15 @@ catch(Throwable)
  *   plugins_loaded judge, unjudged and uncounted here; but the cookie's NAME
  *   is anyone's to send, and mu-plugins, drop-ins and plugin files run
  *   before plugins_loaded, so a block that holds whoever asks — a match
- *   rule, a vpatch for anyone — is refused here. Anywhere else — a direct
- *   hit on a plugin's file — no adapter will ever run, so this layer judges
- *   the request whole (loadsWordPress(), 1.0.3); a REST request carrying
- *   Basic credentials is judged the same way — an application password,
- *   which WordPress checks only after this layer, makes it a user's
- *   (isRest(), by the REST prefix the plugin keeps in the consent);
+ *   rule, a vpatch for anyone — is refused here. The must-use stage, inside
+ *   WordPress, checks the cookie as WordPress will (loginCookieSignsIn()):
+ *   one that signs no one in leaves the caller anonymous, and the request
+ *   is judged there whole. Anywhere else — a direct hit on a plugin's
+ *   file — no adapter will ever run, so this layer judges the request whole
+ *   (loadsWordPress()); a REST request carrying Basic credentials is judged
+ *   the same way — an application password, which WordPress checks only
+ *   after this layer, makes it a user's (isRest(), by the REST prefix the
+ *   plugin keeps in the consent);
  * - every file it reads or writes but the stub and the kernel's ruleset
  *   begins with `<?php exit; ?>` (GUARD), and the ruleset's name is drawn at
  *   random: the directory's .htaccess is read by Apache alone (1.0.3);
@@ -219,8 +236,11 @@ final class Prepend
 	/** defined by run() so the plugins_loaded adapter knows the request was judged */
 	public const MARK = 'CODESAFE_SHIELD_PREPENDED';
 	
-	/** defined by run() as it starts: of the prepend and the mu-plugin, the first judges and the second does nothing */
+	/** defined by run() as it starts: of the prepend and the mu-plugin, the first judges and the second only checks a login cookie the first left to WordPress (recheck()) */
 	public const RAN = 'CODESAFE_SHIELD_RAN';
+	
+	/** defined by run() before WordPress when it left a request to WordPress for a login cookie it cannot check */
+	public const DEFERRED = 'CODESAFE_SHIELD_DEFERRED';
 	
 	/** defined by run() when it judged the request and passed it: judged again at plugins_loaded, a rate rule would count it twice */
 	public const JUDGED = 'CODESAFE_SHIELD_JUDGED';
@@ -248,6 +268,16 @@ final class Prepend
 	
 	/** WordPress's login cookie prefix — a request carrying one is the adapter's to judge */
 	public const LOGIN_COOKIE = 'wordpress_logged_in_';
+	
+	/** wp-config's constants the login cookie's check reads: its name, then the ten wp_salt() reads */
+	public const COOKIE_CONSTANTS = ['LOGGED_IN_COOKIE', 'COOKIEHASH', 'AUTH_KEY', 'AUTH_SALT', 'SECURE_AUTH_KEY', 'SECURE_AUTH_SALT',
+		'LOGGED_IN_KEY', 'LOGGED_IN_SALT', 'NONCE_KEY', 'NONCE_SALT', 'SECRET_KEY', 'SECRET_SALT'];
+	
+	/** the phrase wp-config-sample.php ships in every salt: wp_salt() never takes it for a secret */
+	public const SAMPLE_PHRASE = 'put your unique phrase here';
+	
+	/** the grace wp_validate_auth_cookie() gives a POST or an Ajax call past the cookie's expiration, in seconds */
+	public const COOKIE_GRACE = 3600;
 	
 	/** WordPress's REST prefix unless a filter changes it (rest_get_url_prefix()) */
 	public const REST_PREFIX = 'wp-json';
@@ -352,8 +382,14 @@ final class Prepend
 	{
 		try
 		{
-			if(PHP_SAPI === 'cli' || defined(self::RAN))
+			if(PHP_SAPI === 'cli')
 			{
+				return;
+			}
+			if(defined(self::RAN))
+			{
+				self::recheck($dir);
+				
 				return;
 			}
 			define(self::RAN, true);
@@ -379,35 +415,7 @@ final class Prepend
 				$report = $guard['report'];
 				register_shutdown_function(static fn() => self::queueAtEnd($dir, $report, $ip));
 			}
-			$ran = false;
-			// the mu-plugin stage runs inside WordPress, which defined ABSPATH; the prepend layer runs before it
-			$judged = self::judge($dir, $_SERVER, $_POST, $_COOKIE, null, $consent, $ran, $_GET, $_FILES, defined('ABSPATH') ? true : null, $_REQUEST);
-			if($judged === null)
-			{
-				if($ran && defined(self::JUDGED) === false)
-				{
-					define(self::JUDGED, true);
-				}
-				
-				return;
-			}
-			if(defined(self::MARK) === false)
-			{
-				define(self::MARK, true);
-			}
-			$GLOBALS[self::STASH] = ['verdict' => $judged['verdict'], 'report' => $judged['report'], 'claimed' => false];
-			$verdict = $judged['verdict'];
-			if($verdict->isBlock() && $verdict->rule !== null)
-			{
-				if($judged['report'] !== null)
-				{
-					self::queue($dir, $judged['report'], self::contextOf($_SERVER, $verdict->status(), $ip));
-				}
-				self::refuse((int)$verdict->rule['id'], $verdict->status(), $verdict->retryAfter);
-			}
-			// an observe verdict: the adapter claims it at plugins_loaded — unless
-			// WordPress never loads for this request, when shutdown queues it
-			register_shutdown_function(static fn(): bool => self::settle($dir, null, null, $ip));
+			self::decide($dir, $consent, $ip);
 		}
 		catch(Throwable)
 		{
@@ -416,13 +424,93 @@ final class Prepend
 	}
 	
 	/**
+	 * The mu-plugin's call after the prepend's: a request the prepend left to
+	 * WordPress for a login cookie it could not check, having a ruleset to
+	 * judge it by, is checked here, inside WordPress, and decided whole when
+	 * the cookie signs no one in. Nothing for a request a layer judged
+	 * already, or one the cookie signs in: the adapter judges that one as its
+	 * user
+	 */
+	protected static function recheck(
+		string $dir,
+	): void
+	{
+		if(defined(self::DEFERRED) === false || defined('ABSPATH') === false || defined(self::MARK) || defined(self::JUDGED))
+		{
+			return;
+		}
+		$consent = self::consent($dir);
+		// the switches read again before the database: one may have changed after the prepend read them
+		if($consent === null || $consent['kill'] || $consent['detect'] === false || self::loginCookieSignsIn($_COOKIE, $_SERVER, $consent) !== false)
+		{
+			return;
+		}
+		self::decide($dir, $consent, self::clientIp($_SERVER, $consent['proxy_header'], $consent['proxies']), false);
+	}
+	
+	/**
+	 * The request judged and what follows: a block refused here with its
+	 * report queued, an observe stashed for the adapter to claim (or queued at
+	 * shutdown), a pass marked judged. $signedIn is the login cookie's check
+	 * made already; inside WordPress the judge makes it otherwise, and before
+	 * WordPress a request left to WordPress for its login cookie is marked for
+	 * the must-use stage
+	 *
+	 * @param array{proxy_header: string, proxies: list<string>, login_cookie: string} $consent
+	 */
+	protected static function decide(
+		string $dir,
+		array $consent,
+		string $ip,
+		?bool $signedIn = null,
+	): void
+	{
+		// the mu-plugin stage runs inside WordPress, which defined ABSPATH; the prepend layer runs before it
+		$wordpress = defined('ABSPATH');
+		$ran = false;
+		$left = false;
+		$judged = self::judge($dir, $_SERVER, $_POST, $_COOKIE, null, $consent, $ran, $_GET, $_FILES, $wordpress ? true : null, $_REQUEST, $signedIn, $left);
+		if($judged === null)
+		{
+			if($ran && defined(self::JUDGED) === false)
+			{
+				define(self::JUDGED, true);
+			}
+			// the must-use stage checks the cookie this layer cannot (recheck())
+			if($left && $wordpress === false && defined(self::DEFERRED) === false)
+			{
+				define(self::DEFERRED, true);
+			}
+			
+			return;
+		}
+		if(defined(self::MARK) === false)
+		{
+			define(self::MARK, true);
+		}
+		$GLOBALS[self::STASH] = ['verdict' => $judged['verdict'], 'report' => $judged['report'], 'claimed' => false];
+		$verdict = $judged['verdict'];
+		if($verdict->isBlock() && $verdict->rule !== null)
+		{
+			if($judged['report'] !== null)
+			{
+				self::queue($dir, $judged['report'], self::contextOf($_SERVER, $verdict->status(), $ip));
+			}
+			self::refuse((int)$verdict->rule['id'], $verdict->status(), $verdict->retryAfter);
+		}
+		// an observe verdict: the adapter claims it at plugins_loaded — unless
+		// WordPress never loads for this request, when shutdown queues it
+		register_shutdown_function(static fn(): bool => self::settle($dir, null, null, $ip));
+	}
+	
+	/**
 	 * The pure part: the consent gate, the login-cookie rule, the judge. Null
 	 * when this layer has nothing to say (no consent, detection off, kill,
 	 * the kernel not ready(), no ruleset it can read (the adapter then judges
 	 * the request whole), anything but a block for a request carrying a
-	 * login cookie or a REST request with Basic credentials); otherwise
-	 * the verdict and the report the kernel would have sent — the adapter
-	 * sends it, or the queue holds it
+	 * login cookie that may sign its caller in or a REST request with Basic
+	 * credentials); otherwise the verdict and the report the kernel would
+	 * have sent — the adapter sends it, or the queue holds it
 	 *
 	 * @param array<string, mixed> $server
 	 * @param array<string, mixed> $post
@@ -434,6 +522,10 @@ final class Prepend
 	 * @param ?bool $wordpress whether WordPress loads for this request: true from the mu-plugin stage, which
 	 *     runs inside it; null tells it by the script (loadsWordPress())
 	 * @param ?array<string, mixed> $request PHP's $_REQUEST, which a request: rule reads beside the query and the form
+	 * @param ?bool $signedIn the login cookie's check made already (loginCookieSignsIn()): false, it signs no one in and the
+	 *     request is judged whole; true leaves a request carrying one to the adapter; null makes the check here where
+	 *     WordPress runs ($wordpress true), once there is a ruleset to judge by, and leaves it to the adapter before
+	 * @param ?bool $left set: whether a login cookie left the request to WordPress, judged here by the rules for anyone alone
 	 * @return ?array{verdict: Verdict, report: ?array{0: string, 1: string, 2: array}}
 	 */
 	public static function judge(
@@ -448,9 +540,12 @@ final class Prepend
 		array $files = [],
 		?bool $wordpress = null,
 		?array $request = null,
+		?bool $signedIn = null,
+		?bool &$left = null,
 	): ?array
 	{
 		$judged = false;
+		$left = false;
 		$consent ??= self::consent($dir);
 		if($consent === null || $consent['kill'] || $consent['detect'] === false || self::ready() === false)
 		{
@@ -459,12 +554,6 @@ final class Prepend
 		$loads = $wordpress ?? self::loadsWordPress($server, (string)($consent['root'] ?? ''));
 		$restPrefix = self::restPrefixOf($consent['rest_prefix'] ?? null);
 		$query = $get ?? self::queryOf($server);
-		// a login cookie, or Basic credentials on a REST request (an application password, which WordPress
-		// checks only after this layer), signs a caller in where WordPress runs: the adapter names that user.
-		// Anyone can send either by NAME, and plugin files run before the adapter, so this layer refuses what
-		// holds whoever asks and leaves the rest to the adapter (deferred); where no adapter runs it judges
-		// the request whole — a direct hit on a plugin file is the request it exists for
-		$deferred = $loads && (self::carriesLoginCookie($cookies) || (self::carriesBasicAuth($server) && self::isRest($server, $query, $post, $restPrefix)));
 		$report = null;
 		$reporter = static function(string $kind, string $message, array $extra) use (&$report): void
 		{
@@ -485,6 +574,21 @@ final class Prepend
 		{
 			return null;
 		}
+		$cookie = self::carriesLoginCookie($cookies);
+		// inside WordPress the cookie is checked as WordPress will check it: a database read, made only now that
+		// the request has rules to be judged by
+		if($cookie && $signedIn === null && $wordpress === true)
+		{
+			$signedIn = self::loginCookieSignsIn($cookies, $server, $consent, $now);
+		}
+		// a login cookie, or Basic credentials on a REST request (an application password, which WordPress
+		// checks only after this layer), signs a caller in where WordPress runs: the adapter names that user.
+		// Anyone can send either by NAME, and plugin files run before the adapter, so this layer refuses what
+		// holds whoever asks and leaves the rest to the adapter (deferred); where no adapter runs it judges
+		// the request whole — a direct hit on a plugin file is the request it exists for. A login cookie the
+		// must-use stage found to sign no one in defers nothing: the caller is anonymous
+		$cookie = $cookie && $signedIn !== false;
+		$deferred = $loads && ($cookie || (self::carriesBasicAuth($server) && self::isRest($server, $query, $post, $restPrefix)));
 		// who WordPress will run it as is told only later for a deferred request, an XML-RPC call (inside each
 		// method) and a REST request with a token another plugin reads; the adapter cannot name that caller
 		// either, so the rules for anyone are judged here and what depends on who waits for the adapter
@@ -500,6 +604,8 @@ final class Prepend
 		// a deferred request is refused here, or left to the adapter whole: counted and reported there, with its user
 		if($deferred && $verdict->isBlock() === false)
 		{
+			$left = $cookie;
+			
 			return null;
 		}
 		// a blocking vpatch this layer could not answer (a nonce it cannot check): where
@@ -531,9 +637,12 @@ final class Prepend
 	 * `content` the content directory the guard measures against (realpath
 	 * of WP_CONTENT_DIR, '' when unknown: the guard then says nothing),
 	 * `seal` the key the ruleset is sealed under (sealOf(), '' when none:
-	 * the kernel then reads no ruleset)
+	 * the kernel then reads no ruleset), `login_cookie` the site's login
+	 * cookie name while WordPress's own check of it runs (loginCookieSignsIn(),
+	 * '' when it does not or is not known yet: a login cookie then defers as
+	 * it always did)
 	 *
-	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string, seal: string}
+	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string, seal: string, login_cookie: string}
 	 */
 	public static function consent(
 		string $dir,
@@ -562,6 +671,7 @@ final class Prepend
 			'proxies' => is_array($decoded['proxies'] ?? null) ? array_values(array_filter($decoded['proxies'], 'is_string')) : [],
 			'rest_prefix' => self::restPrefixOf($decoded['rest_prefix'] ?? null),
 			'seal' => self::sealOf($decoded['seal'] ?? null),
+			'login_cookie' => self::loginCookieOf($decoded['login_cookie'] ?? null),
 		];
 	}
 	
@@ -569,12 +679,13 @@ final class Prepend
 	 * The plugin's half: the consent written when it differs from what is
 	 * there (one small read per request, one write per change). The ruleset's
 	 * name is drawn once and kept: the one there, else the one given, else a
-	 * new one. The REST prefix is kept unless given: the writer before
-	 * plugins_loaded cannot know it (writeRestPrefix()). The seal key is
-	 * the given one, '' when none: a writer without the API key leaves the
-	 * layer no ruleset to read
+	 * new one. The REST prefix and the login cookie's name are kept unless
+	 * given: the writer before plugins_loaded cannot know them
+	 * (writeRestPrefix(), writeLoginCookie()). The seal key is the given one,
+	 * '' when none: a writer without the API key leaves the layer no ruleset
+	 * to read
 	 *
-	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string, seal?: string} $consent
+	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string, seal?: string, login_cookie?: string} $consent
 	 * @return bool whether the file was (re)written
 	 */
 	public static function writeConsent(
@@ -602,6 +713,7 @@ final class Prepend
 			'proxies' => array_values(array_filter((array)($consent['proxies'] ?? []), 'is_string')),
 			'rest_prefix' => self::restPrefixOf($consent['rest_prefix'] ?? $current['rest_prefix'] ?? null),
 			'seal' => self::sealOf($consent['seal'] ?? null),
+			'login_cookie' => self::loginCookieOf($consent['login_cookie'] ?? $current['login_cookie'] ?? null),
 		];
 		if($current === $wanted)
 		{
@@ -630,6 +742,26 @@ final class Prepend
 		return self::writeConsent($dir, ['rest_prefix' => $prefix] + $current);
 	}
 	
+	/**
+	 * The plugin's half at init: the site's login cookie name while
+	 * WordPress's own check of it runs, '' while it does not, into the
+	 * consent — rewritten only when it changed. False when it did not, or
+	 * there is no consent to carry it
+	 */
+	public static function writeLoginCookie(
+		string $dir,
+		string $name,
+	): bool
+	{
+		$current = self::consent($dir);
+		if($current === null || $current['login_cookie'] === self::loginCookieOf($name))
+		{
+			return false;
+		}
+		
+		return self::writeConsent($dir, ['login_cookie' => $name] + $current);
+	}
+	
 	/** a REST prefix as the consent keeps it: without its slashes, WordPress's default when there is none */
 	public static function restPrefixOf(
 		mixed $prefix,
@@ -646,6 +778,14 @@ final class Prepend
 	): string
 	{
 		return is_string($seal) && preg_match('~^[0-9a-f]{64}\z~', $seal) === 1 ? $seal : '';
+	}
+	
+	/** a login cookie's name as the consent keeps it, printable ASCII; '' for anything else, which checks no cookie */
+	protected static function loginCookieOf(
+		mixed $name,
+	): string
+	{
+		return is_string($name) && preg_match('~^[\x21-\x7E]{1,255}\z~', $name) === 1 ? $name : '';
 	}
 	
 	/**
@@ -720,6 +860,273 @@ final class Prepend
 		}
 		
 		return false;
+	}
+	
+	/**
+	 * Whether the site's login cookie signs its caller in, checked as
+	 * wp_validate_auth_cookie() checks it for wp_validate_logged_in_cookie(),
+	 * with the core code WordPress loads before the must-use plugins: the
+	 * cookie by the site's name, `login|expiration|token|hmac`, not expired,
+	 * its hmac under the user's password fragment and wp_salt('logged_in'),
+	 * its session live. True: WordPress will sign that user in. False: it
+	 * signs no one in, an absent cookie included. Null: this cannot be told
+	 * here — before WordPress, without the adapter's word that WordPress's own
+	 * check runs on this site (the consent's `login_cookie`), with a filter on
+	 * the salt or the session store, or a salt this cannot read. Never throws
+	 *
+	 * @param array<string, mixed> $cookies
+	 * @param array<string, mixed> $server
+	 * @param array{login_cookie?: string} $consent
+	 * @param ?array<string, mixed> $constants wp-config's constants (COOKIE_CONSTANTS) by name; null reads this request's
+	 */
+	public static function loginCookieSignsIn(
+		array $cookies,
+		array $server,
+		array $consent,
+		?int $now = null,
+		?array $constants = null,
+	): ?bool
+	{
+		try
+		{
+			$name = self::loginCookieOf($consent['login_cookie'] ?? null);
+			$wpdb = $GLOBALS['wpdb'] ?? null;
+			// all of it core code WordPress loads before the must-use plugins: missing, this is no WordPress to check against
+			if($name === '' || is_object($wpdb) === false || function_exists('get_site_option') === false || function_exists('has_filter') === false
+				|| class_exists(WP_Session_Tokens::class, false) === false)
+			{
+				return null;
+			}
+			// a filter that changes the salt or where the sessions live: the check would not be WordPress's
+			if(has_filter('salt') !== false || has_filter('session_token_manager') !== false)
+			{
+				return null;
+			}
+			$constants ??= self::configConstants();
+			// another name than the adapter's: wp-config or the site URL changed after it wrote the consent
+			if(self::loginCookieName($constants) !== $name)
+			{
+				return null;
+			}
+			$value = $cookies[$name] ?? null;
+			// wp_parse_auth_cookie(): none, or one of other than four parts, signs no one in
+			if(is_string($value) === false)
+			{
+				return false;
+			}
+			$parts = explode('|', $value);
+			if(count($parts) !== 4)
+			{
+				return false;
+			}
+			[$login, $expiration, $token, $hmac] = $parts;
+			$grace = (function_exists('wp_doing_ajax') && (bool)wp_doing_ajax()) || ($server['REQUEST_METHOD'] ?? null) === 'POST' ? self::COOKIE_GRACE : 0;
+			if((int)$expiration + $grace < ($now ?? time()))
+			{
+				return false;
+			}
+			// get_user_by() is pluggable and loads after the plugins: the two columns the hmac needs, by the login as sent
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- one read by the users table's unique login, before the object cache's user functions exist
+			$user = $wpdb->get_row($wpdb->prepare('SELECT ID, user_pass FROM ' . $wpdb->users . ' WHERE user_login = %s LIMIT 1', $login));
+			if(is_object($user) === false)
+			{
+				// a query that failed proves no one anonymous
+				return (string)($wpdb->last_error ?? '') === '' ? false : null;
+			}
+			$salt = self::loggedInSalt($constants);
+			if($salt === null)
+			{
+				return null;
+			}
+			$signed = false;
+			foreach(self::passFragments((string)($user->user_pass ?? '')) as $fragment)
+			{
+				// wp_hash() keys the cookie's hmac with the salt and the password fragment, so a new password ends it
+				$key = hash_hmac('md5', $login . '|' . $fragment . '|' . $expiration . '|' . $token, $salt);
+				$signed = $signed || hash_equals(hash_hmac('sha256', $login . '|' . $expiration . '|' . $token, $key), $hmac);
+			}
+			if($signed === false)
+			{
+				return false;
+			}
+			
+			// a session destroyed or expired ends the cookie before its own expiration
+			return WP_Session_Tokens::get_instance((int)($user->ID ?? 0))->verify($token);
+		}
+		catch(Throwable)
+		{
+			return null;
+		}
+	}
+	
+	/**
+	 * wp-config's constants the login cookie's check reads, as this request
+	 * defined them
+	 *
+	 * @return array<string, mixed>
+	 */
+	protected static function configConstants(): array
+	{
+		$constants = [];
+		foreach(self::COOKIE_CONSTANTS as $name)
+		{
+			if(defined($name))
+			{
+				$constants[$name] = constant($name);
+			}
+		}
+		
+		return $constants;
+	}
+	
+	/**
+	 * The login cookie's name as wp_cookie_constants() defines it after the
+	 * must-use plugins: LOGGED_IN_COOKIE where set, else the prefix and
+	 * COOKIEHASH where set, else the prefix and the site URL's md5 ('' without
+	 * a site URL)
+	 *
+	 * @param array<string, mixed> $constants
+	 */
+	protected static function loginCookieName(
+		array $constants,
+	): string
+	{
+		if(array_key_exists('LOGGED_IN_COOKIE', $constants))
+		{
+			return (string)$constants['LOGGED_IN_COOKIE'];
+		}
+		if(array_key_exists('COOKIEHASH', $constants))
+		{
+			return self::LOGIN_COOKIE . (string)$constants['COOKIEHASH'];
+		}
+		$site = get_site_option('siteurl');
+		
+		return self::LOGIN_COOKIE . ((bool)$site ? md5((string)$site) : '');
+	}
+	
+	/**
+	 * wp_salt('logged_in') as it reads wp-config and the site options at the
+	 * must-use stage: a value two of the ten constants share, or the sample's
+	 * phrase, is no secret; SECRET_KEY is the key unless LOGGED_IN_KEY is a
+	 * secret, LOGGED_IN_SALT the salt; what the constants leave empty comes
+	 * from the logged_in_key and logged_in_salt site options. The phrase is
+	 * the English one alone: WordPress loads its translations only after the
+	 * must-use plugins, and the adapter vouches for this salt only where it
+	 * is wp_salt()'s own (Adapter::loginCookie()). Null where wp_salt() would
+	 * draw a new one (no option yet) or a constant is no string or integer:
+	 * not reproduced here
+	 *
+	 * @param ?array<string, mixed> $constants wp-config's constants (COOKIE_CONSTANTS) by name; null reads this request's
+	 */
+	public static function loggedInSalt(
+		?array $constants = null,
+	): ?string
+	{
+		$constants ??= self::configConstants();
+		$duplicated = [];
+		foreach(['AUTH', 'SECURE_AUTH', 'LOGGED_IN', 'NONCE', 'SECRET'] as $first)
+		{
+			foreach(['KEY', 'SALT'] as $second)
+			{
+				$name = $first . '_' . $second;
+				if(array_key_exists($name, $constants) === false)
+				{
+					continue;
+				}
+				$value = $constants[$name];
+				// wp_salt() keys an array by the value
+				if(is_string($value) === false && is_int($value) === false)
+				{
+					return null;
+				}
+				$duplicated[$value] = isset($duplicated[$value]);
+			}
+		}
+		$duplicated[self::SAMPLE_PHRASE] = true;
+		$secret = static fn(string $name): bool => array_key_exists($name, $constants) && (bool)$constants[$name]
+			&& ($duplicated[$constants[$name]] ?? false) === false;
+		$values = ['key' => $secret('SECRET_KEY') ? (string)$constants['SECRET_KEY'] : '', 'salt' => ''];
+		foreach(['key', 'salt'] as $type)
+		{
+			if($secret('LOGGED_IN_' . strtoupper($type)))
+			{
+				$values[$type] = (string)$constants['LOGGED_IN_' . strtoupper($type)];
+			}
+			elseif($values[$type] === '')
+			{
+				$option = get_site_option('logged_in_' . $type);
+				if(is_scalar($option) === false || (bool)$option === false)
+				{
+					return null;
+				}
+				$values[$type] = (string)$option;
+			}
+		}
+		
+		return $values['key'] . $values['salt'];
+	}
+	
+	/**
+	 * Whether a salt wp_salt('logged_in') reads still holds the sample's
+	 * placeholder in one of these spellings: LOGGED_IN_KEY, LOGGED_IN_SALT,
+	 * and SECRET_KEY where the key falls back to it — LOGGED_IN_KEY unset,
+	 * empty, or a value another of the ten constants shares
+	 *
+	 * @param list<string> $phrases the placeholder as written and as the site's language spells it
+	 * @param ?array<string, mixed> $constants wp-config's constants (COOKIE_CONSTANTS) by name; null reads this request's
+	 */
+	public static function placeholderSalt(
+		array $phrases,
+		?array $constants = null,
+	): bool
+	{
+		$constants ??= self::configConstants();
+		$key = $constants['LOGGED_IN_KEY'] ?? null;
+		$read = [$key, $constants['LOGGED_IN_SALT'] ?? null];
+		$shared = 0;
+		foreach(['AUTH', 'SECURE_AUTH', 'LOGGED_IN', 'NONCE', 'SECRET'] as $first)
+		{
+			foreach(['KEY', 'SALT'] as $second)
+			{
+				if($key !== null && ($constants[$first . '_' . $second] ?? null) === $key)
+				{
+					$shared++;
+				}
+			}
+		}
+		if((bool)$key === false || $shared > 1)
+		{
+			$read[] = $constants['SECRET_KEY'] ?? null;
+		}
+		foreach($read as $value)
+		{
+			if(is_string($value) && in_array($value, $phrases, true))
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * The password hash's fragment a login cookie's key holds: 8..11 of a
+	 * phpass or a bcrypt hash, as every WordPress takes it; of any other hash
+	 * the last four, as WordPress 6.8 and later take it, or 8..11, as the
+	 * versions before take it
+	 *
+	 * @return list<string>
+	 */
+	protected static function passFragments(
+		string $hash,
+	): array
+	{
+		if(str_starts_with($hash, '$P$') || str_starts_with($hash, '$2y$'))
+		{
+			return [substr($hash, 8, 4)];
+		}
+		
+		return [substr($hash, -4), substr($hash, 8, 4)];
 	}
 	
 	/**
@@ -1287,8 +1694,9 @@ final class Prepend
 	 * a vulnerable plugin's own file has not run yet — without the server edit
 	 * the prepend needs. It includes this file only while it is there, on the
 	 * PHP this plugin needs, and calls run(): an anonymous request is judged
-	 * whole, a signed-in one on the rules that refuse whoever asks, the rest
-	 * left to plugins_loaded. Written only when it is not the
+	 * whole, a login cookie that signs no one in included, a signed-in one on
+	 * the rules that refuse whoever asks, the rest left to plugins_loaded.
+	 * Written only when it is not the
 	 * current one, never over a file by that name it did not write; '' when
 	 * it is not there (the plugins_loaded judge then stands alone)
 	 */
