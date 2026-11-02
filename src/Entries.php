@@ -213,7 +213,7 @@ class Entries
 			
 			$export = $this->exportDue($dir);
 			$seen = Prepend::seen($dir);
-			$drain = $seen['paths'] !== [] && (int)($this->option()['retry_drain'] ?? 0) <= time();
+			$drain = $this->drainDue($seen);
 			
 			if($export === false && $drain === false)
 			{
@@ -266,11 +266,38 @@ class Entries
 		
 		if(is_file($dir . DIRECTORY_SEPARATOR . Prepend::ENTRIES) === false)
 		{
-			return (int)($stored['retry'] ?? 0) <= time();
+			return $this->retryDue('retry');
 		}
 		
 		return (string)($stored['core'] ?? '') !== $this->coreVersion()
 			|| (string)($stored['plugin'] ?? '') !== Plugin::VERSION;
+	}
+	
+	/**
+	 * Whether the queue the layer recorded is to be judged now: something
+	 * waits, and no drain the console did not take holds it back
+	 *
+	 * @param array{paths: array<string, array>, dropped: int} $seen
+	 */
+	public function drainDue(
+		array $seen,
+	): bool
+	{
+		return $seen['paths'] !== [] && $this->retryDue('retry_drain');
+	}
+	
+	/**
+	 * Whether the retry time stored under $key has come, or lies further
+	 * ahead than the RETRY this class puts one, which no request wrote
+	 */
+	protected function retryDue(
+		string $key,
+	): bool
+	{
+		$at = (int)($this->option()[$key] ?? 0);
+		$now = time();
+		
+		return $at <= $now || Clock::ahead($at, $now, self::RETRY);
 	}
 	
 	/**
@@ -1280,11 +1307,16 @@ class Entries
 		update_option(self::OPTION, $patch + $this->option(), true);
 	}
 	
+	/**
+	 * The scan runner's lock idiom: a lock older than LOCK_TTL, or dated more
+	 * than LOCK_TTL ahead of the clock, which no request took, is taken over
+	 */
 	protected function lock(): bool
 	{
 		$held = get_option(self::LOCK);
+		$now = time();
 		
-		if($held !== false && time() - (int)$held < self::LOCK_TTL)
+		if($held !== false && $now - (int)$held < self::LOCK_TTL && Clock::ahead((int)$held, $now, self::LOCK_TTL) === false)
 		{
 			return false;
 		}
@@ -1294,7 +1326,7 @@ class Entries
 			delete_option(self::LOCK);
 		}
 		
-		return add_option(self::LOCK, time(), '', false);
+		return add_option(self::LOCK, $now, '', false);
 	}
 	
 	protected function unlock(): void

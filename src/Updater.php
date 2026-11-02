@@ -8,27 +8,38 @@ use Throwable;
 use WP_Error;
 use ZipArchive;
 
+use function __;
+use function add_filter;
 use function base64_decode;
 use function class_exists;
 use function defined;
+use function download_url;
 use function explode;
 use function file_get_contents;
+use function get_transient;
 use function hex2bin;
 use function is_array;
 use function is_file;
 use function is_string;
+use function is_wp_error;
 use function json_decode;
 use function ltrim;
+use function plugin_basename;
 use function preg_match;
 use function preg_replace;
 use function rawurldecode;
+use function set_transient;
 use function sodium_crypto_sign_verify_detached;
 use function str_starts_with;
 use function strlen;
 use function substr;
+use function time;
 use function trim;
 use function unlink;
 use function version_compare;
+use function wp_remote_get;
+use function wp_remote_retrieve_body;
+use function wp_remote_retrieve_response_code;
 
 /**
  * Self-update through WordPress core's Update URI mechanism (WP 5.8+):
@@ -88,6 +99,9 @@ class Updater
 	protected const PACKAGE_PREFIX = 'https://github.com/ovos/codesafe-client-wordpress/releases/download/';
 	
 	protected const CACHE_KEY = 'ovos_codesafe_latest_release';
+	
+	/** how long a successful answer is cached, in seconds */
+	protected const CACHE_TTL = 12 * 3600;
 	
 	/** the plugin's main file inside a release zip — git archive's ovos-codesafe/ prefix */
 	public const MAIN_FILE = 'ovos-codesafe/ovos-codesafe.php';
@@ -349,8 +363,12 @@ class Updater
 	protected function latestRelease(): ?array
 	{
 		$cached = get_transient(self::CACHE_KEY);
+		$now = time();
+		$at = is_array($cached) ? (int)($cached['at'] ?? 0) : 0;
 		
-		if(is_array($cached))
+		// the answer dates itself: WordPress keeps a transient stored with no timeout for good,
+		// so one without a time, older than the cache's span or ahead of the clock is asked again
+		if(is_array($cached) && $now - $at < self::CACHE_TTL && Clock::ahead($at, $now) === false)
 		{
 			return $cached;
 		}
@@ -371,7 +389,7 @@ class Updater
 		
 		if($release !== null)
 		{
-			set_transient(self::CACHE_KEY, $release, HOUR_IN_SECONDS * 12);
+			set_transient(self::CACHE_KEY, $release + ['at' => $now], self::CACHE_TTL);
 		}
 		
 		return $release;

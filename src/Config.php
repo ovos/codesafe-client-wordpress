@@ -12,18 +12,25 @@ use function defined;
 use function function_exists;
 use function get_blog_option;
 use function get_main_site_id;
+use function get_option;
+use function inet_pton;
 use function is_main_site;
 use function is_multisite;
 use function is_super_admin;
 use function max;
 use function mb_substr;
 use function min;
+use function ord;
 use function preg_match;
 use function preg_split;
 use function rtrim;
+use function strlen;
+use function strpos;
 use function strtolower;
 use function strtoupper;
+use function substr;
 use function trim;
+use function wp_get_environment_type;
 
 use const PREG_SPLIT_NO_EMPTY;
 
@@ -92,6 +99,41 @@ class Config
 		'198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
 		'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
 		'2a06:98c0::/29', '2c0f:f248::/32'];
+	
+	/** a token shaped like an address or a CIDR range */
+	protected const RANGE = '~^[0-9A-Fa-f:.]+(?:/\d{1,3})?$~';
+	
+	/**
+	 * The shortest IPv4 prefix a trusted range may have: a /8 is the widest
+	 * block one network holds (10.0.0.0/8, the widest private range, or a
+	 * legacy allocation), and anything wider spans networks that are not
+	 * the site's proxy
+	 */
+	public const PROXY_FLOOR_V4 = 8;
+	
+	/**
+	 * The shortest IPv6 prefix a trusted range may have: wider than any one
+	 * provider's allocation (Cloudflare's widest is a /29, the largest
+	 * carriers' near /19), narrower than the /12 a registry hands out
+	 */
+	public const PROXY_FLOOR_V6 = 16;
+	
+	/**
+	 * The IPv6 blocks whose last 32 bits are an IPv4 address: IPv4-mapped,
+	 * which REMOTE_ADDR reads on a dual-stack socket, and NAT64's well-known
+	 * prefix. Each spans every IPv4 address, so a range over one is held to
+	 * the IPv4 floor
+	 */
+	protected const EMBEDDED_V4 = ['::ffff:0:0', '64:ff9b::'];
+	
+	/**
+	 * The IPv6 blocks no internet visitor's address comes from, by prefix
+	 * length: unique local, which internal Docker and Kubernetes networks
+	 * use, and link-local. A range inside one passes whatever its length.
+	 * IPv4 needs no such list: its private and loopback blocks are /8 or
+	 * narrower, so every range inside one clears the floor anyway
+	 */
+	protected const NON_ROUTABLE_V6 = ['fc00::' => 7, 'fe80::' => 10];
 	
 	protected ?array $settings = null;
 	
@@ -271,16 +313,18 @@ class Config
 	 * from: CIDRs or bare addresses, split on commas and whitespace, and the
 	 * word `cloudflare` for Cloudflare's published edge list (CLOUDFLARE).
 	 * Empty means the header is never read — a header any client can send is
-	 * worth only the proxy that set it
+	 * worth only the proxy that set it. A range wider than any one network
+	 * (tooWide()) is left out whatever set it — the form, a constant, or an
+	 * option written past the form: from it every visitor names their own
+	 * address; refusedProxies() lists them for the settings page
 	 *
 	 * @return list<string>
 	 */
 	public function trustedProxies(): array
 	{
-		$tokens = preg_split('~[,;\s]+~', trim((string)$this->networkValue('trusted_proxies')), -1, PREG_SPLIT_NO_EMPTY);
 		$ranges = [];
 		
-		foreach($tokens === false ? [] : $tokens as $token)
+		foreach(self::proxyTokens((string)$this->networkValue('trusted_proxies')) as $token)
 		{
 			if(strtolower($token) === 'cloudflare')
 			{
@@ -289,13 +333,133 @@ class Config
 				continue;
 			}
 			
-			if(preg_match('~^[0-9A-Fa-f:.]+(?:/\d{1,3})?$~', $token) === 1)
+			if(preg_match(self::RANGE, $token) === 1 && self::tooWide($token) === false)
 			{
 				$ranges[] = $token;
 			}
 		}
 		
 		return array_values(array_unique(array_slice($ranges, 0, 256)));
+	}
+	
+	/**
+	 * The configured ranges trustedProxies() leaves out as too wide, as
+	 * they were written
+	 *
+	 * @return list<string>
+	 */
+	public function refusedProxies(): array
+	{
+		return self::tooWideOf((string)$this->networkValue('trusted_proxies'));
+	}
+	
+	/**
+	 * The tokens of a trusted_proxies value, split on commas, semicolons and
+	 * whitespace
+	 *
+	 * @return list<string>
+	 */
+	public static function proxyTokens(
+		string $value,
+	): array
+	{
+		$tokens = preg_split('~[,;\s]+~', trim($value), -1, PREG_SPLIT_NO_EMPTY);
+		
+		return $tokens === false ? [] : $tokens;
+	}
+	
+	/**
+	 * The ranges of a trusted_proxies value that are too wide, as written
+	 *
+	 * @return list<string>
+	 */
+	public static function tooWideOf(
+		string $value,
+	): array
+	{
+		$refused = [];
+		
+		foreach(self::proxyTokens($value) as $token)
+		{
+			// only a parsed address with a numeric prefix is too wide, so `cloudflare` and junk never are
+			if(self::tooWide($token))
+			{
+				$refused[] = $token;
+			}
+		}
+		
+		return $refused;
+	}
+	
+	/**
+	 * Whether a range trusts more addresses than any one network holds: an
+	 * IPv4 prefix shorter than PROXY_FLOOR_V4, an IPv6 one shorter than
+	 * PROXY_FLOOR_V6 unless it lies inside a block no visitor comes from
+	 * (NON_ROUTABLE_V6), and a range over a block that carries IPv4 inside
+	 * IPv6 (EMBEDDED_V4) is measured as the IPv4 range it holds. A token that
+	 * is no range is not too wide: it matches nothing anyway
+	 */
+	public static function tooWide(
+		string $range,
+	): bool
+	{
+		$slash = strpos($range, '/');
+		$packed = @inet_pton($slash === false ? $range : substr($range, 0, $slash));
+		$length = substr($range, $slash === false ? strlen($range) : $slash + 1);
+		
+		if($packed === false || ($slash !== false && preg_match('~^\d{1,3}$~', $length) !== 1))
+		{
+			return false;
+		}
+		
+		$bits = $slash === false ? strlen($packed) * 8 : (int)$length;
+		
+		if(strlen($packed) === 4)
+		{
+			return $bits < self::PROXY_FLOOR_V4;
+		}
+		
+		foreach(self::NON_ROUTABLE_V6 as $block => $blockBits)
+		{
+			// a range inside the block holds no internet visitor: its length cannot widen it past the site's own network
+			if($bits >= $blockBits && self::samePrefix($packed, (string)inet_pton($block), $blockBits))
+			{
+				return false;
+			}
+		}
+		
+		foreach(self::EMBEDDED_V4 as $block)
+		{
+			// the range overlaps the block when their common prefix bits agree
+			if(self::samePrefix($packed, (string)inet_pton($block), min($bits, 96)))
+			{
+				return $bits < 96 + self::PROXY_FLOOR_V4;
+			}
+		}
+		
+		return $bits < self::PROXY_FLOOR_V6;
+	}
+	
+	/**
+	 * Whether two packed addresses agree in their first $bits bits
+	 */
+	protected static function samePrefix(
+		string $a,
+		string $b,
+		int $bits,
+	): bool
+	{
+		for($i = 0; $bits > 0; $i++, $bits -= 8)
+		{
+			$mask = $bits >= 8 ? 0xFF : (0xFF << (8 - $bits)) & 0xFF;
+			
+			if((ord($a[$i]) & $mask) !== (ord($b[$i]) & $mask))
+			{
+				return false;
+			}
+		}
+		
+		return true;
 	}
 	
 	/**

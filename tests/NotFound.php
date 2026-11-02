@@ -17,6 +17,7 @@ use function count;
 use function rest_get_server;
 use function str_contains;
 use function str_repeat;
+use function time;
 use function wp_shim_reset;
 
 use const DIRECTORY_SEPARATOR;
@@ -217,6 +218,44 @@ class NotFound extends Test
 			&& $past === 30
 			&& array_column($sender->queued(), 'message')[30] === '404 Not Found: /wp-admin/admin-ajax.php?action=zz_upload'
 			&& count($sender->queued()) === 32;
+	}
+	
+	/**
+	 * RULE: the budget's window carries its own start, since WordPress keeps
+	 * a transient for as long as its stored timeout says and one written with
+	 * no timeout for good: a bare count, as a plant writes it, and a window
+	 * that starts ahead of the clock are no window, and a miss is reported;
+	 * a full window that started a few seconds ago, or a few seconds ahead by
+	 * another server's clock, still holds the budget, and one past its minute
+	 * does not.
+	 * Falsify: keep the bare counter — a planted count with no timeout keeps
+	 * every not-found report off for good.
+	 */
+	public function aPlantedWindowIsNoBudget(): bool
+	{
+		$sender = $this->sender();
+		$found = new PluginNotFound(new Config, $sender);
+		$GLOBALS['wp']['is_404'] = true;
+		$reported = static function() use ($found, $sender): bool
+		{
+			$before = count($sender->queued());
+			$found->reportPage();
+			
+			return count($sender->queued()) === $before + 1;
+		};
+		
+		$GLOBALS['wp']['transients']['ovos_codesafe_404_rate'] = 1_000_000;
+		$count = $reported();
+		$GLOBALS['wp']['transients']['ovos_codesafe_404_rate'] = ['start' => time() + 315_360_000, 'count' => 1_000_000];
+		$future = $reported();
+		$GLOBALS['wp']['transients']['ovos_codesafe_404_rate'] = ['start' => time() - 10, 'count' => PluginNotFound::MAX_PER_MINUTE];
+		$full = $reported();
+		$GLOBALS['wp']['transients']['ovos_codesafe_404_rate'] = ['start' => time() + 3, 'count' => PluginNotFound::MAX_PER_MINUTE];
+		$skewed = $reported();
+		$GLOBALS['wp']['transients']['ovos_codesafe_404_rate'] = ['start' => time() - 61, 'count' => PluginNotFound::MAX_PER_MINUTE];
+		$closed = $reported();
+		
+		return $count && $future && $full === false && $skewed === false && $closed;
 	}
 	
 	/**

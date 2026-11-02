@@ -25,6 +25,7 @@ use function curl_setopt_array;
 use function defined;
 use function delete_option;
 use function dirname;
+use function fastcgi_finish_request;
 use function function_exists;
 use function get_bloginfo;
 use function get_mu_plugins;
@@ -297,9 +298,13 @@ class Inventory
 				return false;
 			}
 			
-			// a door that timed out or failed is not asked again on every answer heard
+			// a door that timed out or failed is not asked again on every answer heard;
+			// a try dated ahead of the clock was planted and holds nothing back
+			$now ??= time();
+			$triedAt = (int)($state['tried_at'] ?? 0);
 			if((string)($state['tried'] ?? '') === $version
-				&& ($now ?? time()) < (int)($state['tried_at'] ?? 0) + self::backoff((int)($state['fails'] ?? 1)))
+				&& $now < $triedAt + self::backoff((int)($state['fails'] ?? 1))
+				&& Clock::ahead($triedAt, $now) === false)
 			{
 				return false;
 			}
@@ -331,9 +336,13 @@ class Inventory
 			$state = get_option(self::OPTION);
 			$state = is_array($state) ? $state : [];
 			$dirty = get_option(self::OPTION_DIRTY);
+			$ts = (int)($state['ts'] ?? 0);
+			$now = time();
 			
+			// a last send dated ahead of the clock was planted: the heartbeat is due
 			if((bool)$dirty === false
-				&& time() - (int)($state['ts'] ?? 0) < self::DAY)
+				&& $now - $ts < self::DAY
+				&& Clock::ahead($ts, $now) === false)
 			{
 				return;
 			}

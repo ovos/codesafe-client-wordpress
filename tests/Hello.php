@@ -237,6 +237,38 @@ class Hello extends Test
 			&& count($sender->said) === 3;
 	}
 	
+	/**
+	 * RULE: a time in the hello's record further ahead than this code writes
+	 * one was planted: a `next` past a day ahead, an `at` ahead of the clock,
+	 * and the hello goes out. A `next` within the day, as a deactivation
+	 * leaves it, and an `at` a few seconds ahead, another server's clock,
+	 * still hold it.
+	 * Falsify: drop either check — a record dated ten years out keeps the
+	 * hello, and the switches it tells codesafe, silent for ten years.
+	 */
+	public function aRecordDatedAheadOfTheClockIsDue(): bool
+	{
+		$sender = $this->sender();
+		$hello = new PluginHello($this->config(), $sender, cli: false);
+		$hello->maybeSend(self::NOW);
+		$told = $GLOBALS['wp']['options'][PluginHello::OPTION];
+		
+		// a day on, the same switches are due again unless `next` holds them
+		$later = self::NOW + PluginHello::DAY;
+		$GLOBALS['wp']['options'][PluginHello::OPTION] = ['next' => $later + 60 + PluginHello::DAY] + $told;
+		$waits = $hello->maybeSend($later + 60);
+		$GLOBALS['wp']['options'][PluginHello::OPTION] = ['next' => self::NOW + 315_360_000] + $told;
+		$planted = $hello->maybeSend($later + 120);
+		$told = $GLOBALS['wp']['options'][PluginHello::OPTION];
+		$GLOBALS['wp']['options'][PluginHello::OPTION] = ['at' => $later + 183] + $told;
+		$skewed = $hello->maybeSend($later + 180);
+		$GLOBALS['wp']['options'][PluginHello::OPTION] = ['at' => self::NOW + 315_360_000] + $told;
+		$future = $hello->maybeSend($later + 240);
+		
+		return $waits === false && $planted && $skewed === false && $future
+			&& count($sender->said) === 3;
+	}
+	
 	/** an unconnected plugin says nothing */
 	public function anUnconnectedPluginSaysNothing(): bool
 	{

@@ -694,7 +694,8 @@ class Sender
 			}
 			
 			$start = (int)($window['start'] ?? 0);
-			if($now - $start < self::SECURITY_WINDOW)
+			// a start ahead of the clock was planted, never opened: it closes like an old one
+			if($now - $start < self::SECURITY_WINDOW && Clock::ahead($start, $now) === false)
 			{
 				$open[$kind] = $window;
 				
@@ -708,7 +709,8 @@ class Sender
 					sprintf('%1$d more %2$s events within %3$d seconds were over this site\'s budget and are counted here, not sent one by one',
 						$over, $kind, self::SECURITY_WINDOW),
 					['summary' => true, 'suppressed' => $over, 'sent' => (int)($window['count'] ?? 0), 'window' => self::SECURITY_WINDOW],
-					['at' => $start + self::SECURITY_WINDOW],
+					// a closed window ends in the past; a planted one is dated now, never in the future
+					['at' => min($start + self::SECURITY_WINDOW, $now)],
 					null);
 			}
 		}

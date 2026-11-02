@@ -570,7 +570,17 @@ of its request is capped — the URL at 2 KB, the user agent, referer and host
 at 512 bytes each — since every refused request rewrites the queue. Behind a proxy or CDN the
 *Trusted proxy* settings make this layer, the adapter and every report name
 the visitor instead of the edge; the header is read only when the connecting
-address is in the trusted ranges. Deactivating the plugin says goodbye to
+address is in the trusted ranges. A range wider than any one network is
+refused — an IPv4 prefix shorter than /8, an IPv6 one shorter than /16 (a
+range over the IPv4-mapped `::ffff:0:0/96` or NAT64's `64:ff9b::/96` needs
+/104), `0.0.0.0/0` and `::/0` first of all — since through it every visitor
+names their own address. A range inside IPv6's unique-local `fc00::/7` or
+link-local `fe80::/10` passes whatever its length (`fd00::/8` behind an
+internal Docker or Kubernetes proxy): no internet visitor's address comes
+from them. IPv4's private and loopback blocks are /8 or narrower and pass
+the floor as they are. The form saves the rest and says why, and a range
+from `CODESAFE_TRUSTED_PROXIES` or an option written past the form is never
+read, which the settings page says under the field. Deactivating the plugin says goodbye to
 codesafe (`sensor_goodbye`, see *Security events*), then rewrites the consent
 with every box off, so the layer stops on the next request; on a multisite
 network the store is one for every site, and only the main site — set by a
@@ -942,7 +952,8 @@ credential-stuffing run cannot turn the reporter into the flood it surfaces,
 nor silence the privilege grant or the block that follows it. Sensitive admin
 changes (`privileged_action`) and executed files are never held back; what goes
 over a budget is counted and sent as one summary event of its kind (`summary`,
-`suppressed`) when the minute closes.
+`suppressed`) when the minute closes. A window that starts ahead of the clock
+was planted, never opened, and closes at once (see *Times the plugin keeps*).
 
 It is on by default; untick Settings → ovos codesafe → *Security events*, or
 lock it off in `wp-config.php`:
@@ -955,6 +966,27 @@ The codesafe side is on by default for every project (the per-project
 *Security events* switch under the project's Data tab is the off switch).
 The Shield's own kinds (`shield_observe`, `shield_block`, `shield_rate`) do
 not depend on this switch — detection is its own consent.
+
+## Times the plugin keeps
+
+The plugin keeps its waits in the options table, in transients and, for the
+rollups, in APCu: the security-event and not-found budgets' windows, the
+integrity scan's lock, its last pass and the database checks' day of waiting,
+the executed-file watch's lock and its retries, the hello's and the
+inventory's next send, the rollups' flush mark, the cached checksum lists and
+release answer. Its own code writes each one as the time it acted, or as a
+retry a known span after that. A time further ahead was written past the
+plugin — by another plugin that writes options it should not, or by whoever
+has the database — and would hold its guard shut for good, since its age is
+negative and below every limit. So such a time is stale: the window closes,
+the lock is taken over, the pass, the hello or the inventory is due, the
+cache is fetched again. Five seconds ahead are allowed, for servers that
+share one database and keep their clocks a little apart; a time planted
+within them holds its guard no longer than the guard's own span. A cached
+transient also holds no longer than the time stored inside it says,
+whatever timeout WordPress keeps beside it (a transient stored with none is
+kept for good): a budget's minute, a checksum list's month (a week for a
+version wordpress.org did not have), the release answer's twelve hours.
 
 ## What never leaves the site
 

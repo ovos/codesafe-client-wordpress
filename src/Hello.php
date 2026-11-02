@@ -8,6 +8,7 @@ use Ovos\Codesafe\Shield\Prepend;
 
 use function constant;
 use function defined;
+use function fastcgi_finish_request;
 use function function_exists;
 use function get_option;
 use function in_array;
@@ -149,9 +150,12 @@ final class Hello
 		$signature = md5(Plugin::VERSION . '|' . $this->config->environment() . '|' . json_encode($features));
 		$told = get_option(self::OPTION, []);
 		$told = is_array($told) ? $told : [];
+		$next = (int)($told['next'] ?? 0);
+		$at = (int)($told['at'] ?? 0);
 		
-		if((int)($told['next'] ?? 0) > $now
-			|| (($told['sig'] ?? '') === $signature && $now - (int)($told['at'] ?? 0) < self::DAY))
+		// a `next` past the day this code waits at most, or an `at` ahead of the clock, was planted: the hello is due
+		if(($next > $now && Clock::ahead($next, $now, self::DAY) === false)
+			|| (($told['sig'] ?? '') === $signature && $now - $at < self::DAY && Clock::ahead($at, $now) === false))
 		{
 			return false;
 		}
