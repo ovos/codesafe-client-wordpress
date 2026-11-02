@@ -58,11 +58,19 @@ class ScanRunner
 	public const ACTION = 'ovos_codesafe_scan';
 	
 	/**
-	 * {state: <the pass in progress or null>, last: {finished, sent, report}}
+	 * {state: <the pass in progress or null>, last: {finished, sent, report},
+	 * resume: <where the last pass's bounded walks and content pages stopped>}
 	 */
 	public const OPTION = 'ovos_codesafe_scan';
 	
 	public const LOCK = 'ovos_codesafe_scan_lock';
+	
+	/**
+	 * {area, path, size}: the file a chunk is judging while it judges a large
+	 * one, or the database's checks (Scan::$checkpoint) — what a chunk that
+	 * died there leaves for the next
+	 */
+	public const JUDGING = 'ovos_codesafe_scan_judging';
 	
 	/**
 	 * A lock older than this was left by a request that died mid-chunk
@@ -240,10 +248,16 @@ class ScanRunner
 	}
 	
 	/**
-	 * Advance the pass (starting one when none is in progress) within the
-	 * budget and persist the position; a completed pass is finished into
-	 * the report. A button press takes over a background pass — same walk,
-	 * more time per round.
+	 * Advance the pass (starting one when none is in progress, from where the
+	 * last one's bounded walks stopped) within the budget and persist the
+	 * position; a completed pass is finished into the report. A button press
+	 * takes over a background pass — same walk, more time per round. The
+	 * scan's checkpoint keeps the large file it is judging in JUDGING, a row
+	 * of its own and small, and drops it once the file is judged, so a chunk
+	 * that dies there — out of memory, out of time, past this try/finally —
+	 * leaves the file's name: the next chunk hands it to the pass it resumes
+	 * from where the dead chunk began, or begins, which names the file
+	 * instead of dying on it again
 	 */
 	protected function run(
 		string $mode,
@@ -251,7 +265,27 @@ class ScanRunner
 	): string
 	{
 		$stored = $this->option();
-		$state = is_array($stored['state'] ?? null) ? $stored['state'] : $this->scan->start($mode);
+		$state = is_array($stored['state'] ?? null) ? $stored['state'] : $this->scan->start($mode, (array)($stored['resume'] ?? []));
+		$judging = get_option(self::JUDGING, null);
+		
+		// what the last chunk died judging, handed on once
+		if(is_array($judging))
+		{
+			$state['judging'] = $judging;
+			delete_option(self::JUDGING);
+		}
+		
+		$this->scan->checkpoint = static function(?array $judging): void
+		{
+			if($judging === null)
+			{
+				delete_option(self::JUDGING);
+				
+				return;
+			}
+			
+			update_option(self::JUDGING, $judging, false);
+		};
 		
 		if($mode === 'manual')
 		{
@@ -282,6 +316,7 @@ class ScanRunner
 		$report = $this->scan->report($state, 'wordpress/' . Plugin::VERSION);
 		
 		$stored['state'] = null;
+		$stored['resume'] = (array)($state['resume_next'] ?? []);
 		$stored['last'] = [
 			'finished' => time(),
 			'sent' => $this->send($report),

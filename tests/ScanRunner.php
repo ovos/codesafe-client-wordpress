@@ -8,7 +8,9 @@ use Ovos\Codesafe\Scan;
 use Ovos\Codesafe\ScanRunner as PluginScanRunner;
 use Ovos\Test;
 use Ovos\Test\Internal;
+use RuntimeException;
 
+use function array_key_exists;
 use function time;
 use function wp_shim_reset;
 
@@ -78,6 +80,109 @@ class ScanRunner extends Test
 		
 		return $planted !== null && $planted <= time()
 			&& $ordinary !== null && $ordinary > time();
+	}
+	
+	/**
+	 * RULE: the runner hands the scan a checkpoint that keeps the file it is
+	 * about to judge in an option of its own and drops it once cleared,
+	 * writing nothing of the pass; the next chunk hands that name to the pass
+	 * it resumes or begins, and drops the option. A finished pass's resume
+	 * points become the next pass's start. Falsify: keep the name in the
+	 * pass's own option (the whole pass is written on every large file);
+	 * leave the option behind (the name is handed on twice); drop
+	 * resume_next with the pass (every pass starts at the top).
+	 */
+	public function aDyingChunkLeavesItsCheckpointAndResumePointsCarryOver(): bool
+	{
+		$config = new Config();
+		$scan = new class($config) extends Scan
+		{
+			/** @var list<array<string, mixed>> the resume points each new pass was started with */
+			public array $started = [];
+			
+			public bool $dies = true;
+			
+			/** @var list<mixed> the name each chunk was handed */
+			public array $handed = [];
+			
+			public bool $clears = false;
+			
+			public function start(
+				string $mode,
+				array $resume = [],
+			): array
+			{
+				$this->started[] = $resume;
+				
+				return ['mode' => $mode, 'done' => false];
+			}
+			
+			public function advance(
+				array $state,
+				int $budgetMs,
+			): array
+			{
+				$this->handed[] = $state['judging'] ?? null;
+				
+				if($this->dies || $this->clears)
+				{
+					($this->checkpoint)(['area' => 'themes', 'path' => '/site/boom.php', 'size' => 300000]);
+				}
+				
+				if($this->dies)
+				{
+					throw new RuntimeException('died judging');
+				}
+				
+				if($this->clears)
+				{
+					($this->checkpoint)(null);
+				}
+				
+				return ['done' => true, 'resume_next' => ['cache' => 'pages/p08']] + $state;
+			}
+			
+			public function report(
+				array $state,
+				string $client,
+			): array
+			{
+				return ['v' => 1];
+			}
+		};
+		$runner = new class($config, $scan) extends PluginScanRunner
+		{
+			public function once(): string
+			{
+				return $this->run('manual', 1000);
+			}
+		};
+		
+		try
+		{
+			$runner->once();
+		}
+		catch(RuntimeException)
+		{
+			// the chunk died after its checkpoint
+		}
+		
+		$left = $GLOBALS['wp']['options'][PluginScanRunner::JUDGING] ?? null;
+		$pass = $GLOBALS['wp']['options'][PluginScanRunner::OPTION]['state'] ?? null;
+		$scan->dies = false;
+		$finished = $runner->once();
+		$taken = array_key_exists(PluginScanRunner::JUDGING, $GLOBALS['wp']['options']) === false;
+		$scan->clears = true;
+		$runner->once();
+		$cleared = array_key_exists(PluginScanRunner::JUDGING, $GLOBALS['wp']['options']) === false;
+		
+		return $left === ['area' => 'themes', 'path' => '/site/boom.php', 'size' => 300000]
+			&& $pass === null
+			&& $finished === 'done'
+			&& $taken
+			&& $cleared
+			&& $scan->handed === [null, $left, null]
+			&& $scan->started === [[], [], ['cache' => 'pages/p08']];
 	}
 	
 	/**
