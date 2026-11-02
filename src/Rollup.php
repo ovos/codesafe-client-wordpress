@@ -951,7 +951,8 @@ class Rollup
 	): void
 	{
 		$flushed = apcu_fetch($this->prefix() . 'flushed');
-		if(is_int($flushed) && $flushed >= $minute - 1)
+		// a flush marks the minute before its own, so a mark past this minute was never a flush's: it is overwritten
+		if(is_int($flushed) && $flushed >= $minute - 1 && $flushed <= $minute)
 		{
 			return;
 		}

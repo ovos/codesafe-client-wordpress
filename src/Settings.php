@@ -3,18 +3,53 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe;
 
+use function __;
+use function add_action;
+use function add_filter;
+use function add_options_page;
+use function add_query_arg;
+use function add_settings_error;
+use function admin_url;
+use function array_diff;
 use function array_keys;
+use function array_unshift;
+use function array_values;
+use function check_admin_referer;
+use function checked;
+use function current_user_can;
+use function date_i18n;
+use function esc_attr;
+use function esc_html;
+use function esc_html__;
+use function esc_url;
+use function esc_url_raw;
+use function function_exists;
+use function get_option;
 use function implode;
 use function in_array;
 use function is_array;
 use function max;
 use function mb_substr;
 use function min;
+use function number_format_i18n;
+use function plugin_basename;
 use function preg_match;
+use function register_setting;
+use function sanitize_key;
+use function sanitize_text_field;
+use function selected;
+use function settings_fields;
 use function sprintf;
 use function str_starts_with;
 use function strtoupper;
+use function submit_button;
 use function trim;
+use function wp_date;
+use function wp_die;
+use function wp_nonce_field;
+use function wp_print_inline_script_tag;
+use function wp_safe_redirect;
+use function wp_unslash;
 
 /**
  * Settings → ovos codesafe.
@@ -179,6 +214,16 @@ class Settings
 			}
 		}
 		
+		// a range Config refuses on every read is not saved either, and the admin is told why
+		$refused = $this->config->isConstant('trusted_proxies') || $this->networkLocked('trusted_proxies')
+			? []
+			: Config::tooWideOf($clean['trusted_proxies']);
+		if($refused !== [])
+		{
+			$clean['trusted_proxies'] = implode(', ', array_values(array_diff(Config::proxyTokens($clean['trusted_proxies']), $refused)));
+			$this->notice('trusted_proxies', $this->proxyRefusal($refused));
+		}
+		
 		// another URL or key may be another project: a refusal heard from the
 		// old one must not keep this site quiet, nor the page say it
 		if($clean['url'] !== (string)($stored['url'] ?? '') || $clean['api_key'] !== (string)($stored['api_key'] ?? ''))
@@ -187,6 +232,41 @@ class Settings
 		}
 		
 		return $clean;
+	}
+	
+	/**
+	 * What the page and the save's notice say about trusted proxy ranges
+	 * refused for their width, '' when none is
+	 *
+	 * @param list<string> $refused
+	 */
+	public function proxyRefusal(
+		array $refused,
+	): string
+	{
+		if($refused === [])
+		{
+			return '';
+		}
+		
+		return sprintf(
+			/* translators: 1: the refused ranges, 2: the shortest IPv4 prefix, 3: the shortest IPv6 prefix */
+			__('Refused as trusted proxies: %1$s. A range this wide trusts the header from addresses that are not your proxy, so any visitor could name their own address for reports, rate rules and offender scores. An IPv4 range needs a prefix of /%2$d or longer, an IPv6 one /%3$d or longer; name your proxies\' own ranges.', 'ovos-codesafe'),
+			implode(', ', $refused), Config::PROXY_FLOOR_V4, Config::PROXY_FLOOR_V6);
+	}
+	
+	/**
+	 * A notice for the next settings page, the one options.php redirects to
+	 */
+	protected function notice(
+		string $code,
+		string $message,
+	): void
+	{
+		if(function_exists('add_settings_error'))
+		{
+			add_settings_error(Config::OPTION, $code, $message, 'error');
+		}
 	}
 	
 	/**
@@ -282,7 +362,8 @@ class Settings
 		$this->inputField('trusted_proxies',
 			__('Trusted proxy ranges', 'ovos-codesafe'), 'text', 'cloudflare',
 			__('The addresses of your proxies, comma-separated — CIDR ranges or single addresses (10.0.0.0/8, 2001:db8::/32), or the word cloudflare for Cloudflare\'s published ranges (bundled, never fetched). A header from anywhere else is ignored: any client can send one. CODESAFE_TRUSTED_PROXIES overrides this field.', 'ovos-codesafe'));
-			
+		$this->proxiesRefusedRow();
+		
 		echo '</table>';
 		
 		echo '<h2>' . esc_html__('Browser errors', 'ovos-codesafe') . '</h2>';
@@ -562,6 +643,23 @@ class Settings
 				/* translators: %s: date and time of the first refusal */
 				__('codesafe has refused this site\'s traffic rollups since %s: the project has its Traffic rollups switch off. Switch it on in codesafe, on the project; until then this site sends nothing and asks again every hour.', 'ovos-codesafe'),
 				wp_date('Y-m-d H:i', $since))) . '</strong></p>'
+			. '</td></tr>';
+	}
+	
+	/**
+	 * Under the trusted proxy ranges, while the stored option or the constant
+	 * names a range too wide to be used: the form never saves one, so it came
+	 * from wp-config.php or was written past the form
+	 */
+	protected function proxiesRefusedRow(): void
+	{
+		$refusal = $this->proxyRefusal($this->config->refusedProxies());
+		if($refusal === '')
+		{
+			return;
+		}
+		echo '<tr><th scope="row"></th><td>'
+			. '<p class="description" style="margin: 0;"><strong>' . esc_html($refusal) . '</strong></p>'
 			. '</td></tr>';
 	}
 	

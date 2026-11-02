@@ -16,6 +16,7 @@ use function base64_decode;
 use function base64_encode;
 use function bin2hex;
 use function chr;
+use function count;
 use function end;
 use function file_get_contents;
 use function hex2bin;
@@ -40,6 +41,7 @@ use function substr;
 use function substr_replace;
 use function sys_get_temp_dir;
 use function tempnam;
+use function time;
 use function unlink;
 use function wp_shim_reset;
 
@@ -138,6 +140,40 @@ class Updater extends Test
 	{
 		return $this->offered($this->release('v9.9.9', self::THEIRS), '0.6.4') === false
 			&& $GLOBALS['wp']['transient'] === null;
+	}
+	
+	/**
+	 * RULE: the cached answer carries the time it was fetched, since
+	 * WordPress keeps a transient for as long as its stored timeout says and
+	 * one written with no timeout for good: an answer without a time, as a
+	 * plant writes it, one dated ahead of the clock and one older than twelve
+	 * hours are fetched again, stamped with the fetch; a fresh one is
+	 * answered without asking GitHub.
+	 * Falsify: trust the transient — a planted release with no timeout hides
+	 * every later release, a security fix included, for good.
+	 */
+	public function aCachedReleaseHoldsTwelveHoursAtMost(): bool
+	{
+		$old = ['version' => '1.0.0', 'url' => 'https://github.com/ovos/codesafe-client-wordpress/releases', 'package' => self::OURS];
+		$offer = function(array $cached): string
+		{
+			$GLOBALS['wp']['transients']['ovos_codesafe_latest_release'] = $cached;
+			$GLOBALS['wp']['api'] = $this->release('v9.9.9', self::OURS);
+			$offered = (new TestUpdater(self::PLUGIN_FILE))->check(false, ['Version' => '0.6.4'], 'ovos-codesafe/ovos-codesafe.php');
+			
+			return is_array($offered) ? (string)$offered['version'] : '';
+		};
+		
+		$planted = $offer($old);
+		$future = $offer($old + ['at' => time() + 315_360_000]);
+		$stale = $offer($old + ['at' => time() - 43_201]);
+		$stamped = (int)($GLOBALS['wp']['transients']['ovos_codesafe_latest_release']['at'] ?? 0);
+		$asked = count($GLOBALS['wp']['got']);
+		$fresh = $offer($old + ['at' => time() - 60]);
+		
+		return $planted === '9.9.9' && $future === '9.9.9' && $stale === '9.9.9'
+			&& $stamped <= time() && $stamped > time() - 60
+			&& $fresh === '1.0.0' && count($GLOBALS['wp']['got']) === $asked;
 	}
 	
 	/**

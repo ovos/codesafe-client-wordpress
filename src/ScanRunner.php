@@ -13,6 +13,7 @@ use function check_admin_referer;
 use function current_user_can;
 use function delete_option;
 use function esc_html__;
+use function fastcgi_finish_request;
 use function function_exists;
 use function get_option;
 use function ini_get;
@@ -130,8 +131,15 @@ class ScanRunner
 		}
 		
 		$last = $this->last();
+		$now = time();
 		
-		return $last === null ? time() : (int)$last['finished'] + $this->config->scanInterval() * self::DAY;
+		// a pass finished ahead of the clock never finished: the next one is due now
+		if($last === null || Clock::ahead((int)$last['finished'], $now))
+		{
+			return $now;
+		}
+		
+		return (int)$last['finished'] + $this->config->scanInterval() * self::DAY;
 	}
 	
 	/**
@@ -353,13 +361,16 @@ class ScanRunner
 	/**
 	 * add_option() is an INSERT: it fails when the row exists, which makes
 	 * it the one atomic primitive the options table offers. A lock older
-	 * than LOCK_TTL belongs to a request that died and is taken over.
+	 * than LOCK_TTL belongs to a request that died and is taken over, and so
+	 * does one dated more than LOCK_TTL ahead of the clock, which no request
+	 * took: within that margin a server whose clock runs ahead keeps its lock.
 	 */
 	protected function lock(): bool
 	{
 		$held = get_option(self::LOCK);
+		$now = time();
 		
-		if($held !== false && time() - (int)$held < self::LOCK_TTL)
+		if($held !== false && $now - (int)$held < self::LOCK_TTL && Clock::ahead((int)$held, $now, self::LOCK_TTL) === false)
 		{
 			return false;
 		}
@@ -369,7 +380,7 @@ class ScanRunner
 			delete_option(self::LOCK);
 		}
 		
-		return add_option(self::LOCK, time(), '', false);
+		return add_option(self::LOCK, $now, '', false);
 	}
 	
 	protected function unlock(): void

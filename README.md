@@ -131,7 +131,7 @@ Every value lives under **Settings → ovos codesafe**, or as a constant in `wp-
 | Inline styles into snapshots | `CODESAFE_SNAPSHOT_STYLES` | `true` | embed the page's CSS so snapshots render styled |
 | Also load in wp-admin and on the login page | `CODESAFE_JS_ADMIN` | `false` | also report browser errors from wp-admin and the login page |
 | Trusted proxy header | `CODESAFE_TRUSTED_PROXY_HEADER` | — | behind a proxy/CDN only: the header naming the visitor (`CF-Connecting-IP`, `X-Forwarded-For`); read only from the ranges below |
-| Trusted proxy ranges | `CODESAFE_TRUSTED_PROXIES` | — | the proxies' CIDRs or addresses, comma-separated; `cloudflare` = Cloudflare's published ranges (bundled). Empty: `REMOTE_ADDR` is the visitor |
+| Trusted proxy ranges | `CODESAFE_TRUSTED_PROXIES` | — | the proxies' CIDRs or addresses, comma-separated; `cloudflare` = Cloudflare's published ranges (bundled). Empty: `REMOTE_ADDR` is the visitor. A range wider than /8 (IPv4) or /16 (IPv6), `0.0.0.0/0` and `::/0` among them, is refused; one inside `fc00::/7` or `fe80::/10` passes |
 | — | `CODESAFE_STORE_DIR` | — | constant only: an absolute directory **outside the document root** for the Shield's and the watch's store (recommended on nginx/IIS); the prepend stub stays in `wp-content/ovos-codesafe/` |
 
 Example `wp-config.php` block:

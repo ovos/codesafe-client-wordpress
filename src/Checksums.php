@@ -285,9 +285,9 @@ class Checksums
 			return $this->loaded[$key];
 		}
 		
-		$stored = get_transient(self::TRANSIENT . $key);
+		$stored = $this->stored($key);
 		
-		if(is_array($stored) && array_key_exists('list', $stored))
+		if($stored !== null)
 		{
 			return $this->loaded[$key] = is_array($stored['list']) ? $stored['list'] : null;
 		}
@@ -327,9 +327,34 @@ class Checksums
 			return true;
 		}
 		
+		return $this->stored($key) !== null;
+	}
+	
+	/**
+	 * The stored entry for $key while it holds, by the time it carries: a
+	 * list a month, an unavailable answer a week (a failure's hour is the
+	 * transient's own). WordPress keeps a transient stored with no timeout
+	 * for good, so an entry without a time, past its span or ahead of the
+	 * clock is fetched again
+	 *
+	 * @return array{list: mixed, at?: int}|null
+	 */
+	protected function stored(
+		string $key,
+	): ?array
+	{
 		$stored = get_transient(self::TRANSIENT . $key);
 		
-		return is_array($stored) && array_key_exists('list', $stored);
+		if(is_array($stored) === false || array_key_exists('list', $stored) === false)
+		{
+			return null;
+		}
+		
+		$at = (int)($stored['at'] ?? 0);
+		$now = time();
+		$span = is_array($stored['list']) ? self::TTL : self::TTL_MISS;
+		
+		return $now - $at < $span && Clock::ahead($at, $now) === false ? $stored : null;
 	}
 	
 	/**

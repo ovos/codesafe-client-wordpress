@@ -499,6 +499,36 @@ class Scan extends Test
 	}
 	
 	/**
+	 * RULE: a deferral dated ahead of the clock was planted in the stored
+	 * pass, never written by a request: the day's wait starts at this one, so
+	 * the phase still runs a day later. A date a few seconds ahead, another
+	 * server's clock, is kept.
+	 * Falsify: keep the planted date — a site without cron or admin requests
+	 * never finishes its pass.
+	 */
+	public function aDeferralFromTheFutureWaitsFromNow(): bool
+	{
+		$scan = $this->scanner($this->noStore());
+		$state = $scan->start('background');
+		$state['phases'] = [[Database::AREA, '', false, []]];
+		$GLOBALS['wp']['did']['wp_loaded'] = 1;
+		
+		$soon = time() + 3;
+		$state['database_deferred_since'] = $soon;
+		$skewed = $scan->advance($state, 1000);
+		$state['database_deferred_since'] = time() + 315_360_000;
+		$planted = $scan->advance($state, 1000);
+		$restarted = (int)($planted['database_deferred_since'] ?? 0);
+		$planted['database_deferred_since'] = $restarted - 86400;
+		$aDayLater = $scan->advance($planted, 1000);
+		
+		return $skewed['done'] === false && $skewed['database_deferred_since'] === $soon
+			&& $planted['done'] === false
+			&& $restarted <= time() && $restarted > time() - 60
+			&& $aDayLater['done'] === true;
+	}
+	
+	/**
 	 * RULE: the bootstrap AIOS writes into the document root is its own while
 	 * AIOS is installed, and a stranger once it is not. Falsify: drop the
 	 * ROOT_OWNERS entry — the root file is URGENT on every AIOS site.

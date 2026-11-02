@@ -216,6 +216,38 @@ class Rollup extends Test
 	}
 	
 	/**
+	 * RULE: a watermark past the minute being counted was never written by a
+	 * flush, which marks the minute before its own: the complete minutes are
+	 * shipped and the watermark set right. One at the minute before holds
+	 * them, and so does one at this minute, a request that started a minute
+	 * earlier and ends after a flush.
+	 * Falsify: trust the watermark — one stored a million minutes out keeps
+	 * every minute from shipping until it ages out unsent.
+	 */
+	public function aWatermarkFromTheFutureFlushes(): bool
+	{
+		$this->needsApcu();
+		$rollup = $this->rollup();
+		$minute = intdiv(time(), 60);
+		$rollup->seed($minute - 2);
+		$rollup->mark($minute - 1);
+		$rollup->crossNow($minute);
+		$quiet = $rollup->sent === [];
+		$rollup->mark($minute);
+		$rollup->crossNow($minute);
+		$late = $rollup->sent === [];
+		$rollup->mark($minute + 1_000_000);
+		$rollup->crossNow($minute);
+		$sent = $rollup->sent;
+		$mark = $rollup->watermark();
+		$rollup->clear();
+		
+		return $quiet && $late
+			&& count($sent) === 1 && $sent[0]['minute'] === $minute - 2
+			&& $mark === $minute - 1;
+	}
+	
+	/**
 	 * RULE: an answered REST request counts under the longest namespace the
 	 * site registered that its route falls under — the namespace itself or a
 	 * path below it, matched whatever its case and counted lowercase — and
@@ -415,6 +447,27 @@ class Rollup extends Test
 			): void
 			{
 				$this->flush($minute);
+			}
+			
+			/** a request counted in $minute crossing the boundary: the watermark decides */
+			public function crossNow(
+				int $minute,
+			): void
+			{
+				$this->maybeFlush($minute);
+			}
+			
+			/** the watermark as the store holds it */
+			public function mark(
+				int $flushed,
+			): void
+			{
+				apcu_store($this->prefix() . 'flushed', $flushed);
+			}
+			
+			public function watermark(): mixed
+			{
+				return apcu_fetch($this->prefix() . 'flushed');
 			}
 			
 			/** what an idle eviction does: the seq counter gone, the instance kept */

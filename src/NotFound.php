@@ -28,6 +28,7 @@ use function str_starts_with;
 use function strlen;
 use function strtok;
 use function strtolower;
+use function time;
 use function trim;
 use function wp_doing_ajax;
 use function wp_unslash;
@@ -327,19 +328,30 @@ final class NotFound
 	}
 	
 	/**
-	 * Fixed 60-second window cap on not-found reports (a transient counter),
-	 * so a hard scan cannot turn this reporter into the flood it surfaces
+	 * Fixed 60-second window cap on not-found reports (a transient holding
+	 * the window's start and count), so a hard scan cannot turn this reporter
+	 * into the flood it surfaces. The window dates itself: WordPress keeps a
+	 * transient as long as its stored timeout says, and one stored with no
+	 * timeout for good, so a bare count, a window past its minute, and one
+	 * starting ahead of the clock all open a new window
 	 */
 	protected function throttled(): bool
 	{
-		$count = (int)get_transient(self::RATE_KEY);
+		$now = time();
+		$window = get_transient(self::RATE_KEY);
+		$start = is_array($window) ? (int)($window['start'] ?? 0) : 0;
 		
-		if($count >= self::MAX_PER_MINUTE)
+		if(is_array($window) === false || $now - $start >= 60 || Clock::ahead($start, $now))
+		{
+			$window = ['start' => $now, 'count' => 0];
+		}
+		
+		if((int)($window['count'] ?? 0) >= self::MAX_PER_MINUTE)
 		{
 			return true;
 		}
 		
-		set_transient(self::RATE_KEY, $count + 1, 60);
+		set_transient(self::RATE_KEY, ['start' => (int)$window['start'], 'count' => (int)($window['count'] ?? 0) + 1], 60);
 		
 		return false;
 	}

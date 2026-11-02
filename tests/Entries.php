@@ -329,6 +329,12 @@ class Entries extends Test
 			{
 				$this->learn($dir, $paths);
 			}
+			
+			/** the drain's lock, taken directly */
+			public function take(): bool
+			{
+				return $this->lock();
+			}
 		};
 	}
 	
@@ -928,5 +934,58 @@ class Entries extends Test
 			&& ($event['extra']['source'] ?? '') === 'unknown'
 			&& ($event['extra']['detector'] ?? '') === 'executed_leftover'
 			&& ($event['extra']['tier'] ?? '') === 'urgent';
+	}
+	
+	/**
+	 * RULE: the drain's lock dated ahead of the clock was planted, never
+	 * taken: it is taken over like a dead request's; one taken just now, or a
+	 * few seconds ahead by another server's clock, holds; one past its TTL is
+	 * taken over.
+	 * Falsify: drop the check — a planted future lock starves the drain for
+	 * good, since its age is negative and below the TTL forever.
+	 */
+	public function aLockFromTheFutureIsTakenOver(): bool
+	{
+		$entries = $this->entries();
+		$GLOBALS['wp']['options'][BaseEntries::LOCK] = time() + 315_360_000;
+		$planted = $entries->take();
+		$GLOBALS['wp']['options'][BaseEntries::LOCK] = time();
+		$held = $entries->take();
+		$GLOBALS['wp']['options'][BaseEntries::LOCK] = time() + 3;
+		$skewed = $entries->take();
+		$GLOBALS['wp']['options'][BaseEntries::LOCK] = time() - 61;
+		$dead = $entries->take();
+		
+		return $planted
+			&& (int)$GLOBALS['wp']['options'][BaseEntries::LOCK] <= time()
+			&& $held === false
+			&& $skewed === false
+			&& $dead;
+	}
+	
+	/**
+	 * RULE: a retry further ahead than the five minutes this code puts one
+	 * was planted: the export and the drain are due; a retry within the five
+	 * minutes holds them, one in the past does not, and an empty queue is
+	 * never drained.
+	 * Falsify: drop the check — a retry dated ten years out keeps the watch
+	 * from ever exporting its known set or judging what ran; or read any
+	 * future retry as planted — a console out of reach is asked on every
+	 * request.
+	 */
+	public function aRetryFromTheFutureIsDue(): bool
+	{
+		$entries = $this->entries();
+		$nowhere = $this->root . '/nowhere';
+		$seen = ['paths' => ['wp-content/x.php' => $this->record()], 'dropped' => 0];
+		$GLOBALS['wp']['options'][BaseEntries::OPTION] = ['retry' => time() + 315_360_000, 'retry_drain' => time() + 315_360_000];
+		$planted = $entries->exportDue($nowhere) && $entries->drainDue($seen);
+		$GLOBALS['wp']['options'][BaseEntries::OPTION] = ['retry' => time() + 290, 'retry_drain' => time() + 290];
+		$waits = $entries->exportDue($nowhere) === false && $entries->drainDue($seen) === false;
+		$GLOBALS['wp']['options'][BaseEntries::OPTION] = ['retry' => time() - 1, 'retry_drain' => time() - 1];
+		$due = $entries->exportDue($nowhere) && $entries->drainDue($seen);
+		
+		return $planted && $waits && $due
+			&& $entries->drainDue(['paths' => [], 'dropped' => 0]) === false;
 	}
 }

@@ -196,6 +196,41 @@ class SecurityBudget extends Test
 			];
 	}
 	
+	/**
+	 * RULE: a window whose start lies ahead of the clock was planted in the
+	 * store, never opened by a request: it is closed like an old one, its
+	 * claimed excess summarised at the present, and the kind counts afresh. A
+	 * start a few seconds ahead, another server's clock, is still open, and so
+	 * is an ordinary window at its budget.
+	 * Falsify: drop the check — a start ten years out refuses every
+	 * auth_failure for ten years, without a trace.
+	 */
+	public function aWindowFromTheFutureIsClosed(): bool
+	{
+		$GLOBALS['wp']['transients']['ovos_codesafe_security_rate'] = [
+			'auth_failure' => ['start' => self::NOW + 315_360_000, 'count' => 30, 'over' => 4],
+			'csrf_reject' => ['start' => self::NOW + 3, 'count' => 30, 'over' => 0],
+			'permission_denied' => ['start' => self::NOW - 10, 'count' => 30, 'over' => 0],
+		];
+		$sender = $this->sender();
+		$sender->reportRefusal('auth_failure', 'login failed');
+		$sender->reportRefusal('csrf_reject', 'nonce refused');
+		$sender->reportRefusal('permission_denied', 'rest refused');
+		$failures = $this->of($sender, 'auth_failure');
+		$summary = array_values(array_filter($failures,
+			static fn(array $payload): bool => ($payload['extra']['summary'] ?? false) === true));
+		$window = $GLOBALS['wp']['transients']['ovos_codesafe_security_rate']['auth_failure'] ?? [];
+		
+		return count($failures) === 2
+			&& count($summary) === 1
+			&& $summary[0]['extra']['suppressed'] === 4
+			&& $summary[0]['timestamp'] === gmdate('c', self::NOW)
+			&& ($window['start'] ?? null) === self::NOW
+			&& ($window['count'] ?? null) === 1
+			&& $this->of($sender, 'csrf_reject') === []
+			&& $this->of($sender, 'permission_denied') === [];
+	}
+	
 	/** the count 1.0.2 kept in the same transient is read as no window at all */
 	public function the102CounterIsReadAsAFreshStart(): bool
 	{

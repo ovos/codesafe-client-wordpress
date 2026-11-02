@@ -330,6 +330,33 @@ class Inventory extends Test
 	}
 	
 	/**
+	 * RULE: a time in the inventory's state ahead of the clock was planted:
+	 * a last send dated ahead makes the heartbeat due, a tried send dated
+	 * ahead ends its backoff. An ordinary last send an hour old, and a backoff
+	 * that started a minute ago, still hold.
+	 * Falsify: drop either check — a state dated ten years out silences the
+	 * daily inventory, or an operator's auto-update pick, for ten years.
+	 */
+	public function aStateDatedAheadOfTheClockIsDue(): bool
+	{
+		$inventory = $this->inventory();
+		$GLOBALS['wp']['options'][self::OPTION] = ['hash' => '', 'ts' => time() - 3600, 'software' => 'v1'];
+		$inventory->maybeSend();
+		$quiet = $inventory->sent === [];
+		$GLOBALS['wp']['options'][self::OPTION] = ['hash' => '', 'ts' => time() + 315_360_000, 'software' => 'v1'];
+		$inventory->maybeSend();
+		$heartbeat = count($inventory->sent) === 1;
+		
+		$GLOBALS['wp']['options'][self::OPTION] = ['hash' => '', 'ts' => time(), 'software' => 'v1',
+			'tried' => 'v2', 'tried_at' => time() - 60, 'fails' => 1];
+		$backsOff = $inventory->nudge('v2') === false;
+		$GLOBALS['wp']['options'][self::OPTION]['tried_at'] = time() + 315_360_000;
+		$planted = $inventory->nudge('v2');
+		
+		return $quiet && $heartbeat && $backsOff && $planted;
+	}
+	
+	/**
 	 * RULE: a 2xx and a definitive refusal (400, 401, 403, 404, 422) settle the
 	 * version that asked; a 5xx, a 429 or nothing at all count an unanswered
 	 * send; a send for a change hook keeps a running backoff until one is

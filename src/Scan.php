@@ -1725,9 +1725,15 @@ class Scan
 			return true;
 		}
 		
-		$state['database_deferred_since'] ??= time();
+		$now = time();
+		// a deferral dated ahead of the clock was planted in the stored pass: the wait starts now
+		if(Clock::ahead((int)($state['database_deferred_since'] ?? $now), $now))
+		{
+			unset($state['database_deferred_since']);
+		}
+		$state['database_deferred_since'] ??= $now;
 		
-		return time() - (int)$state['database_deferred_since'] >= self::DATABASE_WAIT;
+		return $now - (int)$state['database_deferred_since'] >= self::DATABASE_WAIT;
 	}
 	
 	/**
