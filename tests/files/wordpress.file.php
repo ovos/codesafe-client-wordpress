@@ -91,6 +91,10 @@ function wp_shim_reset(): void
 		'sites' => [],
 		'sites_asked' => [],
 		'blog_options' => [],
+		// get_user_meta(): user id => meta key => value
+		'user_meta' => [],
+		// __(): the translation of a text, by the text
+		'translations' => [],
 	];
 	// WordPress's own: whether the login cookie settled the current user (rest_cookie_collect_status())
 	unset($GLOBALS['wp_rest_auth_cookie'], $GLOBALS['pagenow']);
@@ -210,6 +214,20 @@ function has_action(
 	return false;
 }
 
+// whether a callback is registered under the hook: one apply_filters() runs, or one add_filter() recorded
+function has_filter(
+	string $hook,
+	mixed $callback = false,
+): bool
+{
+	if(($GLOBALS['wp']['filters'][$hook] ?? []) !== [])
+	{
+		return true;
+	}
+	
+	return has_action($hook);
+}
+
 function did_action(
 	string $hook,
 ): int
@@ -237,7 +255,7 @@ function __(
 	string $domain = '',
 ): string
 {
-	return $text;
+	return $GLOBALS['wp']['translations'][$text] ?? $text;
 }
 
 function _n(
@@ -785,5 +803,83 @@ class WP_Automatic_Updater
 	): bool
 	{
 		return (bool)apply_filters('automatic_updates_is_vcs_checkout', $GLOBALS['wp']['vcs'], $context);
+	}
+}
+
+/** a user's meta from the shim's state; $single answers the value itself, '' when there is none, as core does */
+function get_user_meta(
+	int $userId,
+	string $key = '',
+	bool $single = false,
+): mixed
+{
+	$value = $GLOBALS['wp']['user_meta'][$userId][$key] ?? null;
+	
+	if($single)
+	{
+		return $value ?? '';
+	}
+	
+	return $value === null ? [] : [$value];
+}
+
+/** core's session store, the part verify() runs: the session_token_manager filter names the class */
+abstract class WP_Session_Tokens
+{
+	protected function __construct(
+		protected int $user_id,
+	)
+	{
+	}
+	
+	final public static function get_instance(
+		int $user_id,
+	): WP_Session_Tokens
+	{
+		$manager = apply_filters('session_token_manager', 'WP_User_Meta_Session_Tokens');
+		
+		return new $manager($user_id);
+	}
+	
+	/** a token is a session when its sha256 is the key of one not expired yet */
+	final public function verify(
+		string $token,
+	): bool
+	{
+		return (bool)$this->get_session(hash('sha256', $token));
+	}
+	
+	final protected function is_still_valid(
+		array $session,
+	): bool
+	{
+		return $session['expiration'] >= time();
+	}
+	
+	abstract protected function get_session(
+		string $verifier,
+	): ?array;
+}
+
+/** core's default store: the sessions in the user meta session_tokens, a bare integer read as an expiration */
+class WP_User_Meta_Session_Tokens extends WP_Session_Tokens
+{
+	protected function get_sessions(): array
+	{
+		$sessions = get_user_meta($this->user_id, 'session_tokens', true);
+		if(is_array($sessions) === false)
+		{
+			return [];
+		}
+		$sessions = array_map(static fn(mixed $session): mixed => is_int($session) ? ['expiration' => $session] : $session, $sessions);
+		
+		return array_filter($sessions, [$this, 'is_still_valid']);
+	}
+	
+	protected function get_session(
+		string $verifier,
+	): ?array
+	{
+		return $this->get_sessions()[$verifier] ?? null;
 	}
 }

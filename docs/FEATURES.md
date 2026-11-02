@@ -485,11 +485,13 @@ on deactivation and on uninstall; a file of that name it did not write is
 never touched). WordPress loads must-use plugins before every other plugin,
 so a request is judged before a vulnerable plugin's own code has run — the
 before-WordPress layer's judge below, without the server edit: an
-**anonymous** one whole, a signed-in one by the blocks that refuse whoever
-asks, the rest of it at `plugins_loaded` (below). One judge per
-request: with the prepend layer active the mu-plugin does nothing, and a
-request either early layer passed is not judged again (a rate rule counts it
-once).
+**anonymous** one whole, a request whose login cookie signs no one in
+included (below), a signed-in one by the blocks that refuse whoever asks, the
+rest of it at `plugins_loaded` (below). One judge per request: with the
+prepend layer active the mu-plugin only checks the login cookie of a request
+the prepend left to WordPress, and judges it once that cookie signs no one
+in; a request either early layer judged is not judged again (a rate rule
+counts it once).
 
 **Shield coverage FULL — the optional `auto_prepend_file` layer.** The settings page and codesafe's PROJECTS list say the Shield's coverage: FULL where this layer runs, BASIC where it does not. The
 `plugins_loaded` hook runs after WordPress has loaded every plugin; a direct
@@ -524,7 +526,12 @@ same way and whole at `plugins_loaded`: WordPress checks an application
 password only after this layer, and at `plugins_loaded` the plugin checks it
 the same way, read-only
 (no use recorded, no action fired), so an integration is judged as its user
-— not as anonymous; the REST prefix comes from the consent file, where the
+— not as anonymous. The must-use stage leaves such a request to
+`plugins_loaded` too: the functions that check an application password are
+pluggable and load after the plugins, a plugin can switch application
+passwords off, and another can sign Basic credentials in with the account's
+own password, so a password that is no application password proves no one
+anonymous there. The REST prefix comes from the consent file, where the
 plugin writes `rest_get_url_prefix()` once every plugin and the theme have
 set theirs. A REST request the login cookie alone signs in, without a valid
 REST nonce, is judged anonymous at `plugins_loaded`, as WordPress runs it.
@@ -549,9 +556,9 @@ later than that — inside a route's `permission_callback` or on
 refuses it, as it must refuse before the route's own code runs. The early layers judge such a
 request by the rules for anyone and leave the rest to the adapter the same
 way; the evidence of one they passed is counted once WordPress has the user.
-The must-use plugin, which runs inside WordPress, treats every signed-in
-request as this layer treats one to a file WordPress runs through, whatever
-the script. A request to the REST API's `/batch/v1` has each
+The must-use plugin, which runs inside WordPress, treats every request
+whose login cookie may sign its caller in as this layer treats one to a file
+WordPress runs through, whatever the script. A request to the REST API's `/batch/v1` has each
 request its body lists judged as a request of its own. Where the user cannot
 be told, a rule that asks only observes. Anywhere else — a direct hit on a
 plugin's PHP file, or WordPress's installer pages (`wp-admin/install.php`,
@@ -590,6 +597,46 @@ name it. The uninstall removes the stubs only when PHP's configuration
 names neither and can be read; while it names either, or cannot be read
 (WP-CLI), both stay, inert — another directory's configuration may name the
 other one.
+
+**The login cookie, checked before the other plugins.** Before WordPress the
+cookie cannot be checked: there is no database and no salt yet. The must-use
+stage can, before any regular plugin's file runs: WordPress has read
+`wp-config.php` and connected its database, and the plugin repeats WordPress's
+own check of the cookie there, read-only, with the core code already loaded —
+the cookie by this site's name (`LOGGED_IN_COOKIE`; another
+`wordpress_logged_in_*` name is ignored, as WordPress ignores it), in
+WordPress's `login|expiration|token|hmac` form, not expired (an hour later for
+a POST or an Ajax call, as WordPress allows), its login in the users table,
+its HMAC under that user's password hash and the `logged_in` salt
+(`LOGGED_IN_KEY` and `LOGGED_IN_SALT`, or the site options WordPress keeps
+where `wp-config.php` gives none), and its session token among the user's live
+sessions. The database is read only for a request that carries a login cookie,
+on a site whose Shield judges, with a ruleset this stage can read. A cookie
+that fails any of these signs no one in, as WordPress will find too: the
+caller is anonymous, and the request is judged there whole, counted and
+reported as anonymous — a virtual patch for anonymous callers refuses it
+before any plugin's own code runs, and a forged cookie name walks no exploit
+past both early layers. A cookie that passes leaves the request to
+`plugins_loaded`, as above. Where the check could differ from WordPress's, the
+cookie defers the request to `plugins_loaded`, as the prepend layer's does: a
+plugin or the theme replaces one of the functions WordPress checks the cookie
+with (`wp_validate_auth_cookie()`, `wp_parse_auth_cookie()`, `get_user_by()`,
+`wp_hash()`, `wp_salt()`), hooks the `salt` filter or keeps its sessions
+elsewhere (`session_token_manager`), the `logged_in` salt the must-use stage
+reproduces is not the one `wp_salt()` answers, the cookie's name changed after
+the plugin last wrote it, or the salt's site option is not there yet. A site
+whose `LOGGED_IN_KEY`, `LOGGED_IN_SALT` or the `SECRET_KEY` the key falls back
+to still holds the sample's placeholder, in English or translated, keeps the
+early check off. The plugin learns the name, and whether WordPress's own check
+runs, at the end of `init` and keeps both in the consent file: the first
+request after an update, or after such a plugin is switched on or off, is
+judged by what the request before it found. Two limits stand. The auth cookie
+(`wordpress_sec_<hash>`, `wordpress_<hash>`), which signs a user in on admin
+pages, is not consulted: after `LOGGED_IN_KEY` or `LOGGED_IN_SALT` alone is
+rotated, an administrator whose login cookie no longer validates is judged
+anonymous at the must-use stage until they sign in again. Sessions or salts a
+plugin supplies through other filters, such as `get_user_metadata`, are not
+seen there.
 
 **WordPress's update working directories.** Before any rule, the layer
 refuses every PHP file run from `wp-content/upgrade/` or
