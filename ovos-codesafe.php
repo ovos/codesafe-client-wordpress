@@ -3,7 +3,7 @@ declare(strict_types=1);
 /**
  * Plugin Name: ovos codesafe
  * Description: From the first threat to the verified patch. Connects this site to your ovos codesafe instance, which detects the attacks on it and the errors in its code, shields against the attack pattern while the fix ships, and proves the fix held.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Requires at least: 6.0
  * Requires PHP: 8.3
  * Author: ovos media gmbh
