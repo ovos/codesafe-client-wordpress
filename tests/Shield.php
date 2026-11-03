@@ -232,8 +232,10 @@ class Shield extends Test
 	
 	/**
 	 * RULE: the kernel the adapter builds for itself — the one that pulls —
-	 * reads WordPress's module: its pull names the module to the door and
-	 * keeps a `rest` rule and a `shortcode:` rule, and the adapter refuses
+	 * reads WordPress's module: its pull names the module to the door, with
+	 * the word for the XML-RPC targets the module reads beyond its first
+	 * release (`wordpress-xmlrpc`), and keeps a `rest` rule and a
+	 * `shortcode:` rule, and the adapter refuses
 	 * the exploit of each, the route under the site's own REST prefix.
 	 * Falsify: build kernel() without Prepend::platforms() — the core leaves
 	 * both rules out at the pull, and both exploits pass every WordPress site.
@@ -299,7 +301,7 @@ class Shield extends Test
 			wp_shim_reset();
 		}
 		
-		return $pulled === Kernel::PULL_FRESH && $named === 'core,wordpress' && $kept === 2
+		return $pulled === Kernel::PULL_FRESH && $named === 'core,wordpress,wordpress-xmlrpc' && $kept === 2
 			&& $routed?->isBlock() === true && $routed->rule['id'] === 31
 			&& $coded?->isBlock() === true && $coded->rule['id'] === 32;
 	}
