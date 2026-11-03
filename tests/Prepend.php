@@ -17,7 +17,6 @@ use ReflectionClass;
 use function apcu_enabled;
 use function base64_encode;
 use function basename;
-use function clearstatcache;
 use function count;
 use function dirname;
 use function escapeshellarg;
@@ -53,7 +52,6 @@ use function strlen;
 use function strtoupper;
 use function sys_get_temp_dir;
 use function time;
-use function touch;
 use function uniqid;
 use function unlink;
 use function var_export;
@@ -364,6 +362,35 @@ class Prepend extends Test
 			&& ($plain['verdict'] ?? null)?->isBlock() === true && (int)$plain['verdict']->rule['id'] === 41
 			&& $deferred === [null, null]
 			&& ($apcu === false || ($counted[0] === null && ($counted[1]['verdict'] ?? null)?->status() === 429));
+	}
+	
+	/**
+	 * RULE: past the ceiling this layer still refuses what a blocking rule
+	 * matches, and lets pass what a rule that only observes matched — a site
+	 * cut off from codesafe keeps its virtual patches before WordPress too —
+	 * and the report says the ruleset is stale. Falsify: pass past the
+	 * ceiling — a day without codesafe walks every exploit past the earliest
+	 * layer.
+	 */
+	public function pastTheCeilingABlockingRuleStillRefuses(): bool
+	{
+		$rules = [
+			['id' => 7, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'ua', 'op' => 'contains', 'value' => 'zz-prepend-bot', 'ci' => true, 'mode' => 'proven', 'expires_at' => null],
+			['id' => 8, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'uri', 'op' => 'contains', 'value' => 'zz-observed', 'ci' => true, 'mode' => 'observe', 'expires_at' => null],
+		];
+		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
+			'contract' => 1,
+			'dialect' => 're2-2026',
+			'project' => 'harness',
+			'rules' => $rules,
+		], time() - Kernel::CEILING - 60, platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
+		$root = $this->site();
+		BasePrepend::writeConsent($this->dir, ['root' => $root] + self::ENFORCE);
+		$bot = BasePrepend::judge($this->dir, $this->server(self::BOT, '/', $root . '/index.php'));
+		$observed = BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', '/zz-observed', $root . '/index.php'));
+		
+		return ($bot['verdict'] ?? null)?->isBlock() === true && (int)$bot['verdict']->rule['id'] === 7
+			&& ($bot['report'][2]['tags'] ?? null) === ['stale'] && $observed === null;
 	}
 	
 	/**

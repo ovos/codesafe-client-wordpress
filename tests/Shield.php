@@ -22,7 +22,9 @@ use Ovos\Test\Exception\SkipException;
 use ReflectionClass;
 
 use function apcu_delete;
+use function chmod;
 use function class_exists;
+use function clearstatcache;
 use function copy;
 use function count;
 use function dirname;
@@ -36,6 +38,7 @@ use function implode;
 use function is_dir;
 use function is_file;
 use function is_string;
+use function is_writable;
 use function json_encode;
 use function mkdir;
 use function preg_quote;
@@ -304,6 +307,154 @@ class Shield extends Test
 		return $pulled === Kernel::PULL_FRESH && $named === 'core,wordpress,wordpress-xmlrpc' && $kept === 2
 			&& $routed?->isBlock() === true && $routed->rule['id'] === 31
 			&& $coded?->isBlock() === true && $coded->rule['id'] === 32;
+	}
+	
+	/**
+	 * RULE: the adapter's kernel keeps its ruleset on disk wherever it runs —
+	 * in the store directory under the consent's name, else (no consent yet,
+	 * no directory it can write) in the system temp dir under a name of the
+	 * install and the key — never in APCu alone, which an idle eviction
+	 * empties (apc.ttl): past the ceiling a site cut off from codesafe holds
+	 * its blocking rules only while there is a record to hold them. Falsify:
+	 * answer '' without a consent — the record lives in APCu alone, and an
+	 * eviction leaves the site without a rule.
+	 */
+	public function theAdaptersRulesetIsOnDiskWithoutAConsent(): bool
+	{
+		wp_shim_reset();
+		$GLOBALS['wp']['options']['home'] = 'https://shield-file-' . uniqid() . '.test';
+		$GLOBALS['wp']['api'] = ['contract' => 1, 'dialect' => 're2-2026', 'project' => 'harness', 'rules' => $this->moduleRules()];
+		$config = $this->pullingConfig();
+		$adapter = new Adapter($config, new Sender(new Config));
+		$file = $adapter->file();
+		try
+		{
+			$pulled = $adapter->kernel()->pull($adapter->consent(), force: true);
+			// APCu emptied, as an idle eviction empties it: the next request's adapter reads the record off the disk
+			apcu_delete(new APCUIterator('~^' . preg_quote($adapter->prefix(), '~') . '~'));
+			$kept = count((new Adapter($config, new Sender(new Config)))->kernel()->ruleset()->rules ?? []);
+		}
+		finally
+		{
+			apcu_delete(new APCUIterator('~^' . preg_quote($adapter->prefix(), '~') . '~'));
+			if($file !== '' && is_file($file))
+			{
+				unlink($file);
+			}
+			wp_shim_reset();
+		}
+		
+		return $file !== '' && $pulled === Kernel::PULL_FRESH && $kept === 2;
+	}
+	
+	/**
+	 * RULE: the temp dir's folder holds the record where it can (TEMP_DIR,
+	 * made 0700), and where it cannot — a file in its place, one another user
+	 * of a shared temp dir made — the temp dir itself does, never nowhere.
+	 * Falsify: keep the folder's path whatever mkdir answered — the Store
+	 * writes into a folder that is not there, and the record lives in APCu
+	 * alone.
+	 */
+	public function theTempFolderFallsBackToTheTempDirWhenItIsNoFolder(): bool
+	{
+		$root = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'shield-temp-' . uniqid();
+		mkdir($root, 0700);
+		$folder = $root . DIRECTORY_SEPARATOR . Adapter::TEMP_DIR;
+		try
+		{
+			$made = dirname(Adapter::tempFile('harness', 'key', $root)) === $folder && is_dir($folder);
+			rmdir($folder);
+			// a file where the folder belongs: mkdir cannot make it
+			file_put_contents($folder, '');
+			$planted = dirname(Adapter::tempFile('harness', 'key', $root)) === $root;
+		}
+		finally
+		{
+			if(is_file($folder))
+			{
+				unlink($folder);
+			}
+			if(is_dir($folder))
+			{
+				rmdir($folder);
+			}
+			rmdir($root);
+		}
+		
+		return $made && $planted;
+	}
+	
+	/**
+	 * RULE: a temp folder the site cannot write — another user of a shared
+	 * temp dir made it, 0700 — falls back to the temp dir itself. Falsify:
+	 * take the folder because it exists — the Store's writes fail there, and
+	 * the record lives in APCu alone. Skipped where a folder stays writable
+	 * after chmod 0500 (Windows, root).
+	 */
+	public function aTempFolderTheSiteCannotWriteFallsBackToTheTempDir(): bool
+	{
+		$root = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'shield-temp-' . uniqid();
+		mkdir($root, 0700);
+		$folder = $root . DIRECTORY_SEPARATOR . Adapter::TEMP_DIR;
+		mkdir($folder, 0700);
+		chmod($folder, 0500);
+		clearstatcache();
+		try
+		{
+			if(is_writable($folder))
+			{
+				throw new SkipException('a folder chmod 0500 stays writable here');
+			}
+			
+			return dirname(Adapter::tempFile('harness', 'key', $root)) === $root;
+		}
+		finally
+		{
+			chmod($folder, 0700);
+			rmdir($folder);
+			rmdir($root);
+		}
+	}
+	
+	/** a Config that pulls from a harness door, with the Shield on and enforcing */
+	protected function pullingConfig(): Config
+	{
+		return new class extends Config
+		{
+			public function __construct()
+			{
+			}
+			
+			public function enabled(): bool
+			{
+				return true;
+			}
+			
+			public function url(): string
+			{
+				return 'https://codesafe.invalid';
+			}
+			
+			public function apiKey(): string
+			{
+				return 'harness-key';
+			}
+			
+			public function shieldDetect(): bool
+			{
+				return true;
+			}
+			
+			public function shieldEnforce(): bool
+			{
+				return true;
+			}
+			
+			public function shieldKill(): bool
+			{
+				return false;
+			}
+		};
 	}
 	
 	/**
