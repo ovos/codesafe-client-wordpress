@@ -29,6 +29,7 @@ use function implode;
 use function in_array;
 use function is_array;
 use function is_dir;
+use function ksort;
 use function md5;
 use function mkdir;
 use function pack;
@@ -55,6 +56,7 @@ use function wp_shim_reset;
 
 use const DIRECTORY_SEPARATOR;
 use const FILE_APPEND;
+use const SORT_STRING;
 use const STR_PAD_LEFT;
 
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'files' . DIRECTORY_SEPARATOR . 'wordpress.file.php';
@@ -1613,34 +1615,36 @@ class Scan extends Test
 			return false;
 		}
 		
-		// a chunk that dies after the large file was judged
+		// a chunk that dies after the large file was judged: a subdirectory is walked after its parent's files, in any file system's order
+		$this->write($theme . '/later/last.php', "<?php\n@eval(base64_decode('ZWNobyAxOw=='));\n");
 		$marks = [];
-		$scan->dies = '/z.php';
+		$scan->dies = '/later/last.php';
 		$begun = $this->begun($scan, ['themes']);
-		
+
 		try
 		{
 			$scan->advance($begun, 10_000);
-			
+
 			return false;
 		}
 		catch(RuntimeException)
 		{
-			// the chunk died on z.php, past boom.php
+			// the chunk died on later/last.php, past boom.php
 		}
-		
+
 		if(end($marks) !== null || count($marks) !== 2)
 		{
 			return false;
 		}
-		
+
 		$scan->dies = '';
 		$walked = $scan->advance($begun, 10_000);
-		
+
 		return $walked['done'] === true
 			&& $this->verdicts($walked, 'agency/inc/boom.php') === []
 			&& $this->verdicts($walked, 'agency/inc/a.php') === ['eval_chain high']
-			&& $this->verdicts($walked, 'agency/inc/z.php') === ['eval_chain high'];
+			&& $this->verdicts($walked, 'agency/inc/z.php') === ['eval_chain high']
+			&& $this->verdicts($walked, 'agency/inc/later/last.php') === ['eval_chain high'];
 	}
 	
 	/**
@@ -1741,8 +1745,10 @@ class Scan extends Test
 			$chunks++;
 		}
 		
+		// counted in the order they were judged, which is the file system's
 		$judged = array_count_values(array_map('basename', $scan->judged));
-		
+		ksort($judged, SORT_STRING);
+
 		return $state['done'] === true
 			&& $chunks >= 3
 			&& $judged === ['f1.php' => 1, 'f2.php' => 1, 'f3.php' => 1, 'f4.php' => 1, 'f5.php' => 1];
