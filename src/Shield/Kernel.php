@@ -49,9 +49,14 @@ declare(strict_types=1);
  * the next pull puts a sealed unusable record in its place until the door
  * answers), an unknown contract, a rule the engine cannot run, a thrown
  * anything — the request passes. A
- * missing store also forces the very next pull. A ruleset older than CEILING (24 h,
- * a codesafe instance gone silent) lifts by itself; a successful pull — 200 or 304 —
- * renews it. The verdict is `block` only when the rule is set to block AND
+ * missing store also forces the very next pull. Past CEILING (24 h since the last
+ * good fetch: codesafe gone silent, or the site kept from it) the kernel keeps its
+ * blocking rules, each until its own expires_at, and lets the rest lapse — what
+ * only observes, and the threat section; it keeps judging, forcing a pull on every
+ * request, a failed pull holding the next off for RETRY, until one — 200 or 304 —
+ * renews the ruleset. The door's own 401 is codesafe refusing the key (rotated,
+ * its project switched off or deleted), not a site cut off: every rule lifts at
+ * once. The verdict is `block` only when the rule is set to block AND
  * consent.enforce is on; an `observe` rule never blocks whatever the
  * switches say — the per-rule safety lives here. A rule's blocking word is
  * `block`, served to a kernel that names `mode-block` in X-Shield-Kinds;
@@ -188,7 +193,9 @@ use function curl_setopt_array;
 use function explode;
 use function fclose;
 use function file_get_contents;
+use function file_put_contents;
 use function filter_var;
+use function gmmktime;
 use function ini_get;
 use function fopen;
 use function fstat;
@@ -272,6 +279,7 @@ use const FILTER_VALIDATE_BOOLEAN;
 use const FILTER_VALIDATE_IP;
 use const JSON_UNESCAPED_SLASHES;
 use const JSON_UNESCAPED_UNICODE;
+use const LOCK_EX;
 use const PCRE_JIT_SUPPORT;
 use const PHP_INT_MAX;
 use const PREG_NO_ERROR;
@@ -1575,6 +1583,13 @@ final class Verdict
 	public const REASON_UNREAD = 'unread';
 	
 	/**
+	 * the tag of a report a kernel sends past its ceiling: it judged on rules
+	 * it last pulled at the report's `pulled_at`, which codesafe can neither
+	 * lift nor change while the site does not reach it
+	 */
+	public const TAG_STALE = 'stale';
+	
+	/**
 	 * @param ?array<string, mixed> $rule the rule that matched, as served
 	 * @param string $matched the fragment that matched, capped by the kernel
 	 * @param int $count a rate rule's count in its window (the sliding estimate, rounded up)
@@ -2083,13 +2098,49 @@ final class Ruleset
 		return preg_match('~^[0-9a-f]{64}$~', $version) === 1;
 	}
 	
-	/** past the ceiling: a codesafe instance gone silent lifts its shield */
+	/** past the ceiling: codesafe gone silent, or the site kept from it, for longer than it */
 	public function isStale(
 		int $now,
 		int $ceiling,
 	): bool
 	{
 		return $this->fetchedAt + $ceiling <= $now;
+	}
+	
+	/**
+	 * What a kernel holds past its ceiling: the rules whose mode blocks —
+	 * match, rate and vpatch alike — each until its own expires_at, the
+	 * door's UTC `Y-m-d H:i:s`, none for good. A rule that only observes
+	 * lapses, so does one past its expiry or with an expiry this kernel
+	 * cannot read, and the threat section with them: its addresses are a
+	 * score that decays over days, and a dynamic address changes hands
+	 */
+	public function pastCeiling(
+		int $now,
+	): self
+	{
+		$held = array_values(array_filter($this->rules, static fn(array $rule): bool => self::blocks($rule['mode'] ?? '')
+			&& self::holdsAt($rule['expires_at'] ?? null, $now)));
+		
+		return new self($held, $this->digest, $this->fetchedAt, $this->usable, $this->project, $this->version, null, $this->platforms, $this->dropped);
+	}
+	
+	/** whether a rule's expires_at lies ahead of $now: null never expires; anything but the door's UTC `Y-m-d H:i:s` has */
+	protected static function holdsAt(
+		mixed $expires,
+		int $now,
+	): bool
+	{
+		if($expires === null)
+		{
+			return true;
+		}
+		if(is_string($expires) === false || preg_match('~^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$~D', $expires, $at) !== 1)
+		{
+			return false;
+		}
+		
+		return $now < gmmktime((int)$at[4], (int)$at[5], (int)$at[6], (int)$at[2], (int)$at[3], (int)$at[1]);
 	}
 	
 	/** @param list<Platform> $platforms the modules whose words a vpatch may use */
@@ -3699,6 +3750,9 @@ final class Store
 	
 	protected bool $forced = false;
 	
+	/** this instance's word on the last failed pull (pullFailed()); null until it read or wrote one */
+	protected ?int $failedAt = null;
+	
 	public function __construct(
 		public readonly string $file = '',
 		public readonly string $prefix = '',
@@ -3852,6 +3906,67 @@ final class Store
 		return $this->apcu && apcu_fetch($this->key('force')) === 1;
 	}
 	
+	/**
+	 * A pull that failed at $at (Kernel::RETRY holds the next off), 0 for one
+	 * that did not: in APCu, and beside the file (`<file>.failed`), so a host
+	 * without APCu does not pull on every request either; an eviction costs
+	 * one more attempt
+	 */
+	public function pullFailed(
+		int $at,
+	): void
+	{
+		if($at === 0 && $this->pullFailedAt() === 0)
+		{
+			return;
+		}
+		$this->failedAt = $at;
+		if($this->apcu)
+		{
+			if($at === 0)
+			{
+				apcu_delete($this->key('failed'));
+			}
+			else
+			{
+				apcu_store($this->key('failed'), $at, 3600);
+			}
+		}
+		$path = $this->file === '' ? '' : $this->file . '.failed';
+		if($path === '' || is_link($path))
+		{
+			return;
+		}
+		if($at === 0)
+		{
+			@unlink($path);
+			
+			return;
+		}
+		@file_put_contents($path, (string)$at, LOCK_EX);
+	}
+	
+	/** when the last pull failed, 0 when it did not: this instance's word, else APCu's, else the file's */
+	public function pullFailedAt(): int
+	{
+		if($this->failedAt !== null)
+		{
+			return $this->failedAt;
+		}
+		$at = $this->apcu ? apcu_fetch($this->key('failed')) : false;
+		if(is_int($at))
+		{
+			return $at;
+		}
+		$path = $this->file === '' ? '' : $this->file . '.failed';
+		if($path === '' || is_link($path) || is_file($path) === false)
+		{
+			return 0;
+		}
+		
+		return (int)@file_get_contents($path);
+	}
+	
 	/** one more hit for a rule in this minute — uncapped, the truth the events cannot carry */
 	public function hit(
 		int $minute,
@@ -3968,8 +4083,16 @@ final class Kernel
 	/** the pull interval — resolution latency: a resolved finding lifts its rule within this */
 	public const INTERVAL = 300;
 	
-	/** the ceiling — a codesafe instance gone silent this long lifts the shield; a codesafe incident does not disarm the fleet */
+	/**
+	 * the ceiling — a ruleset not renewed this long keeps only its blocking
+	 * rules (Ruleset::pastCeiling()): a site kept from codesafe stays
+	 * protected, and a codesafe incident neither disarms the fleet nor leaves
+	 * it observing what codesafe would have dropped
+	 */
 	public const CEILING = 86400;
+	
+	/** a pull that failed holds the next off this long, forced or not: a door that is down is asked once a minute, never on every request */
+	public const RETRY = 60;
 	
 	public const TIMEOUT_MS = 2000;
 	
@@ -4281,12 +4404,16 @@ final class Kernel
 			{
 				return Verdict::pass($ruleset->isRefused() ? 'refused store' : 'unknown contract');
 			}
-			// past the ceiling the rules lift until a pull renews them
-			if($ruleset->isStale($now ?? time(), $this->ceiling))
+			$now ??= time();
+			// past the ceiling the blocking rules hold, each until its expiry, and every request asks for a pull until one renews them
+			if($ruleset->isStale($now, $this->ceiling))
 			{
 				$this->store->forcePull();
-				
-				return Verdict::pass('ceiling');
+				$ruleset = $ruleset->pastCeiling($now);
+				if($ruleset->rules === [])
+				{
+					return Verdict::pass('ceiling');
+				}
 			}
 			$facts = $this->readable($facts);
 			// a vpatch that would block but could not be answered: observed unless a later rule blocks
@@ -4574,7 +4701,7 @@ final class Kernel
 		if($verdict->isPass() === false)
 		{
 			$this->count($verdict, $now);
-			$this->report($verdict, $facts);
+			$this->report($verdict, $facts, $now);
 		}
 		$this->tally($facts, $consent, $now);
 		
@@ -4596,9 +4723,19 @@ final class Kernel
 		{
 			$now ??= time();
 			$ruleset = $consent->kill || $consent->detect === false || $this->store->hasApcu() === false ? null : $this->ruleset();
-			if($ruleset === null || $ruleset->usable === false || $ruleset->isStale($now, $this->ceiling))
+			if($ruleset === null || $ruleset->usable === false)
 			{
 				return;
+			}
+			// past the ceiling the counting runs on what judge() holds and stops with the last rule held: the heartbeat says
+			// the kernel still judges; under it a ruleset without a rule counts as any other
+			if($ruleset->isStale($now, $this->ceiling))
+			{
+				$ruleset = $ruleset->pastCeiling($now);
+				if($ruleset->rules === [])
+				{
+					return;
+				}
 			}
 			// the counting ran on this request: what codesafe weighs a vpatch's zero against
 			$this->store->hit(intdiv($now, 60), self::HEARTBEAT, 'entry');
@@ -4795,6 +4932,7 @@ final class Kernel
 	public function report(
 		Verdict $verdict,
 		Facts $facts,
+		?int $now = null,
 	): void
 	{
 		// a threat address is counted, never reported: the event would feed the
@@ -4807,15 +4945,17 @@ final class Kernel
 		try
 		{
 			$rule = $verdict->rule;
+			$stale = $this->staleness($now ?? time());
 			if($verdict->isRate())
 			{
-				$this->reportRate($verdict, $facts);
+				$this->reportRate($verdict, $facts, $stale);
 				
 				return;
 			}
 			// a verdict on what was not read whole says so — `reason`, the tag codesafe's grid filters by — and names no match: the
 			// value that pinned the handler is no payload, and an honest heavy save refused there must not read as an exploit
 			$unread = $verdict->reason === Verdict::REASON_UNREAD;
+			$tags = [...($unread ? [Verdict::REASON_UNREAD] : []), ...($stale === [] ? [] : [Verdict::TAG_STALE])];
 			// codesafe's Shield\Alarm reads the rule id off the message's `shield rule N ` start
 			($this->report)($verdict->kind(), sprintf('shield rule %d %s %s %s', (int)$rule['id'],
 				$verdict->isBlock() ? 'refused' : 'observed', $facts->method, substr($facts->path(), 0, 200)), [
@@ -4831,7 +4971,7 @@ final class Kernel
 				'reason' => $verdict->reason,
 				'authed' => $facts->authed,
 				'body_capped' => $facts->bodyWasCapped(),
-			] + ($unread ? ['tags' => [Verdict::REASON_UNREAD]] : []) + (Ruleset::isVpatch($rule) ? ['who' => (string)($rule['who'] ?? '')] : []));
+			] + ($tags === [] ? [] : ['tags' => $tags]) + $stale + (Ruleset::isVpatch($rule) ? ['who' => (string)($rule['who'] ?? '')] : []));
 		}
 		catch(Throwable $e)
 		{
@@ -4848,6 +4988,7 @@ final class Kernel
 	protected function reportRate(
 		Verdict $verdict,
 		Facts $facts,
+		array $stale = [],
 	): void
 	{
 		$rule = (array)$verdict->rule;
@@ -4875,7 +5016,23 @@ final class Kernel
 			'window' => $window,
 			'count' => $verdict->count,
 			'authed' => $facts->authed,
-		]);
+		] + ($stale === [] ? [] : ['tags' => [Verdict::TAG_STALE]] + $stale));
+	}
+	
+	/**
+	 * What a report says of a ruleset past its ceiling: `pulled_at`, the
+	 * second of its last good pull — the report is tagged `stale` beside it;
+	 * nothing under the ceiling
+	 *
+	 * @return array{pulled_at?: int}
+	 */
+	protected function staleness(
+		int $now,
+	): array
+	{
+		$ruleset = $this->ruleset();
+		
+		return $ruleset !== null && $ruleset->usable && $ruleset->isStale($now, $this->ceiling) ? ['pulled_at' => $ruleset->fetchedAt] : [];
 	}
 	
 	/**
@@ -5055,11 +5212,13 @@ final class Kernel
 	
 	/**
 	 * The conditional GET, on the host's tick: off under kill or without
-	 * detect (no network); skipped inside the interval unless forced;
+	 * detect (no network); skipped inside the interval unless forced, and
+	 * within RETRY of a pull that failed unless forced by the caller ($force);
 	 * locked when another request of the pool is pulling; fresh (200,
 	 * stored), unchanged (304, the ceiling renewed), refused (a contract this
-	 * kernel does not know — stored unusable so the door is not hammered),
-	 * failed (anything else — the cache is left alone)
+	 * kernel does not know, or the door's 401 for this key — stored unusable,
+	 * so every rule lifts and the door is not hammered), failed (anything
+	 * else — the cache is left alone, the next pull waits RETRY)
 	 */
 	public function pull(
 		Consent $consent,
@@ -5091,22 +5250,33 @@ final class Kernel
 			{
 				return self::PULL_SKIPPED;
 			}
+			// a pull that failed less than RETRY ago holds this one off, forced by a request or not; a failure that lies ahead (the clock
+			// set back) holds nothing
+			$failedAt = $this->store->pullFailedAt();
+			if($force === false && $failedAt !== 0 && $failedAt <= $now && $now < $failedAt + self::RETRY)
+			{
+				return self::PULL_SKIPPED;
+			}
 			if($this->store->lock('pull') === false)
 			{
 				return self::PULL_LOCKED;
 			}
 			try
 			{
-				return $this->fetch($current, $now);
+				$pulled = $this->fetch($current, $now);
 			}
 			finally
 			{
 				$this->store->unlock('pull');
 			}
+			$this->store->pullFailed($pulled === self::PULL_FAILED ? $now : 0);
+			
+			return $pulled;
 		}
 		catch(Throwable $e)
 		{
 			$this->log('pull failed: ' . $e->getMessage());
+			$this->store->pullFailed($now);
 			
 			return self::PULL_FAILED;
 		}
@@ -5143,6 +5313,16 @@ final class Kernel
 			$this->rulesetRead = false;
 			
 			return self::PULL_UNCHANGED;
+		}
+		// codesafe refusing this key (rotated, its project switched off or deleted) over the connection the site trusts, not a
+		// site cut off: every rule lifts, as on a contract this kernel does not know, and the interval applies
+		if($status === 401 && self::refusesKey($response))
+		{
+			$this->log('pull answered 401: the door refuses this key, every rule lifted until it answers');
+			$this->store->write(Ruleset::refused($now, $this->platformNames())->toRecord($this->sealKey));
+			$this->rulesetRead = false;
+			
+			return self::PULL_REFUSED;
 		}
 		if($status !== 200)
 		{
@@ -5182,6 +5362,22 @@ final class Kernel
 		}
 		
 		return self::PULL_FRESH;
+	}
+	
+	/**
+	 * Whether a 401 is the door's own refusal of the key — its JSON, `success`
+	 * false — and no page a proxy or an HTTP login in front of the instance
+	 * answers, which is a failed pull
+	 */
+	protected static function refusesKey(
+		array $response,
+	): bool
+	{
+		$body = (string)($response['body'] ?? '');
+		// a door's refusal is a few bytes; anything longer is no door's, and is never decoded
+		$payload = strlen($body) > 4096 ? null : json_decode($body, true);
+		
+		return is_array($payload) && ($payload['success'] ?? null) === false;
 	}
 	
 	/** one header of the transport's answer, any case; '' when absent */

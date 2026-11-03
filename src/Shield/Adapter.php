@@ -41,6 +41,7 @@ use function get_current_user_id;
 use function get_option;
 use function get_user_by;
 use function has_filter;
+use function hash;
 use function hash_equals;
 use function header;
 use function headers_sent;
@@ -72,6 +73,7 @@ use function str_replace;
 use function strpos;
 use function strtolower;
 use function substr;
+use function sys_get_temp_dir;
 use function time;
 use function trim;
 use function user_can;
@@ -184,6 +186,9 @@ final class Adapter
 	public const AUTHENTICATED_PRIORITY = PHP_INT_MAX;
 	
 	public const DIR = 'ovos-codesafe';
+	
+	/** the system temp dir's folder the ruleset falls back to without a store directory or a consent (tempFile()) */
+	public const TEMP_DIR = 'ovos-codesafe-shield';
 	
 	/** the store directory under the plugin's first name, ovos-console */
 	public const LEGACY_DIR = 'ovos-console';
@@ -774,14 +779,43 @@ final class Adapter
 	/**
 	 * The durable tier: the ruleset in the store directory under the name the
 	 * consent drew (Prepend::rules) — JSON that is never included, and that no
-	 * one can ask a web server for by name. '' when there is no store or no
-	 * consent yet: the kernel runs on APCu alone, or fails open
+	 * one can ask a web server for by name. With no store or no consent yet,
+	 * the system temp dir under a name of the install and the key
+	 * (tempFile()), never APCu alone: an idle eviction (apc.ttl) would empty
+	 * it, and past the ceiling a site cut off from codesafe holds its
+	 * blocking rules only while there is a record to hold them
 	 */
 	public function file(): string
 	{
 		$dir = self::storeDir();
+		$file = $dir === '' ? '' : Prepend::rules($dir);
 		
-		return $dir === '' ? '' : Prepend::rules($dir);
+		return $file !== '' ? $file : self::tempFile($this->prefix(), $this->config->apiKey());
+	}
+	
+	/**
+	 * The ruleset's file in the temp dir's own folder (TEMP_DIR; `$temp`, the
+	 * system's when null), named by the install prefix and the key, so two
+	 * installs on one box never read each other's record; the kernel seals it
+	 * under the key, so a record another writer of the shared folder plants
+	 * reads as none
+	 */
+	public static function tempFile(
+		string $prefix,
+		string $key,
+		?string $temp = null,
+	): string
+	{
+		$temp = rtrim($temp ?? sys_get_temp_dir(), '/\\');
+		$dir = $temp . DIRECTORY_SEPARATOR . self::TEMP_DIR;
+		// a folder that cannot be made or written (a file in its place, one another user of a shared temp dir made) falls
+		// back to the temp dir itself: on APCu alone an idle eviction would lose the record
+		if((is_dir($dir) === false && @mkdir($dir, 0700, true) === false) || is_writable($dir) === false)
+		{
+			$dir = $temp;
+		}
+		
+		return $dir . DIRECTORY_SEPARATOR . 'shield-' . substr(hash('sha256', $prefix . '|' . $key), 0, 16) . '.json';
 	}
 	
 	/**
