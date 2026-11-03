@@ -6,11 +6,13 @@ declare(strict_types=1);
  * kernel (Shield.php): what WordPress makes of a request that the core does
  * not read alike for every platform. Its REST route (target `rest`, in either
  * spelling, under the site's REST prefix), its batch route (each request a
- * batch lists reaches its own route's handler), the shortcode and block
- * attributes a decode step reads (`shortcode:<tag>.<attribute>`,
- * `block:<namespace/name>.<dot.path>`) and the JSON types WordPress reads as
- * JSON. A kernel not given this module drops a rule that names these words
- * at the pull and reads none of them: nothing is guessed.
+ * batch lists reaches its own route's handler), its XML-RPC call (target
+ * `xmlrpc`, the method; `xmlrpc:<dot.path>`, a parameter, base64 decoded as
+ * the server decodes it), the shortcode and block attributes a decode step
+ * reads (`shortcode:<tag>.<attribute>`, `block:<namespace/name>.<dot.path>`)
+ * and the JSON types WordPress reads as JSON. A kernel not given this module
+ * drops a rule that names these words at the pull and reads none of them:
+ * nothing is guessed.
  *
  *   require_once __DIR__ . '/Shield.php';               // the core first: it declares Platform
  *   require_once __DIR__ . '/Shield/Wordpress.php';
@@ -29,13 +31,20 @@ declare(strict_types=1);
 
 namespace Ovos\Codesafe\Shield;
 
+use Closure;
+
+use function abs;
 use function array_filter;
+use function array_pop;
 use function array_slice;
 use function array_values;
+use function base64_decode;
 use function count;
 use function explode;
+use function html_entity_decode;
 use function in_array;
 use function is_array;
+use function is_infinite;
 use function is_scalar;
 use function is_string;
 use function json_decode;
@@ -45,10 +54,14 @@ use function preg_match_all;
 use function preg_replace;
 use function rawurldecode;
 use function rtrim;
+use function sprintf;
 use function str_contains;
+use function str_replace;
 use function str_ends_with;
+use function str_repeat;
 use function str_starts_with;
 use function strcasecmp;
+use function strcspn;
 use function stripcslashes;
 use function strlen;
 use function strpos;
@@ -58,8 +71,13 @@ use function strtolower;
 use function strtoupper;
 use function strtr;
 use function substr;
+use function substr_compare;
+use function substr_count;
+use function substr_replace;
 use function trim;
 
+use const ENT_QUOTES;
+use const ENT_XML1;
 use const PREG_SET_ORDER;
 
 final class Wordpress implements Platform
@@ -67,8 +85,34 @@ final class Wordpress implements Platform
 	/** the word X-Shield-Platforms names this module by */
 	public const NAME = 'wordpress';
 	
-	/** the REST route in either spelling: a frame target with no name, which selects the handler a request reaches */
-	public const TARGETS = ['rest'];
+	/**
+	 * the REST route in either spelling, and the XML-RPC method a call names:
+	 * frame targets with no name, which select the handler a request reaches
+	 */
+	public const TARGETS = ['rest', 'xmlrpc'];
+	
+	/** the targets that take a name: `xmlrpc:<dot.path>`, a parameter of the XML-RPC call — positional from 0, a struct member by its name, `*` any */
+	public const PREFIXES = ['xmlrpc'];
+	
+	/**
+	 * what X-Shield-Platforms names beside `wordpress` for this module: it
+	 * reads the XML-RPC targets, which a module before them drops at the pull
+	 */
+	public const WORD_XMLRPC = 'wordpress-xmlrpc';
+	
+	/** the bytes PHP's trim() takes off either end, as IXR_Message trims a message */
+	public const TRIMMED_BYTES = " \t\n\r\0\x0B";
+	
+	/** the script WordPress's XML-RPC server runs as */
+	public const XMLRPC_SCRIPT = '/xmlrpc.php';
+	
+	/**
+	 * the elements a call holds at most, IXR_Message's own limit (the
+	 * xmlrpc_element_limit filter's default): WordPress refuses a message
+	 * with more than twice as many `<`, unless a site raised it, so past it a
+	 * call is unread rather than refused
+	 */
+	public const XMLRPC_ELEMENTS_MAX = 30000;
 	
 	/** Facts::$options' key for the REST API's path prefix — rest_get_url_prefix(); none is WordPress's default, wp-json */
 	public const OPTION_REST_PREFIX = 'rest_prefix';
@@ -119,12 +163,56 @@ final class Wordpress implements Platform
 		return self::TARGETS;
 	}
 	
+	/** its targets that take a name (Platform's optional prefixes()) */
+	public function prefixes(): array
+	{
+		return self::PREFIXES;
+	}
+	
+	/** the words a door serves its XML-RPC targets to a kernel by (Platform's optional words()) */
+	public function words(): array
+	{
+		return [self::WORD_XMLRPC];
+	}
+	
 	public function values(
 		string $target,
 		Facts $facts,
 	): array
 	{
-		return $target === 'rest' ? self::routes($facts) : [];
+		if($target === 'rest')
+		{
+			return self::routes($facts);
+		}
+		$call = $target === 'xmlrpc' || str_starts_with($target, 'xmlrpc:') ? self::xmlrpcCall($facts) : null;
+		if(is_array($call) === false)
+		{
+			return [];
+		}
+		if($target === 'xmlrpc')
+		{
+			return $call['methods'];
+		}
+		// a parameter of the call, and of each call system.multicall lists: any of them is enough
+		$values = [];
+		foreach($call['params'] as $params)
+		{
+			foreach(Kernel::pickJson($params, substr($target, strlen('xmlrpc:'))) as $value)
+			{
+				$values[] = $value;
+			}
+		}
+		
+		return $values;
+	}
+	
+	/** whether an XML-RPC target was not read whole for this request (Platform's optional unread(), xmlrpcCall()) */
+	public function unread(
+		string $target,
+		Facts $facts,
+	): bool
+	{
+		return ($target === 'xmlrpc' || str_starts_with($target, 'xmlrpc:')) && self::xmlrpcCall($facts) === false;
 	}
 	
 	public function decodes(
@@ -284,8 +372,9 @@ final class Wordpress implements Platform
 		$names = [];
 		foreach($headers as $name => $value)
 		{
-			// WordPress keeps a header's values as a list: the first is the one read
-			$names[strtolower((string)$name)] = is_array($value) ? (string)(array_values($value)[0] ?? '') : (is_scalar($value) ? (string)$value : '');
+			// WordPress keeps a header's values as a list: the first is the one read, a scalar as PHP writes it, anything else empty
+			$first = is_array($value) ? (array_values($value)[0] ?? null) : $value;
+			$names[strtolower((string)$name)] = is_scalar($first) ? (string)$first : '';
 		}
 		
 		return $facts->derived(strtoupper($method), Facts::decodeOnce('/' . self::restPrefix($facts) . $path), $query, is_array($body) ? $body : [], $body,
@@ -884,5 +973,433 @@ final class Wordpress implements Platform
 		}
 		
 		return 1 + strspn($value, 'abcdefghijklmnopqrstuvwxyz0123456789_-', $at + 1);
+	}
+	
+	/**
+	 * The XML-RPC call a request carries, as WordPress's server reads it
+	 * (xmlrpc.php, IXR_Server::serve()): on a POST to a script ending in
+	 * /xmlrpc.php, the body as sent whatever its Content-Type, trimmed,
+	 * through IXR_Message's reading (ixr()) — the method it names and each
+	 * one system.multicall lists (IXR_Server::multiCall(), one level: a
+	 * nested multicall runs nothing), and the parameters of the call and of
+	 * each listed one. Null where no call runs: another script, another
+	 * method, a body IXR_Message refuses or a message that is no
+	 * methodCall; false where the kernel did not read it whole (unread()):
+	 * past Facts::RAW_CAP, past XMLRPC_ELEMENTS_MAX, XML its reader does not
+	 * follow, or no body to read. Read once per request
+	 *
+	 * @return array{methods: list<string>, params: list<list<mixed>>}|false|null
+	 */
+	public static function xmlrpcCall(
+		Facts $facts,
+	): array|false|null
+	{
+		return $facts->kept('xmlrpc', static function() use ($facts): array|false|null
+		{
+			if($facts->outer() !== null || strtoupper($facts->method) !== 'POST' || str_ends_with(strtolower($facts->scriptPath()), self::XMLRPC_SCRIPT) === false)
+			{
+				return null;
+			}
+			$raw = $facts->raw();
+			// a call the kernel cannot see may be any call
+			if($raw === null || strlen($raw) > Facts::RAW_CAP)
+			{
+				return false;
+			}
+			$message = self::ixr(trim($raw));
+			if(is_array($message) === false)
+			{
+				return $message;
+			}
+			$methods = [$message['method']];
+			$params = [$message['params']];
+			// the calls system.multicall runs, each with its own parameters
+			if($message['method'] === 'system.multicall' && is_array($message['params'][0] ?? null))
+			{
+				foreach($message['params'][0] as $call)
+				{
+					if(is_array($call) && is_scalar($call['methodName'] ?? null))
+					{
+						$methods[] = (string)$call['methodName'];
+					}
+					if(is_array($call) && is_array($call['params'] ?? null))
+					{
+						$params[] = $call['params'];
+					}
+				}
+			}
+			
+			return ['methods' => $methods, 'params' => $params];
+		});
+	}
+	
+	/**
+	 * A message as IXR_Message::parse() reads it: the XML declaration taken
+	 * out of the first 100 bytes and a DOCTYPE without a subset out of the
+	 * first 200, a root of methodCall, methodResponse or fault, at most
+	 * XMLRPC_ELEMENTS_MAX elements, then each tag as tag_open(), cdata()
+	 * and tag_close() read it (ixrClose()) over the XML (xmlEvents()). Null
+	 * where IXR_Message refuses the message or it is no methodCall, false
+	 * where the reader does not follow it. What IXR_Message takes off the
+	 * front is read past, never copied off: a message of RAW_CAP bytes is
+	 * held once, beside the text of its largest value
+	 *
+	 * @return array{method: string, params: list<mixed>}|false|null
+	 */
+	public static function ixr(
+		string $message,
+	): array|false|null
+	{
+		$window = substr($message, 0, 100);
+		$head = (string)preg_replace('/<\?xml.*?\?>/s', '', $window, 1);
+		// a declaration that begins the message leaves the rest of the window at its end: the message is read from there; one in
+		// the window's middle, which no client writes, is taken out as IXR_Message takes it, at the cost of a copy
+		if(str_ends_with($window, $head) === false)
+		{
+			$message = trim(substr_replace($message, $head, 0, 100));
+			$window = '';
+			$head = '';
+		}
+		$from = strlen($window) - strlen($head);
+		$from+= strspn($message, self::TRIMMED_BYTES, $from);
+		// a DOCTYPE is taken off the next 200 bytes' start alone: read past the same way
+		$window = substr($message, $from, 200);
+		$from+= strlen($window) - strlen((string)preg_replace('/^<!DOCTYPE[^>]*+>/i', '', $window, 1));
+		$from+= strspn($message, self::TRIMMED_BYTES, $from);
+		$root = substr($message, $from, strcspn($message, "> \t\r\n", $from, 20));
+		if($from >= strlen($message) || in_array($root, ['<methodCall', '<methodResponse', '<fault'], true) === false)
+		{
+			return null;
+		}
+		// WordPress refuses more by default; the xmlrpc_element_limit filter may raise it, so the rest is unread, not refused
+		if(2 * self::XMLRPC_ELEMENTS_MAX < substr_count($message, '<', $from))
+		{
+			return false;
+		}
+		$state = ['contents' => '', 'type' => '', 'stack' => [], 'kinds' => [], 'names' => [], 'params' => [], 'method' => ''];
+		$read = self::xmlEvents($message, static function(string $event, string $data) use (&$state): void
+		{
+			if($event === 'text')
+			{
+				$state['contents'] .= $data;
+			}
+			elseif($event === 'open')
+			{
+				$state['contents'] = '';
+				if($data === 'methodCall' || $data === 'methodResponse' || $data === 'fault')
+				{
+					$state['type'] = $data;
+				}
+				elseif($data === 'data' || $data === 'struct')
+				{
+					$state['kinds'][] = $data === 'data' ? 'array' : 'struct';
+					$state['stack'][] = [];
+				}
+			}
+			else
+			{
+				self::ixrClose($state, $data);
+			}
+		}, $from);
+		
+		return $read === false ? false : ($state['type'] === 'methodCall' ? ['method' => $state['method'], 'params' => $state['params']] : null);
+	}
+	
+	/**
+	 * IXR_Message::tag_close(): a typed value as WordPress gets it — an int
+	 * as PHP's (int) reads its trimmed text, a double as PHP's (float) does
+	 * (doubleOf()), a boolean '1' or '', a base64 decoded as base64_decode()
+	 * does without strict, a string trimmed, an untyped value that is not
+	 * blank as sent, a date as its trimmed text — added to the struct (under
+	 * the open member's name) or the array open, else to the parameters; a
+	 * name pushed, a member popped, the method name trimmed; the contents
+	 * emptied whatever the tag
+	 */
+	protected static function ixrClose(
+		array &$state,
+		string $tag,
+	): void
+	{
+		$contents = $state['contents'];
+		$state['contents'] = '';
+		$value = match($tag)
+		{
+			'int', 'i4' => (string)(int)trim($contents),
+			'double' => self::doubleOf(trim($contents)),
+			'dateTime.iso8601' => trim($contents),
+			'string' => trim($contents),
+			'value' => trim($contents) !== '' ? $contents : null,
+			'boolean' => (bool)trim($contents) ? '1' : '',
+			'base64' => (string)base64_decode($contents),
+			'data', 'struct' => array_pop($state['stack']),
+			default => null,
+		};
+		if($tag === 'data' || $tag === 'struct')
+		{
+			array_pop($state['kinds']);
+		}
+		elseif($tag === 'member')
+		{
+			array_pop($state['names']);
+		}
+		elseif($tag === 'name')
+		{
+			$state['names'][] = trim($contents);
+		}
+		elseif($tag === 'methodName')
+		{
+			$state['method'] = trim($contents);
+		}
+		if($value === null)
+		{
+			return;
+		}
+		$open = count($state['stack']) - 1;
+		if($open < 0)
+		{
+			$state['params'][] = $value;
+		}
+		elseif($state['kinds'][count($state['kinds']) - 1] === 'struct')
+		{
+			// no member open: PHP reads the missing name as null, the key ''
+			$state['stack'][$open][$state['names'] === [] ? '' : $state['names'][count($state['names']) - 1]] = $value;
+		}
+		else
+		{
+			$state['stack'][$open][] = $value;
+		}
+	}
+	
+	/**
+	 * A double's text as the value a test reads: what PHP's (float) makes of
+	 * it, as IXR_Message does — `1e3` is 1000, `500abc` 500 — in the fewest
+	 * digits that read back as that double, written out up to 21 integer
+	 * digits and down to 10^-6, past either as `1e+21`: the number a number
+	 * test compares, the text a text test reads, the Node twin's alike; an
+	 * infinite one INF or -INF
+	 */
+	public static function doubleOf(
+		string $text,
+	): string
+	{
+		$double = (float)$text;
+		if(is_infinite($double))
+		{
+			return $double > 0 ? 'INF' : '-INF';
+		}
+		if($double === 0.0)
+		{
+			return '0';
+		}
+		// the fewest significant digits that read back as this double: seventeen always do
+		$digits = 1;
+		while((float)sprintf('%.' . ($digits - 1) . 'e', $double) !== $double)
+		{
+			$digits++;
+		}
+		preg_match('/^(-?)([0-9])(?:\.([0-9]+))?e([+-][0-9]+)$/', sprintf('%.' . ($digits - 1) . 'e', $double), $parts);
+		$mantissa = rtrim($parts[2] . ($parts[3] ?? ''), '0');
+		$length = strlen($mantissa);
+		// how many of the digits stand before the decimal point
+		$point = (int)$parts[4] + 1;
+		
+		return $parts[1] . match(true)
+		{
+			$point >= $length && $point <= 21 => $mantissa . str_repeat('0', $point - $length),
+			$point > 0 && $point <= 21 => substr($mantissa, 0, $point) . '.' . substr($mantissa, $point),
+			$point > -6 && $point <= 0 => '0.' . str_repeat('0', -$point) . $mantissa,
+			default => $mantissa[0] . ($length > 1 ? '.' . substr($mantissa, 1) : '') . 'e' . ($point > 0 ? '+' : '-') . abs($point - 1),
+		};
+	}
+	
+	/**
+	 * A document's elements as libxml2 (PHP's ext/xml, which IXR_Message
+	 * parses with) hands them to a handler — `open` and `close` with the
+	 * tag, `text` with the character data between two tags, one event a
+	 * run, its line ends folded to one `\n` and its references decoded (the
+	 * five XML ones, numeric ones of any length to UTF-8; references()),
+	 * CDATA as it is, line ends and all; comments and processing
+	 * instructions skipped. A name is read as XML 1.0's and wider: an ASCII
+	 * one as it allows, any byte past ASCII in it (where libxml2 refuses
+	 * such a name, WordPress runs nothing). False where the document is
+	 * anything else or not well formed: no UTF-8, a DOCTYPE, an unknown
+	 * entity, a control byte, a tag closed out of order. The document starts
+	 * at $from, and the bytes before it are held to the same UTF-8 and
+	 * control-byte checks: what a client puts in an XML declaration is
+	 * ASCII. It is never copied whole: a text run is read where it stands,
+	 * and a run of references costs a few passes in C, never a call each
+	 */
+	public static function xmlEvents(
+		string $xml,
+		Closure $handler,
+		int $from = 0,
+	): bool
+	{
+		// UTF-8 whole, no control byte but tab and line ends, no U+FFFE or U+FFFF
+		if(preg_match('//u', $xml) !== 1 || preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F]|\xEF\xBF[\xBE\xBF]/', $xml) === 1)
+		{
+			return false;
+		}
+		$name = '[A-Za-z_:\x80-\xFF][A-Za-z0-9._:\x80-\xFF-]*';
+		$length = strlen($xml);
+		$open = [];
+		$rooted = false;
+		$at = $from;
+		while($at < $length)
+		{
+			$run = strcspn($xml, '<', $at);
+			if($run > 0)
+			{
+				$text = substr($xml, $at, $run);
+				// outside the root only blanks, a reference no blank either; `]]>` is no text anywhere
+				if(($open === [] && trim($text, " \t\r\n") !== '') || str_contains($text, ']]>'))
+				{
+					return false;
+				}
+				// the line ends folded first: a reference's `&#13;` is a carriage return as written
+				$text = $open === [] ? null : self::references(self::lineEnds($text));
+				if($open !== [] && $text === null)
+				{
+					return false;
+				}
+				if($text !== null)
+				{
+					$handler('text', $text);
+				}
+				// a value's text is held once, by the handler: a run of RAW_CAP bytes is not held twice while the next tag decodes it
+				unset($text);
+				$at+= $run;
+				
+				continue;
+			}
+			if(substr_compare($xml, '<!--', $at, 4) === 0)
+			{
+				$end = strpos($xml, '-->', $at + 4);
+				$body = $end === false ? '' : substr($xml, $at + 4, $end - $at - 4);
+				if($end === false || str_contains($body, '--') || str_ends_with($body, '-'))
+				{
+					return false;
+				}
+				$at = $end + 3;
+				
+				continue;
+			}
+			if(substr_compare($xml, '<![CDATA[', $at, 9) === 0)
+			{
+				$end = strpos($xml, ']]>', $at + 9);
+				if($open === [] || $end === false)
+				{
+					return false;
+				}
+				// as it is, its line ends too: libxml2's push parser, which ext/xml runs, hands a CDATA section over unfolded
+				$handler('text', substr($xml, $at + 9, $end - $at - 9));
+				$at = $end + 3;
+				
+				continue;
+			}
+			if(substr_compare($xml, '<?', $at, 2) === 0)
+			{
+				$end = strpos($xml, '?>', $at + 2);
+				// a declaration anywhere but the start is an error to libxml2
+				if($end === false || preg_match('/\G<\?(' . $name . ')(?:[ \t\r\n]|\?>)/', $xml, $target, 0, $at) !== 1 || strtolower($target[1]) === 'xml')
+				{
+					return false;
+				}
+				$at = $end + 2;
+				
+				continue;
+			}
+			if(substr_compare($xml, '</', $at, 2) === 0)
+			{
+				if(preg_match('/\G<\/(' . $name . ')[ \t\r\n]*>/', $xml, $tag, 0, $at) !== 1 || $open === [] || array_pop($open) !== $tag[1])
+				{
+					return false;
+				}
+				$handler('close', $tag[1]);
+				$at+= strlen($tag[0]);
+				
+				continue;
+			}
+			// a start tag: its name, attributes each after a blank and named once, `>` or `/>`
+			if(($rooted && $open === []) || preg_match('/\G<(' . $name . ')((?:[ \t\r\n]+' . $name . '[ \t\r\n]*=[ \t\r\n]*(?:"[^<"]*"|\'[^<\']*\'))*)[ \t\r\n]*(\/?)>/',
+					$xml, $tag, 0, $at) !== 1 || self::xmlAttributes($tag[2], $name) === false)
+			{
+				return false;
+			}
+			$rooted = true;
+			$handler('open', $tag[1]);
+			if($tag[3] === '/')
+			{
+				$handler('close', $tag[1]);
+			}
+			else
+			{
+				$open[] = $tag[1];
+			}
+			$at+= strlen($tag[0]);
+		}
+		
+		return $rooted && $open === [];
+	}
+	
+	/**
+	 * a text's line ends as XML reads them, `\r\n` and a lone `\r` one `\n`:
+	 * two passes that each build their text at its size, where strtr()'s
+	 * growing buffer holds twice a long one
+	 */
+	protected static function lineEnds(
+		string $text,
+	): string
+	{
+		return str_contains($text, "\r") ? str_replace("\r", "\n", str_replace("\r\n", "\n", $text)) : $text;
+	}
+	
+	/** whether a start tag's attributes are each named once and hold only references libxml2 reads */
+	protected static function xmlAttributes(
+		string $attributes,
+		string $name,
+	): bool
+	{
+		preg_match_all('/(' . $name . ')[ \t\r\n]*=[ \t\r\n]*(?:"([^"]*)"|\'([^\']*)\')/', $attributes, $pairs, PREG_SET_ORDER);
+		$names = [];
+		foreach($pairs as $pair)
+		{
+			$value = ($pair[2] ?? '') . ($pair[3] ?? '');
+			if(isset($names[$pair[1]]) || preg_match('/&(?!(?:lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);)/', $value) === 1)
+			{
+				return false;
+			}
+			$names[$pair[1]] = true;
+		}
+		
+		return true;
+	}
+	
+	/**
+	 * A text's references as the text they stand for: the five XML
+	 * entities, a numeric one as UTF-8, its digits as many as sent (leading
+	 * zeros included, as libxml2 reads them); null where an `&` opens none
+	 * of them (a bare one, an unknown entity, `&#X41;`) or one names a code
+	 * point XML allows no document (`&#0;`, a surrogate, past U+10FFFF).
+	 * html_entity_decode() under ENT_XML1 decodes exactly those and leaves
+	 * the others as written, so an `&` left over is a refused one; the `&`
+	 * a reference stands for is held apart (\x01, a control byte no
+	 * document holds) until then
+	 */
+	protected static function references(
+		string $text,
+	): ?string
+	{
+		if(str_contains($text, '&') === false)
+		{
+			return $text;
+		}
+		if(preg_match('/&(?!(?:lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);)/', $text) === 1)
+		{
+			return null;
+		}
+		$decoded = html_entity_decode((string)preg_replace('/&(?:amp|#0*38|#x0*26);/', "\x01", $text), ENT_QUOTES | ENT_XML1, 'UTF-8');
+		
+		return str_contains($decoded, '&') ? null : str_replace("\x01", '&', $decoded);
 	}
 }

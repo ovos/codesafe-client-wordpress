@@ -81,16 +81,18 @@ declare(strict_types=1);
  * Virtual patches (kind `vpatch`): an entry point, a parameter, a typed test
  * and WHO — `{who, conditions: [{target, decode, test, value, ci}]}`, every
  * condition holding, over the request as the platform parsed it (Facts'
- * query, form, JSON, cookies, headers, file names, and an upload's head and
- * tail when a condition names its contents; a form PHP left out of $_POST
- * on PUT, PATCH or DELETE the kernel parses as WordPress's REST server
- * does, Facts::formReader()). `who` is anyone,
+ * query, form, JSON, cookies, headers, file names, and an upload's bytes,
+ * read whole within Facts::FILE_BUDGET, when a condition names its
+ * contents; a form PHP left out of $_POST on PUT, PATCH or DELETE the
+ * kernel parses as WordPress's REST server does, Facts::formReader()).
+ * `who` is anyone,
  * anonymous or lacks:<capability>, and a nonce test asks the platform: a
  * blocking vpatch whose who or nonce the adapter cannot answer, or that
- * reads what the kernel could not (an upload; a JSON body past
- * Facts::JSON_CAP or a decode step's values past Facts::DECODED_BUDGET on a
- * handler none of its other entries pins; a WordPress batch whose body it
- * could not read), is held with the reason `unanswered`
+ * reads what the kernel could not (an upload the host cannot read; an
+ * upload past Facts::FILE_BUDGET, a JSON body past Facts::JSON_CAP or a
+ * decode step's values past Facts::DECODED_BUDGET on a handler none of its
+ * other entries pins; a WordPress batch whose body it could not read), is
+ * held with the reason `unanswered`
  * (Verdict::REASON_UNANSWERED), never blocked. On the handler its other
  * entries pin, what the kernel did not read whole is taken to carry what the
  * condition looks for, and the verdict says `unread` (Verdict::REASON_UNREAD):
@@ -161,6 +163,7 @@ use function apcu_fetch;
 use function apcu_inc;
 use function apcu_store;
 use function array_diff;
+use function array_diff_key;
 use function array_filter;
 use function array_is_list;
 use function array_key_exists;
@@ -186,6 +189,7 @@ use function explode;
 use function fclose;
 use function file_get_contents;
 use function filter_var;
+use function ini_get;
 use function fopen;
 use function fstat;
 use function function_exists;
@@ -214,9 +218,11 @@ use function json_decode;
 use function json_encode;
 use function ltrim;
 use function max;
+use function method_exists;
 use function min;
 use function ord;
 use function parse_str;
+use function preg_last_error;
 use function preg_match;
 use function preg_match_all;
 use function preg_quote;
@@ -227,6 +233,7 @@ use function random_bytes;
 use function rawurldecode;
 use function rename;
 use function rtrim;
+use function serialize;
 use function sort;
 use function sprintf;
 use function str_contains;
@@ -261,17 +268,30 @@ use const CURLOPT_RETURNTRANSFER;
 use const CURLOPT_TIMEOUT_MS;
 use const CURLOPT_URL;
 use const CURLOPT_USERAGENT;
+use const FILTER_VALIDATE_BOOLEAN;
 use const FILTER_VALIDATE_IP;
 use const JSON_UNESCAPED_SLASHES;
 use const JSON_UNESCAPED_UNICODE;
+use const PCRE_JIT_SUPPORT;
 use const PHP_INT_MAX;
+use const PREG_NO_ERROR;
 
 /**
  * A platform's kernel module: the vocabulary only its app gives a request a
  * meaning in — frame targets, decode steps, the requests a request carries
  * inside it, the JSON types it reads. Given to Kernel and Facts (their
  * `platforms`), it is asked where the core's own reading ends; a kernel
- * without it drops its rules at the pull and reads none of its words
+ * without it drops its rules at the pull and reads none of its words.
+ *
+ * Three members are optional, asked only of a module that has them, so a
+ * module written before them still loads: `prefixes(): list<string>`, its
+ * targets that take a name (`xmlrpc:<path>`), read like a core parameter
+ * and never a frame; `unread(string $target, Facts $facts): bool`, whether
+ * it did not read one of its targets whole for this request, which then
+ * holds as a JSON body past its cap does; `words(): list<string>`, what
+ * X-Shield-Platforms names beside its name, the words it reads beyond its
+ * first release, so a door serves a rule in them only to a kernel that
+ * reads them
  */
 interface Platform
 {
@@ -384,10 +404,54 @@ final class Facts
 	 */
 	public const FORM_CAP = 1048576;
 	
-	/** an upload is read as its first FILE_HEAD bytes and its last FILE_TAIL, one value: a payload hides at either end */
-	public const FILE_HEAD = 65536;
+	/**
+	 * the body as sent that a platform module parses as its app does
+	 * (raw(): WordPress's XML-RPC server) is read up to this, PHP's default
+	 * post_max_size, so a host on PHP's defaults receives none larger; past
+	 * it the module's targets are unread, held on the handler the rule's
+	 * other entries pin, observed elsewhere
+	 */
+	public const RAW_CAP = 8388608;
 	
-	public const FILE_TAIL = 4096;
+	/**
+	 * the upload bytes a request's file-content tests read in all, every
+	 * condition of every rule together, judge and tally alike
+	 * (Kernel::contents()): an upload is read whole, once, by the first test
+	 * that can afford it, and each test spends its size times its weight
+	 * (FILE_WEIGHTS), so a request holds at most this much of its uploads and
+	 * stays under 200 ms whatever the rule count (a literal test 3.3 ms a MiB
+	 * at worst); past it a condition is cut (Kernel::patched())
+	 */
+	public const FILE_BUDGET = 16777216;
+	
+	/** the least one test over one upload spends, as opening a small file costs more than its bytes: a request reads 256 small uploads at most */
+	public const FILE_TEST_MIN = 65536;
+	
+	/**
+	 * what a test over an upload's bytes weighs against a literal one where
+	 * PCRE runs with its JIT, as PHP does by default: the markup and URL tests
+	 * run up to 46 ms a MiB and copy the value twice, the host's HTML filter
+	 * (wp_kses_post()) up to 6 s; every other test weighs 1, a regex too, as
+	 * the JIT runs the shapes the gate admits in a line (fileWeight())
+	 */
+	public const FILE_WEIGHTS = ['has_markup' => 4, 'offsite' => 4, 'unsafe_html' => 512];
+	
+	/**
+	 * the weights where PCRE runs without its JIT (pcre.jit off, or a PHP
+	 * built without it): the interpreter backtracks the shapes the gate
+	 * admits quadratically — `[a-z]+[0-9]*x` over 16 KiB of `a` takes 3.9 s,
+	 * over 1 KiB 15 ms — so a regex reads 2 KiB of a request's uploads;
+	 * has_markup's own patterns run 340 ms over 4 MiB there
+	 */
+	public const FILE_WEIGHTS_INTERPRETED = ['regex' => 8192, 'not_regex' => 8192, 'has_markup' => 8];
+	
+	/**
+	 * what each atom of a regex without a quantifier weighs where PCRE runs
+	 * without its JIT (RegexGate::width()): every start compares its atoms
+	 * in turn, up to 9 ms a MiB an atom, so `<\?(?:php|=)` (5) reads 800 KiB
+	 * of a request's uploads and a 600-byte pattern 7 KiB
+	 */
+	public const LINEAR_ATOM_WEIGHT = 4;
 	
 	protected ?string $body = null;
 	
@@ -407,7 +471,7 @@ final class Facts
 	/** whether the form the kernel parsed itself ran past FORM_CAP: what lies past is unread */
 	protected bool $formCut = false;
 	
-	/** @var array<string, ?string> the uploads read, by temp path */
+	/** @var array<string, string|int|null> the uploads asked for, by temp path: the bytes, the length of one not read, null where the host cannot read it */
 	protected array $fileContents = [];
 	
 	/** @var array<string, ?bool> the host's answers, by question: a rule judged twice asks once */
@@ -440,6 +504,9 @@ final class Facts
 	/** the budget spent so far (spend()); a sub-request's and a copy's is its request's */
 	protected int $spent = 0;
 	
+	/** the upload bytes spent so far (spendFile()); a sub-request's and a copy's is its request's */
+	protected int $fileSpent = 0;
+	
 	/** @var array<string, mixed> what was computed once for this request (kept()): what judge() read, tally() reads again for free */
 	protected array $kept = [];
 	
@@ -459,13 +526,15 @@ final class Facts
 	 * @param ?Closure(string): ?bool $kses whether the host's HTML filter would change a value (WordPress:
 	 *     wp_kses_post()); null when the host cannot say
 	 * @param array<string, mixed> $uploads field => the upload's temp path (or paths), nested as $files nests the names
-	 * @param ?Closure(string): ?string $fileReader an upload's bytes by its temp path; null when the host cannot read it
+	 * @param ?Closure(string, int): (string|int|null) $fileReader an upload's bytes by its temp path when it is at most the int long,
+	 *     else its length, unread; null when the host cannot read it
 	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms()); anything else is ignored
 	 * @param array<string, scalar> $options what a platform module reads of the host, by the module's own key (WordPress's REST prefix)
 	 * @param ?array<string, mixed> $request the host's request bag ($_REQUEST), whose values a request: target reads beside the
 	 *     query's and the form's; null where the host has none
 	 * @param ?Closure(): array{array<string, mixed>, bool} $formReader the form a rule reads where the platform parsed none
 	 *     (formReader()), and whether it ran past FORM_CAP; null = $form is the form
+	 * @param ?Closure(): ?string $rawReader the body as sent, whatever its type (raw()); null where the host hands none
 	 */
 	public function __construct(
 		public readonly string $method,
@@ -491,6 +560,7 @@ final class Facts
 		public readonly array $options = [],
 		public readonly ?array $request = null,
 		protected ?Closure $formReader = null,
+		protected ?Closure $rawReader = null,
 	)
 	{
 		$this->platforms = array_values(array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform));
@@ -549,8 +619,9 @@ final class Facts
 			$copy = new self($this->method, $this->uri, $this->ua, $this->ip, $this->authed, fn(): array => [$this->body(), $this->bodyWasCapped()], $this->user,
 				$this->query, $this->form, $this->cookies, $this->headers, $this->files, $this->jsonFor === null ? $this->jsonThrough(...) : ($this->jsonFor)($platforms),
 				fn(string $capability): ?bool => $this->can($capability), fn(string $action, string $value): ?bool => $this->nonceValid($action, $value),
-				$this->callerKnown, fn(string $value): ?bool => $this->htmlUnsafe($value), $this->uploads, fn(string $path): ?string => $this->fileContent($path),
-				$platforms, $this->options, $this->request, $this->formReader === null ? null : fn(): array => [$this->form(), $this->formUnread()]);
+				$this->callerKnown, fn(string $value): ?bool => $this->htmlUnsafe($value), $this->uploads, fn(string $path, int $max): string|int|null => $this->fileContent($path, $max),
+				$platforms, $this->options, $this->request, $this->formReader === null ? null : fn(): array => [$this->form(), $this->formUnread()],
+				$this->rawReader === null ? null : fn(): ?string => $this->raw());
 			$copy->outer = $this->outer;
 			$copy->jsonFor = $this->jsonFor;
 			$copy->root = $this->root ?? $this;
@@ -577,6 +648,49 @@ final class Facts
 	public function remaining(): int
 	{
 		return max(0, self::DECODED_BUDGET - ($this->root ?? $this)->spent);
+	}
+	
+	/** whether the request's upload budget still covers a test of this cost, which is spent only then: an upload cut leaves the rest to the next */
+	public function spendFile(
+		int $cost,
+	): bool
+	{
+		$root = $this->root ?? $this;
+		if($cost > self::FILE_BUDGET - $root->fileSpent)
+		{
+			return false;
+		}
+		$root->fileSpent+= $cost;
+		
+		return true;
+	}
+	
+	/** the upload budget left: the most a test of weight 1 may still read */
+	public function fileRemaining(): int
+	{
+		return self::FILE_BUDGET - ($this->root ?? $this)->fileSpent;
+	}
+	
+	/**
+	 * What a test over an upload's bytes weighs on the engine that runs it:
+	 * PCRE's interpreter where its JIT is off or not built in, a regex there
+	 * by its atoms when it holds no quantifier ($width, RegexGate::width())
+	 */
+	public static function fileWeight(
+		string $test,
+		?int $width = null,
+	): int
+	{
+		$jit = PCRE_JIT_SUPPORT && filter_var(ini_get('pcre.jit'), FILTER_VALIDATE_BOOLEAN);
+		if($jit === false && isset(self::FILE_WEIGHTS_INTERPRETED[$test]))
+		{
+			// a pattern without a quantifier reads each start once over: its atoms set its cost, never past a quantified one's
+			$linear = ($test === 'regex' || $test === 'not_regex') && $width !== null;
+			
+			return $linear ? min(self::FILE_WEIGHTS_INTERPRETED[$test], max(1, self::LINEAR_ATOM_WEIGHT * $width)) : self::FILE_WEIGHTS_INTERPRETED[$test];
+		}
+		
+		return self::FILE_WEIGHTS[$test] ?? 1;
 	}
 	
 	/** what was computed once for this request under a key: what judge() read, tally() reads again for free */
@@ -654,7 +768,8 @@ final class Facts
 	 * @param ?callable(string, string): ?bool $nonce whether a nonce is valid for an action (a vpatch's nonce test)
 	 * @param bool $callerKnown whether the host could tell who the caller is (Facts::$callerKnown)
 	 * @param ?callable(string): ?bool $kses whether the host's HTML filter would change a value (a vpatch's unsafe_html)
-	 * @param ?callable(string): ?string $fileReader an upload's bytes by its temp path; null reads PHP's own (uploadReader())
+	 * @param ?callable(string, int): (string|int|null) $fileReader an upload's bytes by its temp path, its length past the int;
+	 *     null reads PHP's own (uploadReader())
 	 * @param list<Platform> $platforms the platform modules the kernel was given (Kernel::platforms())
 	 * @param array<string, scalar> $options what a platform module reads of the host (Facts::$options)
 	 * @param ?array<string, mixed> $request the host's request bag ($_REQUEST), read by a request: target beside the query and the form
@@ -716,6 +831,12 @@ final class Facts
 			$options,
 			$request,
 			$formReader,
+			$input === null ? null : static function() use ($input): ?string
+			{
+				$raw = $input();
+				
+				return is_string($raw) ? $raw : null;
+			},
 		);
 		$facts->jsonFor = static fn(array $platforms): ?Closure => self::jsonReader($contentType, $input, platforms: $platforms);
 		
@@ -736,7 +857,7 @@ final class Facts
 		$raw = null;
 		$failure = null;
 		// a byte past the largest cap: every reader still sees the body run past its own
-		$keep = max(self::BODY_CAP, self::JSON_CAP, self::FORM_CAP) + 1;
+		$keep = max(self::BODY_CAP, self::JSON_CAP, self::FORM_CAP, self::RAW_CAP) + 1;
 		
 		return static function() use ($input, $keep, &$read, &$raw, &$failure): mixed
 		{
@@ -824,18 +945,17 @@ final class Facts
 		return $paths;
 	}
 	
-	/** PHP's own temp files, read by headAndTail(): a path PHP did not write for this request's upload is never opened */
+	/** PHP's own temp files, read by fileBytes(): a path PHP did not write for this request's upload is never opened */
 	public static function uploadReader(): Closure
 	{
-		return static fn(string $path): ?string => is_uploaded_file($path) ? self::headAndTail($path) : null;
+		return static fn(string $path, int $max = self::FILE_BUDGET): string|int|null => is_uploaded_file($path) ? self::fileBytes($path, $max) : null;
 	}
 	
-	/** a file's first $head bytes and its last $tail as one value, the whole file when it is no longer; null when it cannot be read */
-	public static function headAndTail(
+	/** a file's bytes when it is at most $max long, else its length, unread; null when it cannot be read */
+	public static function fileBytes(
 		string $path,
-		int $head = self::FILE_HEAD,
-		int $tail = self::FILE_TAIL,
-	): ?string
+		int $max = self::FILE_BUDGET,
+	): string|int|null
 	{
 		$handle = is_file($path) && is_readable($path) ? fopen($path, 'rb') : false;
 		if($handle === false)
@@ -845,25 +965,25 @@ final class Facts
 		try
 		{
 			$stat = fstat($handle);
-			$size = $stat === false ? 0 : $stat['size'];
-			if($size <= $head + $tail)
+			$size = $stat === false ? 0 : (int)$stat['size'];
+			// longer than the test may read: the length answers, the bytes stay on disk
+			if($size > $max)
 			{
-				$bytes = stream_get_contents($handle);
+				return $size;
 			}
-			else
-			{
-				// the middle is never read: a large upload costs what a small one does
-				$start = stream_get_contents($handle, $head);
-				$end = stream_get_contents($handle, $tail, $size - $tail);
-				$bytes = $start === false || $end === false ? false : $start . $end;
-			}
+			// a byte more than asked: a file grown since the stat still reads as past
+			$bytes = stream_get_contents($handle, $max < PHP_INT_MAX ? $max + 1 : null);
 		}
 		finally
 		{
 			fclose($handle);
 		}
+		if($bytes === false)
+		{
+			return null;
+		}
 		
-		return $bytes === false ? null : $bytes;
+		return strlen($bytes) > $max ? strlen($bytes) : $bytes;
 	}
 	
 	/**
@@ -1087,6 +1207,30 @@ final class Facts
 		return $this->bodyRead;
 	}
 	
+	/**
+	 * The body as sent, whatever its type — what a platform module parses
+	 * the way its app does (WordPress's XML-RPC server reads php://input
+	 * whatever the Content-Type says) — read once when first asked, up to
+	 * what the input keeps (fromServer(): a byte past the largest cap); null
+	 * where the host hands none or it cannot be read
+	 */
+	public function raw(): ?string
+	{
+		return $this->kept('raw', function(): ?string
+		{
+			try
+			{
+				$raw = $this->rawReader === null ? null : ($this->rawReader)();
+			}
+			catch(Throwable)
+			{
+				$raw = null;
+			}
+			
+			return is_string($raw) ? $raw : null;
+		});
+	}
+	
 	public function bodyWasCapped(): bool
 	{
 		return $this->bodyCapped;
@@ -1215,32 +1359,30 @@ final class Facts
 	}
 	
 	/**
-	 * An upload's contents as a rule reads them, its head and tail
-	 * (FILE_HEAD, FILE_TAIL), read once; null when the host cannot read it.
-	 * A payload padded into the middle of a larger upload is never read, so a
-	 * file-content condition passes it
+	 * An upload's contents, read whole and once: its bytes, or the length of
+	 * one longer than $max, read only when a test may read that much; null
+	 * when the host cannot read it. A host's reader may hand more than it was
+	 * asked for: the bytes are kept, and their length tells the caller
 	 */
 	public function fileContent(
 		string $path,
-	): ?string
+		int $max = self::FILE_BUDGET,
+	): string|int|null
 	{
-		if(array_key_exists($path, $this->fileContents) === false)
+		$known = $this->fileContents[$path] ?? null;
+		// not asked yet, or a length this test may read now: the bytes, the host's failure and a length still past stand
+		if(array_key_exists($path, $this->fileContents) === false || (is_int($known) && $known <= $max))
 		{
 			try
 			{
-				$bytes = $this->fileReader === null ? null : ($this->fileReader)($path);
+				$bytes = $this->fileReader === null ? null : ($this->fileReader)($path, $max);
 			}
 			catch(Throwable)
 			{
 				$bytes = null;
 			}
-			$bytes = is_string($bytes) ? $bytes : null;
-			// a host's reader may hand the whole file: a rule reads its head and tail all the same
-			if($bytes !== null && strlen($bytes) > self::FILE_HEAD + self::FILE_TAIL)
-			{
-				$bytes = substr($bytes, 0, self::FILE_HEAD) . substr($bytes, -self::FILE_TAIL);
-			}
-			$this->fileContents[$path] = $bytes;
+			// a length is an upload left on disk; anything else is no answer
+			$this->fileContents[$path] = is_string($bytes) || (is_int($bytes) && $bytes >= 0) ? $bytes : null;
 		}
 		
 		return $this->fileContents[$path];
@@ -1627,6 +1769,9 @@ final class Ruleset
 	
 	public const VPATCHES_MAX = 100;
 	
+	/** the ids of rules a pull left out (dropped) a ruleset keeps and the next pull names (Kernel::HEADER_DROPPED) at most */
+	public const DROPPED_MAX = 100;
+	
 	/**
 	 * An ordinary visitor's request as a match rule's field reads it: the
 	 * home page, a current browser, no body. A match rule that holds on it
@@ -1660,6 +1805,8 @@ final class Ruleset
 	 * @param list<array<string, mixed>> $rules
 	 * @param list<string> $platforms the names of the platform modules the ruleset was pulled with: sealed into the record, and a
 	 *   kernel reads back only a record pulled with its own (fromRecord())
+	 * @param list<int> $dropped the ids of the rules the door served that this kernel left out: past RULES_MAX or VPATCHES_MAX,
+	 *   or refused by its own checks (wellFormed(), reachesEverything()) — at most DROPPED_MAX, in the door's order
 	 */
 	public function __construct(
 		public readonly array $rules,
@@ -1670,6 +1817,7 @@ final class Ruleset
 		public readonly string $version = '',
 		public readonly ?array $threats = null,
 		public readonly array $platforms = [],
+		public readonly array $dropped = [],
 	)
 	{
 	}
@@ -1704,7 +1852,8 @@ final class Ruleset
 	 * the rules as received — the same bytes the door hashes. The version is
 	 * the door's X-Shield-Version, '' when it said none. The threat section is
 	 * kept only whole — a mode, pass paths, addresses PHP can read (threats()).
-	 * A rule in the words of a platform module not given is left out too
+	 * A rule in the words of a platform module not given is left out too, and
+	 * every rule left out is named by its id (dropped)
 	 *
 	 * @param list<Platform> $platforms the modules whose words a rule may use
 	 */
@@ -1721,6 +1870,7 @@ final class Ruleset
 			&& is_array($payload['rules'] ?? null);
 		// the store keeps only these: fromRecord() checks the seal, not the rules, and a malformed rate rule would throw in judge() on every request (the Node twin checks on read)
 		$rules = [];
+		$dropped = [];
 		if($usable)
 		{
 			// the door's caps, in the door's order: what is past them is dropped
@@ -1728,14 +1878,17 @@ final class Ruleset
 			foreach($payload['rules'] as $rule)
 			{
 				// a match rule that would refuse every visitor is no door's to serve
-				if(self::wellFormed($rule, $platforms) === false
-					|| (self::isVpatch($rule) === false && self::isRate($rule) === false && self::reachesEverything($rule)))
+				$left = self::wellFormed($rule, $platforms) === false
+					|| (self::isVpatch($rule) === false && self::isRate($rule) === false && self::reachesEverything($rule));
+				$slot = $left === false && self::isVpatch($rule) ? 'vpatch' : 'match';
+				if($left || $kept[$slot] >= ($slot === 'vpatch' ? self::VPATCHES_MAX : self::RULES_MAX))
 				{
-					continue;
-				}
-				$slot = self::isVpatch($rule) ? 'vpatch' : 'match';
-				if($kept[$slot] >= ($slot === 'vpatch' ? self::VPATCHES_MAX : self::RULES_MAX))
-				{
+					// said at the next pull, so the door's count of what a site holds is the site's
+					if(is_array($rule) && is_int($rule['id'] ?? null) && count($dropped) < self::DROPPED_MAX)
+					{
+						$dropped[] = $rule['id'];
+					}
+					
 					continue;
 				}
 				$kept[$slot]++;
@@ -1752,7 +1905,7 @@ final class Ruleset
 			self::isVersion($version) ? $version : '', $usable ? self::threats($payload['threats'] ?? null) : null,
 			// an entry that is no module names nothing, as it keeps no rule (targetOf())
 			array_values(array_map(static fn(Platform $platform): string => $platform->name(),
-				array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform))));
+				array_filter($platforms, static fn(mixed $platform): bool => $platform instanceof Platform))), $dropped);
 	}
 	
 	/**
@@ -1803,6 +1956,8 @@ final class Ruleset
 			// stored as checked (a lookup map): read per request, never checked again
 			is_array($record['threats']['addresses'] ?? null) ? $record['threats'] : null,
 			$record['platforms'],
+			// a record from before the field drops nothing
+			array_values(array_filter(is_array($record['dropped'] ?? null) ? $record['dropped'] : [], is_int(...))),
 		);
 	}
 	
@@ -1883,6 +2038,7 @@ final class Ruleset
 			'platforms' => $this->platforms,
 			'threats' => $this->threats,
 			'usable' => $this->usable,
+			'dropped' => $this->dropped,
 			'rules' => $this->rules,
 		];
 		$record['seal'] = self::seal($record, $key);
@@ -1916,7 +2072,7 @@ final class Ruleset
 	): self
 	{
 		return new self($this->rules, $this->digest, $fetchedAt, $this->usable, $this->project,
-			self::isVersion($version) ? $version : $this->version, $this->threats, $this->platforms);
+			self::isVersion($version) ? $version : $this->version, $this->threats, $this->platforms, $this->dropped);
 	}
 	
 	/** a version is the door's sha256, lowercase hex */
@@ -1995,10 +2151,11 @@ final class Ruleset
 	
 	/**
 	 * Whether a vpatch entry selects the handler a request reaches — its
-	 * entry point: a platform module's target (a route), or an ENTRY_TESTS
-	 * test on a value as sent (no decode steps) of any target but an
-	 * upload's contents; a group when every member does. A negation, a
-	 * payload test, a nonce or exists says what the exploit carries
+	 * entry point: a platform module's frame target (a route), or an
+	 * ENTRY_TESTS test on a value as sent (no decode steps) of any target but
+	 * an upload's contents, a module's named one (`xmlrpc:0`) as a core
+	 * parameter; a group when every member does. A negation, a payload
+	 * test, a nonce or exists says what the exploit carries
 	 *
 	 * @param list<Platform> $platforms
 	 */
@@ -2021,17 +2178,51 @@ final class Ruleset
 		}
 		$target = (string)($entry['target'] ?? '');
 		
-		return self::targetOf($target, $platforms) !== null || (in_array($entry['test'] ?? null, self::ENTRY_TESTS, true) && ($entry['decode'] ?? []) === []
+		return self::frameOf($target, $platforms) !== null || (in_array($entry['test'] ?? null, self::ENTRY_TESTS, true) && ($entry['decode'] ?? []) === []
 			&& str_starts_with($target, 'file-content:') === false);
 	}
 	
 	/**
-	 * The module among $platforms whose targets() names a target; null when
-	 * none does — a target no module given names is never read
+	 * The module among $platforms that reads a target: one whose targets()
+	 * names it, or whose optional prefixes() names its prefix and a name
+	 * follows (`xmlrpc:0`); null when none does — a target no module given
+	 * names is never read
 	 *
 	 * @param list<Platform> $platforms
 	 */
 	public static function targetOf(
+		string $target,
+		array $platforms,
+	): ?Platform
+	{
+		$frame = self::frameOf($target, $platforms);
+		if($frame !== null)
+		{
+			return $frame;
+		}
+		$at = strpos($target, ':');
+		if($at === false || $at === strlen($target) - 1)
+		{
+			return null;
+		}
+		foreach($platforms as $platform)
+		{
+			if($platform instanceof Platform && method_exists($platform, 'prefixes') && in_array(substr($target, 0, $at), (array)$platform->prefixes(), true))
+			{
+				return $platform;
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * The module among $platforms whose targets() names a target, a frame
+	 * target of its own; null when none does
+	 *
+	 * @param list<Platform> $platforms
+	 */
+	public static function frameOf(
 		string $target,
 		array $platforms,
 	): ?Platform
@@ -2080,7 +2271,7 @@ final class Ruleset
 		array $platforms,
 	): bool
 	{
-		return in_array($target, self::TARGETS, true) || self::targetOf($target, $platforms) !== null;
+		return in_array($target, self::TARGETS, true) || self::frameOf($target, $platforms) !== null;
 	}
 	
 	/**
@@ -2256,8 +2447,8 @@ final class Ruleset
 	}
 	
 	/**
-	 * `method`, `path`, a module's own (`rest`), or a prefix and a name
-	 * (`query:file`); the keys targets may name the top level ('')
+	 * `method`, `path`, a module's own (`rest`, `xmlrpc:0`), or a prefix and
+	 * a name (`query:file`); the keys targets may name the top level ('')
 	 *
 	 * @param list<Platform> $platforms
 	 */
@@ -2270,7 +2461,7 @@ final class Ruleset
 		{
 			return false;
 		}
-		if(self::isFrame($target, $platforms))
+		if(self::isFrame($target, $platforms) || self::targetOf($target, $platforms) !== null)
 		{
 			return true;
 		}
@@ -2334,11 +2525,27 @@ final class RegexGate
 	public const LARGE_COUNT = 16;
 	
 	/**
-	 * The most choices a run of overlapping small counts may multiply to:
-	 * `\w{1,8}\w{1,8}` (64) and `\w{1,15}\w{1,15}` (225) pass, three
-	 * `\w{1,8}` (512) do not
+	 * The most choices a run of overlapping items may multiply to, an
+	 * alternation's branches and an unbounded item's LARGE_COUNT among them:
+	 * `\w+(?:a|b)(?:a|b)(?:a|b)(?:a|b)` (256) passes, `\w{1,8}` three times
+	 * over (512) does not
 	 */
 	public const BOUNDED_CHOICES_MAX = 256;
+	
+	/**
+	 * The most choices the counts in an overlapping run may multiply to on
+	 * their own — a small count's m-n+1, an optional item or group 2, an
+	 * alternation's branches and an unbounded item none: a near-miss tries
+	 * every split of the run at every byte, so `\w{1,4}\w{1,4}` (16) costs
+	 * 18 ms a MiB under PCRE's JIT, `\w{1,15}\w{1,15}` (225) 220 ms and V8
+	 * the same
+	 */
+	public const COUNT_CHOICES_MAX = 16;
+	
+	/** the overlap walk's conflicts: two unbounded quantifiers meeting, or a run past BOUNDED_CHOICES_MAX; a run of counts past COUNT_CHOICES_MAX */
+	protected const CONFLICT_OVERLAP = 'overlap';
+	
+	protected const CONFLICT_COUNTS = 'counts';
 	
 	/** a POSIX class's opening: read where the classes still stand, as it is a class's own spelling */
 	protected const POSIX_CLASS = '~\[\[:~';
@@ -2448,9 +2655,13 @@ final class RegexGate
 		}
 		// on the value itself: the parser reads each escape as its byte set; null when it cannot read the pattern
 		$overlapping = self::hasOverlappingQuantifiers($value, $ci);
-		if($overlapping === true)
+		if($overlapping === self::CONFLICT_OVERLAP)
 		{
 			return 'quantifiers that can match the same character back to back (`.*.*`, `\w+\w+`, a run of `\w{1,8}` past ' . self::BOUNDED_CHOICES_MAX . ' choices) backtrack polynomially in a backtracking engine — make their sets disjoint or bound them';
+		}
+		if($overlapping === self::CONFLICT_COUNTS)
+		{
+			return 'counts that can match the same character back to back (`\w{1,8}\w{1,8}`, three `\w{1,4}`) multiply past ' . self::COUNT_CHOICES_MAX . ' choices, every one of them tried at every byte of a near-miss — fewer choices, or sets that do not overlap';
 		}
 		// run on an empty subject: a pattern that does not compile is no rule
 		if(self::compiles($value, $ci) === false)
@@ -2762,18 +2973,21 @@ final class RegexGate
 	 * Small counts chain the same way and multiply: the choices of the
 	 * overlapping ones in a row (`\w{1,8}\w{1,8}` is 8 × 8) may not pass
 	 * BOUNDED_CHOICES_MAX, or forty `\w{1,15}` in 600 bytes would be the
-	 * same hang without a single large count.
+	 * same hang without a single large count; and the counts' own choices
+	 * in such a run, an alternation's branches and an unbounded item aside,
+	 * may not pass COUNT_CHOICES_MAX.
 	 *
 	 * Conservative: a set the parser cannot read exactly is every byte, a
 	 * repeated group is the union of everything inside it, `ci` folds the
 	 * letters. A pattern the parser cannot follow at all answers null, never
 	 * "no conflict": checkRegex() lets the compile check name a broken one
-	 * and refuses one that compiles.
+	 * and refuses one that compiles. '' is no conflict, else the first one
+	 * met (CONFLICT_OVERLAP, CONFLICT_COUNTS)
 	 */
 	protected static function hasOverlappingQuantifiers(
 		string $value,
 		bool $ci,
-	): ?bool
+	): ?string
 	{
 		$at = 0;
 		$tree = self::parseAlternation($value, $at, $ci);
@@ -2782,23 +2996,79 @@ final class RegexGate
 			return null;
 		}
 		
-		$conflict = false;
+		$conflict = '';
 		self::walkAlternation($tree, self::emptyChain(), $conflict);
 		
 		return $conflict;
 	}
 	
 	/**
+	 * The atoms one attempt of a pattern without a quantifier reads at one
+	 * start: an escape, a class or a byte is one, a zero-width assertion
+	 * none, a group its widest branch. Null for a pattern with any quantifier
+	 * — `* + ?` or a count, `{n}` too, which multiplies what one start reads
+	 * (`\w{2000}`) — and for one the parser cannot follow. Such a pattern
+	 * runs in a line on every engine, each start costing its atoms
+	 */
+	public static function width(
+		string $value,
+		bool $ci = true,
+	): ?int
+	{
+		$at = 0;
+		$tree = $value === '' ? null : self::parseAlternation($value, $at, $ci);
+		
+		return $tree === null || $at !== strlen($value) ? null : self::widthOf($tree);
+	}
+	
+	/**
+	 * width() over a parsed alternation: its widest branch, null once an item is quantified
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function widthOf(
+		array $branches,
+	): ?int
+	{
+		$widest = 0;
+		foreach($branches as $sequence)
+		{
+			$width = 0;
+			foreach($sequence as $item)
+			{
+				if($item['type'] === 'zero')
+				{
+					continue;
+				}
+				if($item['min'] !== 1 || $item['max'] !== 1)
+				{
+					return null;
+				}
+				$inner = $item['type'] === 'group' ? self::widthOf($item['branches']) : 1;
+				if($inner === null)
+				{
+					return null;
+				}
+				$width+= $inner;
+			}
+			$widest = max($widest, $width);
+		}
+		
+		return $widest;
+	}
+	
+	/**
 	 * What flows along a sequence: `open`, every byte an unbounded
 	 * quantifier still in reach could swallow; `chain`, the bytes of the
 	 * small counts in the current overlapping run, and `choices`, the
-	 * product of their choices
+	 * product of their choices; `countSet` and `counts`, the same run read
+	 * for its counts' own choices alone
 	 *
-	 * @return array{open: string, chain: string, choices: int}
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
 	 */
 	protected static function emptyChain(): array
 	{
-		return ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1];
+		return ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1, 'countSet' => str_repeat("\0", 256), 'counts' => 1];
 	}
 	
 	/**
@@ -2806,22 +3076,24 @@ final class RegexGate
 	 * branches' sets and the worst of their choices
 	 *
 	 * @param list<list<array>> $branches
-	 * @param array{open: string, chain: string, choices: int} $state
-	 * @return array{open: string, chain: string, choices: int}
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
 	 */
 	protected static function walkAlternation(
 		array $branches,
 		array $state,
-		bool &$conflict,
+		string &$conflict,
 	): array
 	{
-		$out = ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1];
+		$out = self::emptyChain();
 		foreach($branches as $sequence)
 		{
 			$exit = self::walkSequence($sequence, $state, $conflict);
 			$out['open'] |= $exit['open'];
 			$out['chain'] |= $exit['chain'];
 			$out['choices'] = max($out['choices'], $exit['choices']);
+			$out['countSet'] |= $exit['countSet'];
+			$out['counts'] = max($out['counts'], $exit['counts']);
 		}
 		
 		return $out;
@@ -2829,18 +3101,19 @@ final class RegexGate
 	
 	/**
 	 * An unbounded item meeting `open` is the conflict, and so is a run of
-	 * overlapping small counts past BOUNDED_CHOICES_MAX. An optional or
-	 * zero-width item leaves both runs open; a required item ends a run
-	 * only when that run cannot swallow the item's bytes
+	 * overlapping small counts past BOUNDED_CHOICES_MAX, or its counts past
+	 * COUNT_CHOICES_MAX. An optional or zero-width item leaves the runs
+	 * open; a required item ends a run only when that run cannot swallow
+	 * the item's bytes
 	 *
 	 * @param list<array> $sequence
-	 * @param array{open: string, chain: string, choices: int} $state
-	 * @return array{open: string, chain: string, choices: int}
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
 	 */
 	protected static function walkSequence(
 		array $sequence,
 		array $state,
-		bool &$conflict,
+		string &$conflict,
 	): array
 	{
 		foreach($sequence as $item)
@@ -2859,13 +3132,16 @@ final class RegexGate
 					$inner['open'] |= $state['open'];
 					$inner['chain'] |= $state['chain'];
 					$inner['choices'] = max($inner['choices'], $state['choices']);
+					$inner['countSet'] |= $state['countSet'];
+					$inner['counts'] = max($inner['counts'], $state['counts']);
 				}
 				// and is a choice itself: one way per branch, one more when it may
-				// be skipped — forty `(?:x)?` before a `y` are 2^40 ways on a near-miss
+				// be skipped — forty `(?:x)?` before a `y` are 2^40 ways on a near-miss;
+				// to the counts' run only the skip is a choice
 				$ways = count($item['branches']) + ($item['min'] === 0 ? 1 : 0);
 				if($ways > 1)
 				{
-					$inner = self::counted($inner, $item['set'], $ways, $item['min'] > 0 && $item['nullable'] === false, $conflict);
+					$inner = self::counted($inner, $item['set'], $ways, $item['min'] === 0 ? 2 : 1, $item['min'] > 0 && $item['nullable'] === false, $conflict);
 				}
 				$state = $inner;
 				
@@ -2880,7 +3156,7 @@ final class RegexGate
 			{
 				if($overlapsOpen)
 				{
-					$conflict = true;
+					$conflict = $conflict === '' ? self::CONFLICT_OVERLAP : $conflict;
 				}
 				// an optional one keeps the earlier runs in reach; a required one is the only run left
 				$state['open'] = $item['min'] === 0 ? $state['open'] | $set : $set;
@@ -2891,63 +3167,77 @@ final class RegexGate
 				$state['open'] = str_repeat("\0", 256);
 			}
 			
-			// an unbounded one weighs LARGE_COUNT in the counts' run, so
-			// `\w{1,15}\w{1,15}\w+` (225 × 16) is a conflict while `\w+\d{0,3}`
-			// (16 × 4) is not — the two unbounded ones meeting each other are
-			// `open`'s business
-			$state = self::counted($state, $set, $item['max'] === null ? self::LARGE_COUNT : $item['max'] - $item['min'] + 1, $required, $conflict);
+			// an unbounded one weighs LARGE_COUNT in the run, so `\w{1,15}\w{1,15}\w+`
+			// (225 × 16) is a conflict while `\w+\d{0,3}` (16 × 4) is not — the two
+			// unbounded ones meeting each other are `open`'s business — and nothing
+			// among the counts' own choices
+			$choices = $item['max'] === null ? 1 : $item['max'] - $item['min'] + 1;
+			$state = self::counted($state, $set, $item['max'] === null ? self::LARGE_COUNT : $choices, $choices, $required, $conflict);
 		}
 		
 		return $state;
 	}
 	
 	/**
-	 * The counts' run after one more item with $choices ways through it: an
-	 * item with a choice multiplies the run it overlaps or starts one, past
-	 * BOUNDED_CHOICES_MAX the conflict; a required item the run cannot
-	 * swallow ends it
+	 * The runs after one more item with $choices ways through it, $counts
+	 * of them its counts' own (run())
 	 *
-	 * @param array{open: string, chain: string, choices: int} $state
-	 * @return array{open: string, chain: string, choices: int}
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
 	 */
 	protected static function counted(
 		array $state,
 		string $set,
 		int $choices,
+		int $counts,
 		bool $required,
-		bool &$conflict,
+		string &$conflict,
 	): array
 	{
-		$overlapsChain = self::intersects($state['chain'], $set);
-		if($choices > 1)
+		[$state['chain'], $state['choices']] = self::run($state['chain'], $state['choices'], $set, $choices, $required);
+		[$state['countSet'], $state['counts']] = self::run($state['countSet'], $state['counts'], $set, $counts, $required);
+		if($conflict === '' && $state['choices'] > self::BOUNDED_CHOICES_MAX)
 		{
-			if($overlapsChain)
-			{
-				$state['choices']*= $choices;
-				$state['chain'] |= $set;
-			}
-			elseif($required)
-			{
-				$state['chain'] = $set;
-				$state['choices'] = $choices;
-			}
-			else
-			{
-				$state['chain'] |= $set;
-				$state['choices'] = max($state['choices'], $choices);
-			}
-			if($state['choices'] > self::BOUNDED_CHOICES_MAX)
-			{
-				$conflict = true;
-			}
+			$conflict = self::CONFLICT_OVERLAP;
 		}
-		elseif($required && $overlapsChain === false)
+		if($conflict === '' && $state['counts'] > self::COUNT_CHOICES_MAX)
 		{
-			$state['chain'] = str_repeat("\0", 256);
-			$state['choices'] = 1;
+			$conflict = self::CONFLICT_COUNTS;
 		}
 		
 		return $state;
+	}
+	
+	/**
+	 * One run — its bytes and the product of its choices — after one more
+	 * item with $choices ways through it: an item with a choice multiplies
+	 * the run it overlaps or starts one; a required item the run cannot
+	 * swallow ends it. The product stops one past BOUNDED_CHOICES_MAX, which
+	 * both runs' limits already refuse: forty `(?:x|xx|xxx)` would pass what
+	 * an integer holds
+	 *
+	 * @return array{string, int}
+	 */
+	protected static function run(
+		string $bytes,
+		int $product,
+		string $set,
+		int $choices,
+		bool $required,
+	): array
+	{
+		$overlaps = self::intersects($bytes, $set);
+		if($choices > 1)
+		{
+			if($overlaps)
+			{
+				return [$bytes | $set, min($product * $choices, self::BOUNDED_CHOICES_MAX + 1)];
+			}
+			
+			return $required ? [$set, $choices] : [$bytes | $set, max($product, $choices)];
+		}
+		
+		return $required && $overlaps === false ? [str_repeat("\0", 256), 1] : [$bytes, $product];
 	}
 	
 	/** whether two byte sets (256 bytes of "\0" or "\1") share a byte */
@@ -3724,6 +4014,13 @@ final class Kernel
 	 */
 	public const HEADER_PLATFORMS = 'X-Shield-Platforms';
 	
+	/**
+	 * the ids of the rules the last pull left out (Ruleset::$dropped), a
+	 * comma list each pull sends while the stored ruleset names any: a door
+	 * that knows it keeps what the site holds, any other ignores it
+	 */
+	public const HEADER_DROPPED = 'X-Shield-Dropped';
+	
 	public const PLATFORM_CORE = 'core';
 	
 	/** the rule the counting's heartbeat is an `entry` of, once per request it ran on: rule 0, the threat addresses', whose evidence nothing else counts */
@@ -3865,6 +4162,32 @@ final class Kernel
 	}
 	
 	/**
+	 * What X-Shield-Platforms names beside the core: each module's name, then
+	 * the words it reads beyond its first release (a module's optional
+	 * words(): WordPress's XML-RPC), so a door serves a rule in those words
+	 * only to a kernel that reads them
+	 *
+	 * @return list<string>
+	 */
+	protected function platformWords(): array
+	{
+		$words = [];
+		foreach($this->platforms as $platform)
+		{
+			$words[] = $platform->name();
+			foreach(method_exists($platform, 'words') ? (array)$platform->words() : [] as $word)
+			{
+				if(is_string($word) && $word !== '')
+				{
+					$words[] = $word;
+				}
+			}
+		}
+		
+		return $words;
+	}
+	
+	/**
 	 * The request as this kernel reads it: never with fewer platform modules
 	 * than it pulled for. Facts an adapter built without some of the
 	 * kernel's — none given, or a module's word where the module was meant —
@@ -3924,9 +4247,11 @@ final class Kernel
 	 * is over its limit, the same way; else a listed address the section
 	 * only observes, observed under its pseudo-rule — the rules judge it
 	 * first, so a blocking rule still blocks it and a rule's match is the
-	 * rule's. A rule the engine cannot run matches
-	 * nothing. The one side effect: a rate rule's predicate that matches
-	 * counts the request
+	 * rule's. A regex PCRE gives up on over a value is what the kernel did
+	 * not read whole: a vpatch's condition holds `unread` (patched()), a
+	 * match rule, which nothing pins, observes `unread`, held where it would
+	 * block; a rate rule's counts nothing. The one side effect: a rate rule's
+	 * predicate that matches counts the request
 	 */
 	public function judge(
 		Facts $facts,
@@ -3989,8 +4314,9 @@ final class Kernel
 				}
 			}
 			$rates = [];
-			[$subs, $unread] = self::subRequests($facts);
-			foreach($ruleset->rules as $rule)
+			[$subs, $unread, $failed] = self::subRequests($facts);
+			// the blocking rules first, whatever order they were served in: their tests read an upload before an observing one spends the budget
+			foreach(self::blockingFirst($ruleset->rules) as $rule)
 			{
 				// rate rules count only a request no match rule decided: judged after this loop
 				if(Ruleset::isRate($rule))
@@ -4016,7 +4342,7 @@ final class Kernel
 					// and not only logged; a body the kernel could not read holds unanswered
 					if($hit === null && self::reaches($rule, $facts, $unread))
 					{
-						$overflow = self::overflows($facts, $unread);
+						$overflow = self::overflows($facts, $unread, $failed);
 						$who = $overflow ? self::patched(['who' => $rule['who'] ?? '', 'conditions' => []], $facts) : null;
 						$hit = ['matched' => '', 'resolved' => $who !== null && $who['resolved'], 'unread' => $overflow];
 					}
@@ -4039,12 +4365,28 @@ final class Kernel
 					// an observe after a held vpatch: the earlier, held verdict wins
 					return $verdict->isBlock() ? $verdict : ($held ?? $verdict);
 				}
-				$matched = $this->matched($rule, $facts);
-				if($matched === null)
+				// its own name: $unread holds the modules whose sub-requests went unread, which every vpatch after it asks
+				$gaveUp = false;
+				$matched = $this->matched($rule, $facts, $gaveUp);
+				if($matched === null && $gaveUp === false)
 				{
 					continue;
 				}
 				$blocks = Ruleset::blocks($rule['mode'] ?? '') && $consent->blocks();
+				// a pattern the engine gave up on: no entry point pins a match rule, so it observes as an unpinned vpatch does, held
+				// where it would block (a later blocking rule still blocks), and says it read nothing whole
+				if($matched === null)
+				{
+					$unreadVerdict = new Verdict(Verdict::OBSERVE, $rule, '', Verdict::REASON_UNREAD);
+					if($blocks)
+					{
+						$held ??= $unreadVerdict;
+						
+						continue;
+					}
+					
+					return $held ?? $unreadVerdict;
+				}
 				$verdict = new Verdict($blocks ? Verdict::BLOCK : Verdict::OBSERVE, $rule, substr($matched, 0, self::MATCHED_MAX));
 				
 				return $verdict->isBlock() ? $verdict : ($held ?? $verdict);
@@ -4105,12 +4447,19 @@ final class Kernel
 		return ['id' => Ruleset::THREAT_RULE, 'kind' => Ruleset::KIND_THREAT, 'mode' => (string)$threats['mode']];
 	}
 	
-	/** a rule's predicate over the request: the fragment of the first of the field's subjects (Facts::subjects()) it matches, or null */
+	/**
+	 * A rule's predicate over the request: the fragment of the first of the
+	 * field's subjects (Facts::subjects()) it matches, or null; $unread says
+	 * whether PCRE gave up on a subject that matched nothing (its JIT stack,
+	 * its backtrack or recursion limit)
+	 */
 	protected function matched(
 		array $rule,
 		Facts $facts,
+		bool &$unread = false,
 	): ?string
 	{
+		$unread = false;
 		foreach($facts->subjects((string)$rule['field']) as $subject)
 		{
 			$matched = self::match($rule, $subject);
@@ -4118,6 +4467,7 @@ final class Kernel
 			{
 				return $matched;
 			}
+			$unread = $unread || (($rule['op'] ?? '') === Ruleset::OP_REGEX && preg_last_error() !== PREG_NO_ERROR);
 		}
 		
 		return null;
@@ -4308,8 +4658,14 @@ final class Kernel
 						continue 2;
 					}
 				}
+				$hit = self::patched($rule, $request);
+				// held on what was not read whole: neither honest traffic at the entry point nor a match as far as anyone knows
+				if($hit !== null && ($hit['unread'] ?? false))
+				{
+					continue;
+				}
 				$entry = $entry || $selecting !== [];
-				$matched ??= self::patched($rule, $request) === null ? null : $request;
+				$matched ??= $hit === null ? null : $request;
 			}
 			// held as judge() holds it: whose request it is says whether it was signed in
 			if($matched === null && self::reaches($rule, $facts, $unread))
@@ -4328,10 +4684,12 @@ final class Kernel
 	
 	/**
 	 * The requests inside this one that reach handlers of their own, as
-	 * every platform module given reads them (a WordPress batch's), and the
-	 * modules that could not read all of theirs
+	 * every platform module given reads them (a WordPress batch's), the
+	 * modules that could not read all of theirs, and those that threw
+	 * reading them: a module's fault costs the vpatches its sub-requests may
+	 * reach, which fail closed (overflows()), never the request
 	 *
-	 * @return array{list<Facts>, list<Platform>}
+	 * @return array{list<Facts>, list<Platform>, list<Platform>}
 	 */
 	public static function subRequests(
 		Facts $facts,
@@ -4342,9 +4700,18 @@ final class Kernel
 		{
 			$subs = [];
 			$unread = [];
+			$failed = [];
 			foreach($facts->platforms as $platform)
 			{
-				[$found, $cut] = $platform->subRequests($facts);
+				try
+				{
+					[$found, $cut] = $platform->subRequests($facts);
+				}
+				catch(Throwable)
+				{
+					[$found, $cut] = [[], true];
+					$failed[] = $platform;
+				}
 				$subs = [...$subs, ...$found];
 				if($cut)
 				{
@@ -4352,25 +4719,39 @@ final class Kernel
 				}
 			}
 			
-			return [$subs, $unread];
+			return [$subs, $unread, $failed];
 		});
 	}
 	
 	/**
 	 * Whether the sub-requests a module could not read run past the count the
 	 * module's platform itself refuses (Platform::overflows()), so a vpatch
-	 * they may reach fails closed
+	 * they may reach fails closed — as it does where a module threw reading
+	 * them ($failed) or asked how many there were
 	 *
 	 * @param list<Platform> $unread
+	 * @param list<Platform> $failed
 	 */
 	public static function overflows(
 		Facts $facts,
 		array $unread,
+		array $failed = [],
 	): bool
 	{
+		if($failed !== [])
+		{
+			return true;
+		}
 		foreach($unread as $platform)
 		{
-			if($platform->overflows($facts))
+			try
+			{
+				if($platform->overflows($facts))
+				{
+					return true;
+				}
+			}
+			catch(Throwable)
 			{
 				return true;
 			}
@@ -4381,7 +4762,8 @@ final class Kernel
 	
 	/**
 	 * Whether sub-requests a module could not read (subRequests()) may have
-	 * reached a vpatch — its own word, the one module that knows its handlers
+	 * reached a vpatch — its own word, the one module that knows its
+	 * handlers; one that throws answering may have
 	 *
 	 * @param list<Platform> $unread
 	 */
@@ -4393,7 +4775,14 @@ final class Kernel
 	{
 		foreach($unread as $platform)
 		{
-			if($platform->reaches($rule, $facts))
+			try
+			{
+				if($platform->reaches($rule, $facts))
+				{
+					return true;
+				}
+			}
+			catch(Throwable)
 			{
 				return true;
 			}
@@ -4535,7 +4924,7 @@ final class Kernel
 		};
 	}
 	
-	/** whether a target reads a secret's value: any cookie, a header or a parameter named like a secret, a parameter by a wildcard name */
+	/** whether a target reads a secret's value: any cookie, a header or a parameter named like a secret, a parameter by a wildcard name, any module's named one */
 	public static function secretTarget(
 		string $target,
 	): bool
@@ -4547,12 +4936,15 @@ final class Kernel
 		}
 		$name = substr($target, $at + 1);
 		
-		return match(substr($target, 0, $at))
+		$prefix = substr($target, 0, $at);
+		
+		return match($prefix)
 		{
 			'cookie' => true,
 			'header' => self::secretName($name),
 			'query', 'body', 'request', 'json', 'file' => str_contains($name, '*') || self::secretName($name),
-			default => false,
+			// a module's named target (`xmlrpc:2`) may be a password by its place alone
+			default => in_array($prefix, Ruleset::TARGET_PREFIXES, true) === false,
 		};
 	}
 	
@@ -4727,9 +5119,14 @@ final class Kernel
 	{
 		// both names of the key header: an instance older than the rename to
 		// codesafe reads only X-Console-Key
-		$platforms = implode(',', [self::PLATFORM_CORE, ...array_map(static fn(Platform $platform): string => $platform->name(), $this->platforms)]);
+		$platforms = implode(',', [self::PLATFORM_CORE, ...$this->platformWords()]);
 		$headers = ['X-Codesafe-Key: ' . $this->key, 'X-Console-Key: ' . $this->key, 'Accept: application/json',
 			self::HEADER_KINDS . ': ' . self::KINDS, self::HEADER_PLATFORMS . ': ' . $platforms];
+		// what the last pull left out, so the door knows the site does not hold it
+		if($current !== null && $current->dropped !== [])
+		{
+			$headers[] = self::HEADER_DROPPED . ': ' . implode(',', $current->dropped);
+		}
 		// the digest as the ETag: an unchanged ruleset answers 304
 		if($current !== null && $current->digest !== '')
 		{
@@ -4772,6 +5169,11 @@ final class Kernel
 		// stored even when unusable, so an unknown contract is not fetched again on every tick
 		$this->store->write($ruleset->toRecord($this->sealKey));
 		$this->rulesetRead = false;
+		if($ruleset->dropped !== [])
+		{
+			$this->log('pull kept ' . count($ruleset->rules) . ' rules and left out rule ' . implode(', ', $ruleset->dropped) . ': past the '
+				. Ruleset::RULES_MAX . ' match and rate rules or ' . Ruleset::VPATCHES_MAX . ' vpatches a kernel keeps, or refused by its own checks');
+		}
 		if($ruleset->usable === false)
 		{
 			$this->log('pull refused: contract ' . json_encode($payload['contract'] ?? null) . ' dialect ' . json_encode($payload['dialect'] ?? null));
@@ -4800,18 +5202,38 @@ final class Kernel
 	}
 	
 	/**
+	 * A ruleset's rules with those whose mode blocks first, each part in its
+	 * own order
+	 *
+	 * @param list<array<string, mixed>> $rules
+	 * @return list<array<string, mixed>>
+	 */
+	protected static function blockingFirst(
+		array $rules,
+	): array
+	{
+		$blocking = array_filter($rules, static fn(array $rule): bool => Ruleset::blocks($rule['mode'] ?? ''));
+		
+		return [...$blocking, ...array_diff_key($rules, $blocking)];
+	}
+	
+	/**
 	 * A vpatch over the request: the value that passed (a parameter's, else
 	 * the frame's) and whether all of it was answered — `who` and any nonce
 	 * test — or null when it does not hold. A request that is not signed in
 	 * lacks every capability; a signed-in one asks Facts::can(). A condition
 	 * over what the kernel did not read whole — a JSON body past
-	 * Facts::JSON_CAP, a form it parsed itself past Facts::FORM_CAP, a decode
-	 * step's values past Ruleset::DECODED_MAX or a module's own bound — is
-	 * answered as holding once an entry that held
-	 * answered pins the handler (pins()): the app reads it whole, and padding
-	 * must not turn a block into an observe; `unread` says the answer rests
-	 * on that. A rule's answer is kept for the request: tally() reads what
-	 * judge() read
+	 * Facts::JSON_CAP, a form it parsed itself past Facts::FORM_CAP, an
+	 * upload past what Facts::FILE_BUDGET left, a value a regex could not
+	 * run over, a decode step's values past Ruleset::DECODED_MAX or a
+	 * module's own bound — is answered as holding once an entry that held
+	 * answered pins the handler (pins()), or a module's frame entry the
+	 * kernel could not read does — an XML-RPC call past Facts::RAW_CAP is
+	 * still xmlrpc.php's: the app reads it whole, and padding must not turn
+	 * a block into an observe; `unread` says the answer rests on that. An
+	 * entry that throws is unread and pins nothing, so a module's fault costs
+	 * the rule judged, never the request. A rule's answer is kept for the
+	 * request: tally() reads what judge() read
 	 *
 	 * @return ?array{matched: string, resolved: bool, unread: bool}
 	 */
@@ -4874,7 +5296,15 @@ final class Kernel
 			...array_filter($entries, static fn(mixed $entry): bool => self::readsUpload($entry))];
 		foreach($entries as $entry)
 		{
-			$hit = self::held((array)$entry, $facts);
+			try
+			{
+				$hit = self::held((array)$entry, $facts);
+			}
+			catch(Throwable)
+			{
+				// a module or a test that throws costs this entry alone: unread, and it pins nothing
+				$hit = ['matched' => '', 'resolved' => false, 'unread' => true, 'frame' => false];
+			}
 			if($hit === null)
 			{
 				return null;
@@ -4887,7 +5317,8 @@ final class Kernel
 			{
 				$resolved = $resolved && $hit['resolved'];
 			}
-			$pinned = $pinned || ($hit['resolved'] && self::pins((array)$entry, $facts->platforms));
+			// a module's frame it could not read still names the handler family (an XML-RPC call is xmlrpc.php's whatever it holds)
+			$pinned = $pinned || (($hit['resolved'] || (($hit['unread'] ?? false) && $hit['frame'])) && self::pins((array)$entry, $facts->platforms));
 			// a method, path or route value only stands in when no parameter's value matched
 			if($hit['frame'])
 			{
@@ -4942,8 +5373,9 @@ final class Kernel
 	 * One entry: a plain condition, or a group — its first member that holds
 	 * answered, else its first that holds unanswered (a body or a decode step
 	 * the kernel could not read; no member waits on the host, a nonce test
-	 * never being in one) — with `frame` saying whether the holding target is
-	 * a frame target
+	 * never being in one), a frame member's before any other, as an unread
+	 * frame still names the handler — with `frame` saying whether the
+	 * holding target is a frame target
 	 *
 	 * @return ?array{matched: string, resolved: bool, frame: bool}
 	 */
@@ -4960,12 +5392,15 @@ final class Kernel
 			if($hit !== null)
 			{
 				$hit['frame'] = Ruleset::isFrame((string)($member['target'] ?? ''), $facts->platforms);
-				// an unread branch never answers for one that holds answered
+				// an unread branch never answers for one that holds answered; of the unread, a frame names the handler (patchedNow())
 				if($hit['resolved'])
 				{
 					return $hit;
 				}
-				$pending ??= $hit;
+				if($pending === null || ($hit['frame'] && $pending['frame'] === false))
+				{
+					$pending = $hit;
+				}
 			}
 		}
 		
@@ -4979,14 +5414,36 @@ final class Kernel
 	 * that is not there is an invalid one, and a present one needs the host,
 	 * and an upload the host cannot read holds unanswered where no value
 	 * passes; what the kernel did not read whole — a JSON body past the cap,
-	 * a form it parsed itself past Facts::FORM_CAP, a decode step's values
-	 * past DECODED_MAX or a module's own bound — holds the condition
-	 * unanswered where no value read passes and says so (`unread`), for
-	 * patched() to answer
+	 * a form it parsed itself past Facts::FORM_CAP, an upload past what
+	 * Facts::FILE_BUDGET left, any value a regex could not run over, a decode
+	 * step's values past DECODED_MAX or a module's own bound — holds the
+	 * condition unanswered where no value read passes and says so
+	 * (`unread`), for patched() to answer. One over the request's uploads is
+	 * answered once, whichever rule asks it
 	 *
 	 * @return ?array{matched: string, resolved: bool, unread?: true}
 	 */
 	public static function condition(
+		array $condition,
+		Facts $facts,
+	): ?array
+	{
+		if(str_starts_with((string)$condition['target'], 'file-content:') === false)
+		{
+			return self::conditionNow($condition, $facts);
+		}
+		$names = implode(',', array_map(static fn(Platform $platform): string => $platform->name(), $facts->platforms));
+		
+		// read and paid for once: three vpatches asking it at one handler spend the upload budget once
+		return $facts->keptShared('upload:' . hash('xxh3', $names . "\0" . serialize($condition)), static fn(): ?array => self::conditionNow($condition, $facts));
+	}
+	
+	/**
+	 * condition(), computed
+	 *
+	 * @return ?array{matched: string, resolved: bool, unread?: true}
+	 */
+	protected static function conditionNow(
 		array $condition,
 		Facts $facts,
 	): ?array
@@ -4997,26 +5454,36 @@ final class Kernel
 		{
 			return ['matched' => '', 'resolved' => false, 'unread' => true];
 		}
+		// a module's target over what the module did not read whole (WordPress's XML-RPC call past its bounds): the same
+		if(self::moduleUnread($target, $facts))
+		{
+			return ['matched' => '', 'resolved' => false, 'unread' => true];
+		}
 		// what the kernel did not read — the decode steps' values past the request's budget (Facts::DECODED_BUDGET) or a step's own
 		// bound, a form's pairs past Facts::FORM_CAP — may hold what no value read did: the condition holds unanswered and says so,
 		// for patched() to answer on a pinned handler
 		$cut = ['matched' => '', 'resolved' => false, 'unread' => true];
 		$formCut = self::readsForm($target) && $facts->formUnread();
-		// unreadable: an upload the host could not read — the host's failure, never a cap
-		[$values, $unreadable] = str_starts_with($target, 'file-content:')
-			? self::contents($facts, substr($target, strlen('file-content:'))) : [self::values($target, $facts), false];
 		$test = (string)$condition['test'];
+		$upload = str_starts_with($target, 'file-content:') ? substr($target, strlen('file-content:')) : null;
+		if($upload !== null && $test === 'exists')
+		{
+			// an upload is there whether or not it is read: its bytes are never needed
+			return self::uploaded($facts, $upload) ? ['matched' => '', 'resolved' => true] : null;
+		}
+		// unreadable: an upload the host could not read — the host's failure, never a cap; $fileCut: one past the upload budget
+		[$values, $unreadable, $fileCut] = $upload !== null
+			? self::contents($facts, $upload, Facts::fileWeight($test, self::widthOf($condition))) : [self::values($target, $facts), false, false];
 		if($test === 'exists')
 		{
-			// an upload that could not be read is there all the same
-			return $values === [] && $unreadable === false ? ($formCut ? $cut : null) : ['matched' => $values[0] ?? '', 'resolved' => true];
+			return $values === [] ? ($formCut ? $cut : null) : ['matched' => $values[0], 'resolved' => true];
 		}
 		if($test === 'nonce_invalid')
 		{
-			// no nonce sent is an invalid one, unless the form it would be in was cut
+			// no nonce sent is an invalid one, unless the form or the upload it would be in was cut
 			if($values === [])
 			{
-				return $formCut ? $cut : ['matched' => '', 'resolved' => true];
+				return $formCut || $fileCut ? $cut : ['matched' => '', 'resolved' => true];
 			}
 			$resolved = true;
 			foreach($values as $value)
@@ -5058,8 +5525,8 @@ final class Kernel
 					$pending ??= $unsafe === null ? $decoded : null;
 				}
 			}
-			// what a step left unread may hold
-			if($short)
+			// what a step left unread, or an upload past the budget, may hold
+			if($short || $fileCut)
 			{
 				return $cut;
 			}
@@ -5081,10 +5548,13 @@ final class Kernel
 				{
 					return ['matched' => $decoded, 'resolved' => true];
 				}
+				// a pattern PCRE gave up on (its JIT stack, its backtrack or recursion limit) answered neither yes nor no, whatever it read:
+				// `(ab)+c` does on 16 KiB of `ab` under the JIT
+				$short = $short || (($test === 'regex' || $test === 'not_regex') && preg_last_error() !== PREG_NO_ERROR);
 			}
 		}
-		// what a step left unread may hold
-		if($short)
+		// what a step left unread, an upload past the budget or a value past a pattern's reach may hold
+		if($short || $fileCut)
 		{
 			return $cut;
 		}
@@ -5099,6 +5569,32 @@ final class Kernel
 	): bool
 	{
 		return str_starts_with($target, 'body:') || str_starts_with($target, 'body-keys:') || str_starts_with($target, 'request:');
+	}
+	
+	/**
+	 * Whether the module that reads a target did not read it whole for this
+	 * request: its optional unread(), which a module without bounds of its
+	 * own does not have
+	 */
+	protected static function moduleUnread(
+		string $target,
+		Facts $facts,
+	): bool
+	{
+		$platform = Ruleset::targetOf($target, $facts->platforms);
+		
+		return $platform !== null && method_exists($platform, 'unread') && $platform->unread($target, $facts) === true;
+	}
+	
+	/** the atoms a regex test's pattern reads at one start where it holds no quantifier (RegexGate::width()); null for any other test or pattern */
+	protected static function widthOf(
+		array $condition,
+	): ?int
+	{
+		$test = (string)($condition['test'] ?? '');
+		
+		return ($test === 'regex' || $test === 'not_regex') && is_string($condition['value'] ?? null)
+			? RegexGate::width($condition['value'], ($condition['ci'] ?? true) === true) : null;
 	}
 	
 	/**
@@ -5182,29 +5678,47 @@ final class Kernel
 	}
 	
 	/**
-	 * An upload field's contents (Facts::fileContent()) and whether the host
-	 * could not read one; a failed upload, with no temp path, never reached
-	 * the app and is not there. A batch's sub-request has none of its own:
-	 * its handler reads its batch's, through the batch's own reads
+	 * An upload field's contents (Facts::fileContent()) as a test of this
+	 * weight reads them within Facts::FILE_BUDGET, each costing its size
+	 * times the weight, Facts::FILE_TEST_MIN at least; whether the host
+	 * could not read one; and whether one was past what the budget left. A
+	 * failed upload, with no temp path, never reached the app and is not
+	 * there. A batch's sub-request has none of its own: its handler reads
+	 * its batch's, through the batch's own reads
 	 *
-	 * @return array{list<string>, bool}
+	 * @return array{list<string>, bool, bool}
 	 */
 	public static function contents(
 		Facts $facts,
 		string $name,
+		int $weight = 1,
 	): array
 	{
 		$contents = [];
 		$unread = false;
+		$cut = false;
 		foreach(self::pick($facts->uploads, $name) as $path)
 		{
 			if($path === '')
 			{
 				continue;
 			}
-			$content = $facts->fileContent($path);
+			// past what the budget left for the least test: not even opened
+			if(Facts::FILE_TEST_MIN > $facts->fileRemaining())
+			{
+				$cut = true;
+				
+				continue;
+			}
+			// asked for no more than this test may still read: a longer upload answers its length and stays on disk
+			$content = $facts->fileContent($path, intdiv($facts->fileRemaining(), $weight));
 			$unread = $unread || $content === null;
-			if($content !== null)
+			// checked before it is spent: an upload cut leaves the budget to a smaller one after it
+			if(is_int($content) || (is_string($content) && $facts->spendFile(max(strlen($content) * $weight, Facts::FILE_TEST_MIN)) === false))
+			{
+				$cut = true;
+			}
+			else if($content !== null)
 			{
 				$contents[] = $content;
 			}
@@ -5212,12 +5726,30 @@ final class Kernel
 		$outer = $facts->outer();
 		if($outer === null)
 		{
-			return [$contents, $unread];
+			return [$contents, $unread, $cut];
 		}
 		// read once per request, however many sub-requests reach the rule
-		[$outers, $outerUnread] = self::contents($outer, $name);
+		[$outers, $outerUnread, $outerCut] = self::contents($outer, $name, $weight);
 		
-		return [[...$contents, ...$outers], $unread || $outerUnread];
+		return [[...$contents, ...$outers], $unread || $outerUnread, $cut || $outerCut];
+	}
+	
+	/** whether an upload field holds an upload with a temp path, its own or the batch's a sub-request came in */
+	protected static function uploaded(
+		Facts $facts,
+		string $name,
+	): bool
+	{
+		foreach(self::pick($facts->uploads, $name) as $path)
+		{
+			if($path !== '')
+			{
+				return true;
+			}
+		}
+		$outer = $facts->outer();
+		
+		return $outer !== null && self::uploaded($outer, $name);
 	}
 	
 	/**
