@@ -169,6 +169,7 @@ use function apcu_inc;
 use function apcu_store;
 use function array_diff;
 use function array_diff_key;
+use function array_fill;
 use function array_filter;
 use function array_is_list;
 use function array_key_exists;
@@ -176,6 +177,7 @@ use function array_keys;
 use function array_map;
 use function array_merge;
 use function array_pop;
+use function array_reduce;
 use function array_slice;
 use function array_unique;
 use function array_values;
@@ -229,7 +231,6 @@ use function method_exists;
 use function min;
 use function ord;
 use function parse_str;
-use function preg_last_error;
 use function preg_match;
 use function preg_match_all;
 use function preg_quote;
@@ -282,7 +283,7 @@ use const JSON_UNESCAPED_UNICODE;
 use const LOCK_EX;
 use const PCRE_JIT_SUPPORT;
 use const PHP_INT_MAX;
-use const PREG_NO_ERROR;
+use const PREG_OFFSET_CAPTURE;
 
 /**
  * A platform's kernel module: the vocabulary only its app gives a request a
@@ -439,8 +440,11 @@ final class Facts
 	 * what a test over an upload's bytes weighs against a literal one where
 	 * PCRE runs with its JIT, as PHP does by default: the markup and URL tests
 	 * run up to 46 ms a MiB and copy the value twice, the host's HTML filter
-	 * (wp_kses_post()) up to 6 s; every other test weighs 1, a regex too, as
-	 * the JIT runs the shapes the gate admits in a line (fileWeight())
+	 * (wp_kses_post()) up to 6 s; every other test weighs 1, a regex too: the
+	 * JIT runs `+` in a line, and a pattern at the gate's ceiling
+	 * (`\w{0,1023}x`) costs 0.57 s a MiB, so one such test over a 16 MiB
+	 * upload takes 9 s. A regex the JIT runs without its early exit
+	 * (RegexGate::loops()) weighs as without the JIT (fileWeight())
 	 */
 	public const FILE_WEIGHTS = ['has_markup' => 4, 'offsite' => 4, 'unsafe_html' => 512];
 	
@@ -448,10 +452,46 @@ final class Facts
 	 * the weights where PCRE runs without its JIT (pcre.jit off, or a PHP
 	 * built without it): the interpreter backtracks the shapes the gate
 	 * admits quadratically — `[a-z]+[0-9]*x` over 16 KiB of `a` takes 3.9 s,
-	 * over 1 KiB 15 ms — so a regex reads 2 KiB of a request's uploads;
-	 * has_markup's own patterns run 340 ms over 4 MiB there
+	 * over 1 KiB 15 ms — so a regex with `+` reads 2 KiB of a request's
+	 * uploads, one of counts alone weighs this times its cost over
+	 * RegexGate::RUN_COST_MAX (Kernel::weighted()); has_markup's own
+	 * patterns run 340 ms over 4 MiB there
 	 */
 	public const FILE_WEIGHTS_INTERPRETED = ['regex' => 8192, 'not_regex' => 8192, 'has_markup' => 8];
+	
+	/**
+	 * without PCRE's JIT, a quantified regex reads at most this many bytes
+	 * of a longer value that is no upload and that it may not read whole
+	 * (REGEX_WHOLE_MAX_INTERPRETED, REGEX_WHOLE_BYTES_INTERPRETED,
+	 * REGEX_WHOLE_BUDGET_INTERPRETED), as the
+	 * Node twin does: the interpreter backtracks the shapes the gate admits
+	 * quadratically and pcre.backtrack_limit counts a start at a time, so it
+	 * never stops them (`\w+x` over 64 KiB: 27 s). Past the cut a vpatch's
+	 * condition that matched nothing is unread (the pinned handler refuses,
+	 * any other observes), a match rule matches nothing; a pattern without a
+	 * quantifier reads any value whole, and with the JIT every pattern does
+	 * but one it runs without its early exit (RegexGate::loops())
+	 */
+	public const REGEX_SUBJECT_CAP = 1024;
+	
+	/**
+	 * the longest value a quantified regex reads whole without the JIT, its
+	 * bytes weighted by the pattern's cost (Kernel::weighted()): `\w+x` and
+	 * `\w{1,4}\w{0,255}x` over 2 KiB 23 ms, the 1 KiB cut at most 28 ms
+	 */
+	public const REGEX_WHOLE_MAX_INTERPRETED = 2048;
+	
+	/**
+	 * the most bytes a quantified regex reads whole without the JIT,
+	 * whatever its cost: the cost is a model, and this bounds what its error
+	 * can cost. It meets REGEX_WHOLE_MAX_INTERPRETED at a cost of 128, where
+	 * `\w{0,127}x` takes the interpreter 24 ms over it; a pattern at the
+	 * gate's ceiling would take 190 ms
+	 */
+	public const REGEX_WHOLE_BYTES_INTERPRETED = 16384;
+	
+	/** the weighted bytes a request's quantified regexes read whole past REGEX_SUBJECT_CAP without the JIT, every condition and match rule together: about 100 ms */
+	public const REGEX_WHOLE_BUDGET_INTERPRETED = 8192;
 	
 	/**
 	 * what each atom of a regex without a quantifier weighs where PCRE runs
@@ -514,6 +554,9 @@ final class Facts
 	
 	/** the upload bytes spent so far (spendFile()); a sub-request's and a copy's is its request's */
 	protected int $fileSpent = 0;
+	
+	/** the weighted bytes quantified regexes read whole so far without the JIT (spendRegex()); a sub-request's and a copy's is its request's */
+	protected int $regexSpent = 0;
 	
 	/** @var array<string, mixed> what was computed once for this request (kept()): what judge() read, tally() reads again for free */
 	protected array $kept = [];
@@ -680,22 +723,57 @@ final class Facts
 	}
 	
 	/**
+	 * Whether a quantified regex may read a value of these weighted bytes
+	 * whole without the JIT, which are spent only then: against
+	 * REGEX_WHOLE_BUDGET_INTERPRETED
+	 */
+	public function spendRegex(
+		int $bytes,
+	): bool
+	{
+		$root = $this->root ?? $this;
+		if($bytes > self::REGEX_WHOLE_BUDGET_INTERPRETED - $root->regexSpent)
+		{
+			return false;
+		}
+		$root->regexSpent+= $bytes;
+		
+		return true;
+	}
+	
+	/** whether PCRE runs with its JIT here: built in and pcre.jit on */
+	public static function jit(): bool
+	{
+		return PCRE_JIT_SUPPORT && filter_var(ini_get('pcre.jit'), FILTER_VALIDATE_BOOLEAN);
+	}
+	
+	/**
 	 * What a test over an upload's bytes weighs on the engine that runs it:
 	 * PCRE's interpreter where its JIT is off or not built in, a regex there
-	 * by its atoms when it holds no quantifier ($width, RegexGate::width())
+	 * by its $pattern (Kernel::weighs()) — its atoms when it holds no
+	 * quantifier, else FILE_WEIGHTS_INTERPRETED weighted by its cost; a
+	 * regex test without a pattern weighs as one with `+`
 	 */
 	public static function fileWeight(
 		string $test,
-		?int $width = null,
+		?string $pattern = null,
+		bool $ci = true,
 	): int
 	{
-		$jit = PCRE_JIT_SUPPORT && filter_var(ini_get('pcre.jit'), FILTER_VALIDATE_BOOLEAN);
-		if($jit === false && isset(self::FILE_WEIGHTS_INTERPRETED[$test]))
+		// the JIT runs a pattern without its early exit as slowly as the interpreter does (RegexGate::loops())
+		$loops = $pattern !== null && ($test === 'regex' || $test === 'not_regex') && Kernel::weighs($pattern, $ci)['loops'];
+		if((self::jit() === false || $loops) && isset(self::FILE_WEIGHTS_INTERPRETED[$test]))
 		{
-			// a pattern without a quantifier reads each start once over: its atoms set its cost, never past a quantified one's
-			$linear = ($test === 'regex' || $test === 'not_regex') && $width !== null;
+			if(($test !== 'regex' && $test !== 'not_regex') || $pattern === null)
+			{
+				return self::FILE_WEIGHTS_INTERPRETED[$test];
+			}
+			$width = Kernel::weighs($pattern, $ci)['width'];
 			
-			return $linear ? min(self::FILE_WEIGHTS_INTERPRETED[$test], max(1, self::LINEAR_ATOM_WEIGHT * $width)) : self::FILE_WEIGHTS_INTERPRETED[$test];
+			// a pattern without a quantifier reads each start once over: its atoms set its cost, never past a quantified one's
+			return $width !== null
+				? min(self::FILE_WEIGHTS_INTERPRETED[$test], max(1, self::LINEAR_ATOM_WEIGHT * $width))
+				: Kernel::weighted(self::FILE_WEIGHTS_INTERPRETED[$test], $pattern, $ci);
 		}
 		
 		return self::FILE_WEIGHTS[$test] ?? 1;
@@ -2546,13 +2624,17 @@ final class Ruleset
  * The regex gate of the rule dialect: the RE2-safe subset both engines read
  * alike, and nothing a backtracking engine runs in more than polynomial
  * time: no nested quantifier, no alternation inside a repeated group, at
- * most UNBOUNDED_MAX unbounded quantifiers, none that overlap. codesafe's
+ * most UNBOUNDED_MAX unbounded quantifiers, none that overlap, none of
+ * the shapes the cost cannot weigh (shape()) or PCRE's JIT runs without
+ * its early exit behind a group of varying count (behindVarying()), and
+ * no start that costs more than RUN_COST_MAX (cost()). codesafe's
  * gate (Codesafe\Shield\Dialect::checkRegex()) answers with this class, and
  * a kernel holds every pulled regex to it (Ruleset::wellFormed(),
  * Ruleset::conditionWellFormed()), so a pattern an outdated, mistaken or
  * hostile codesafe serves never runs here: in PHP it fails open at
  * pcre.backtrack_limit, and in the Node twin (client-node/shield.mjs) it
- * would hold the event loop. Pure; asked at a pull, never per request
+ * would hold the event loop. Pure; the gate is asked at a pull, width()
+ * and cost() by the byte budgets too, once per pattern (Kernel::weighs())
  */
 final class RegexGate
 {
@@ -2570,8 +2652,9 @@ final class RegexGate
 	 * A count `{n,m}` (lazy or not) with m at least this many is unbounded to
 	 * the gate — in the UNBOUNDED_MAX count and in the overlap check alike:
 	 * `\w{0,300}\w{0,300}\w{0,300}x` carries no `*` or `+` and backtracks as
-	 * badly in V8. An exact `{n}` has no choice to backtrack over and stays
-	 * bounded whatever its n
+	 * badly in V8. An exact `{n}` has no choice to backtrack over and is
+	 * never unbounded here, whatever its n; cost() weighs both by what they
+	 * read: `\w{1,8}\w{0,500}x` and `\w{1,8}\w{500}x` read 4000 ways a start
 	 */
 	public const LARGE_COUNT = 16;
 	
@@ -2589,17 +2672,114 @@ final class RegexGate
 	 * alternation's branches and an unbounded item none: a near-miss tries
 	 * every split of the run at every byte, so `\w{1,4}\w{1,4}` (16) costs
 	 * 18 ms a MiB under PCRE's JIT, `\w{1,15}\w{1,15}` (225) 220 ms and V8
-	 * the same
+	 * the same. A large count is RUN_COST_MAX's to weigh
 	 */
 	public const COUNT_CHOICES_MAX = 16;
+	
+	/**
+	 * The most one start of a pattern may cost (cost()): a near-miss pays it
+	 * at every byte. At 1024, the weights calibrated on each engine timed
+	 * alone, a MiB costs PCRE's JIT about 0.47 s (up to 0.8 s in a worker
+	 * where the compiled code lands badly) and V8 3.6 s, PCRE's
+	 * interpreter 21 ms over its 2 KiB read; the live rules reach 716 (rule
+	 * 109, its `=src=` prefix credited). 512 would refuse two of them
+	 */
+	public const RUN_COST_MAX = 1024;
+	
+	/**
+	 * What an unbounded quantifier (`*`, `+`, `{n,}`) weighs in the gate's
+	 * cost: four ways may share its run (`\w+\d{0,3}=`), five may not
+	 * (`\w{1,5}\w+x`). The byte budgets weigh it RUN_COST_MAX, as it reads
+	 * the rest of the subject
+	 */
+	public const UNBOUNDED_REACH = 256;
+	
+	/**
+	 * What a count right behind a separator its set cannot match multiplies
+	 * its run by, whatever the count: the separator fixes where it starts,
+	 * so `[\w.]{0,200}\.\w{1,8}x` costs about four times `[\w.]{0,200}`
+	 * (3.6 under PCRE's JIT, the worst measured), not eight
+	 */
+	public const SEPARATED_WAYS = 4;
+	
+	/**
+	 * The most atoms the body of a repeated group (`(…){n}`, `{n,m}`, `*`,
+	 * `+`) may hold: each repetition reads them all again, so the body
+	 * multiplies what one start reads. The live rules repeat three
+	 * (`(\.\.[/\\]){3}`), the drafts none
+	 */
+	public const REPEATED_GROUP_ATOMS_MAX = 4;
+	
+	/**
+	 * What one unit of a count's reach weighs in cost(), in eighths: a
+	 * multiple of the unit, a count over a shorthand, `.` or a negated byte
+	 * whose backtrack compares one byte or nothing it holds (`\w{0,1023}x`,
+	 * `[^/]{0,1023}=`; per unit and MiB of a near-miss PCRE's JIT 0.45 ms,
+	 * V8 3.5, the interpreter 11.7). Each is the slowest engine's multiple
+	 * behind seven count sets at 255 and 1023, every engine timed alone —
+	 * PCRE's JIT throughout: V8 stays under 2.3, the interpreter under 7
+	 */
+	protected const WEIGHTS = [
+		'unit' => 8,
+		// the count's set is a class of two or more members (`[a-z]`, `[\w.]`): 1.1-1.6
+		'class' => 14,
+		// a repeated group (`(?:\w)*`): the interpreter 1.3-1.7 a count's time
+		'repeat' => 14,
+		// a lazy count: 1.5-2.7, whatever it tests
+		'lazy' => 23,
+		// each step of the backtrack tests `$`: 1.0-3.0
+		'end' => 25,
+		// a class, a shorthand or a negated byte it holds (`[xy]`, `\d`, `[^a]`): 2.1-3.6; behind a count, a byte it holds
+		// with more of the pattern behind, which each step passes where a near-miss repeats it: 2.5-3.4 a way, whatever the
+		// row's length (`a#`, `ax`, `aax`, `abcx`), so shared over the compares the row counts
+		'test' => 28,
+		// `\b`: 4.9-6.1
+		'boundary' => 52,
+		// an optional byte, then what follows it (`x?=`, `-?x`): 2.7-3.6, half of it the row's second way
+		'optional' => 20,
+		// a count it holds, exact or not (`x{2}`, `[a-z]{1,2}`): 2.3-3.5 a way it makes
+		'count' => 32,
+		// an alternation of 2, 4, 8 branches: 3.3-4.6, 4.3-5.2, 6.8-8.9, so 4 and 0.75 a way into it
+		'group' => 32,
+		'way' => 6,
+	];
+	
+	/**
+	 * What one start of a branch anchored at `^` is spread over in cost(): a
+	 * kernel runs a rule's regex once from the subject's start, without the
+	 * `m` flag (Kernel::regexPattern()), so the branch starts there alone. Its
+	 * unbounded quantifiers read this many bytes, and its cost grows with
+	 * them at most once over (two multiplied pass COST_SATURATION), so a
+	 * longer subject costs no more a byte
+	 */
+	protected const ANCHORED_BYTES = 1024;
+	
+	/**
+	 * The most atoms and texts of a branch's literal prefix period() reads:
+	 * the first atoms of a prefix are one too, and no period passes the
+	 * shortest text. The live rules open with up to 10 texts
+	 * (`=["']?(?:href|src|action|extsrc|asyncsrc)=`)
+	 */
+	protected const PREFIX_ATOMS_MAX = 16;
+	
+	protected const PREFIX_TEXTS_MAX = 16;
+	
+	/** a class of one member, `^` captured: its byte, or every byte but it */
+	protected const ONE_MEMBER = '~\G\[(\^?)(?:\\\\x[0-9a-fA-F]{2}|\\\\[^dDwWsS]|[^\\\\\]])\]~';
+	
+	/** where a cost stops growing: far past RUN_COST_MAX, and an integer in both twins */
+	protected const COST_SATURATION = 1048576;
 	
 	/** the overlap walk's conflicts: two unbounded quantifiers meeting, or a run past BOUNDED_CHOICES_MAX; a run of counts past COUNT_CHOICES_MAX */
 	protected const CONFLICT_OVERLAP = 'overlap';
 	
 	protected const CONFLICT_COUNTS = 'counts';
 	
-	/** a POSIX class's opening: read where the classes still stand, as it is a class's own spelling */
-	protected const POSIX_CLASS = '~\[\[:~';
+	/**
+	 * a POSIX class's opening, or a `[` that PCRE reads as one (`[=a=]`, `[.a.]`, `[:a:]`, inside a class or not), which
+	 * it refuses to compile and JavaScript takes as plain members: read where the classes still stand, as it is a class's own spelling
+	 */
+	protected const POSIX_CLASS = '~\[\[:|\[([:.=])[^\]]*?\1\]~';
 
 	/** a character class, read as one atom by the construct checks: `[*+]` and `[(?]` are sets of characters, no quantifier and no group */
 	protected const CLASS_ATOM = '~\[\^?\]?[^\]]*\]~';
@@ -2684,9 +2864,17 @@ final class RegexGate
 				return $reason . ' is not in the ' . Ruleset::DIALECT . ' dialect';
 			}
 		}
+		if(self::hasRepeatedName($bare))
+		{
+			return 'a group name used twice compiles in JavaScript and not in PCRE — name each group once';
+		}
 		if(self::hasBracketLedClass($bare))
 		{
 			return 'a class that opens with `]` (`[]a]`, `[^]a]`) is a literal `]` to PCRE and an empty or any-byte class to JavaScript — write `\]`';
+		}
+		if(self::hasShorthandRange($value))
+		{
+			return 'a class range from a shorthand (`[\w-z]`) does not compile in PCRE and is three members to JavaScript — escape the `-` (`[\w\-z]`)';
 		}
 		if(self::hasLooseCount($bare))
 		{
@@ -2704,6 +2892,11 @@ final class RegexGate
 		{
 			return 'more than ' . self::UNBOUNDED_MAX . ' unbounded quantifiers (`* + {n,}`, and a `{n,m}` with m of ' . self::LARGE_COUNT . ' or more) backtrack polynomially in a backtracking engine';
 		}
+		$shape = self::shape($value, $ci);
+		if($shape !== null)
+		{
+			return $shape;
+		}
 		// on the value itself: the parser reads each escape as its byte set; null when it cannot read the pattern
 		$overlapping = self::hasOverlappingQuantifiers($value, $ci);
 		if($overlapping === self::CONFLICT_OVERLAP)
@@ -2713,6 +2906,14 @@ final class RegexGate
 		if($overlapping === self::CONFLICT_COUNTS)
 		{
 			return 'counts that can match the same character back to back (`\w{1,8}\w{1,8}`, three `\w{1,4}`) multiply past ' . self::COUNT_CHOICES_MAX . ' choices, every one of them tried at every byte of a near-miss — fewer choices, or sets that do not overlap';
+		}
+		if(self::behindVarying($value, $ci))
+		{
+			return 'an unbounded quantifier behind or inside a group of varying count (`(?:a)?\w+`, `(?:\w+=)?`) is quadratic under PCRE\'s JIT — anchor the pattern with `^`, give the group one count, or bound the quantifier';
+		}
+		if((self::cost($value, $ci) ?? 0) > self::RUN_COST_MAX)
+		{
+			return 'one start can read more than ' . self::RUN_COST_MAX . ' bytes of work: a count beside another that can match the same character multiplies (`\w{1,8}\w{0,200}`, `\w+\w{16}`), and one over a class or before `\b`, `$` or an alternation weighs more — shorten a count, put a character between them the next one cannot match, or open the pattern with fixed text (`src=`) or `^`';
 		}
 		// run on an empty subject: a pattern that does not compile is no rule
 		if(self::compiles($value, $ci) === false)
@@ -2956,6 +3157,19 @@ final class RegexGate
 	}
 	
 	/**
+	 * Whether two groups carry one name: PCRE refuses to compile it, and V8
+	 * takes it across alternatives (`(?<n>a)|(?<n>b)`)
+	 */
+	protected static function hasRepeatedName(
+		string $bare,
+	): bool
+	{
+		preg_match_all('~\(\?<([A-Za-z_]\w*)>~', $bare, $names);
+		
+		return count($names[1]) !== count(array_unique($names[1]));
+	}
+	
+	/**
 	 * A class whose first member (after a `^`) is a bare `]`: `[]a]` is the
 	 * class of `]` and `a` to PCRE, an empty class and the text `a]` to
 	 * JavaScript, and `[^]a]` any byte there — on the pattern with escapes
@@ -2982,6 +3196,330 @@ final class RegexGate
 		}
 		
 		return false;
+	}
+	
+	/**
+	 * A class range with a shorthand (`\d \D \w \W \s \S`) at either end:
+	 * `[\w-z]`, `[a-\d]` — PCRE refuses to compile it, JavaScript reads the
+	 * shorthand, a `-` and the other end. On the value itself, an escape
+	 * read whole; a `-` first or last in the class is a literal
+	 */
+	protected static function hasShorthandRange(
+		string $value,
+	): bool
+	{
+		$n = strlen($value);
+		for($i = 0; $i < $n; $i++)
+		{
+			if($value[$i] === '\\')
+			{
+				$i++;
+				
+				continue;
+			}
+			if($value[$i] !== '[')
+			{
+				continue;
+			}
+			$j = $i + 1;
+			if(($value[$j] ?? '') === '^')
+			{
+				$j++;
+			}
+			// whether the member before is a shorthand; null where no member may start a range
+			$previous = null;
+			$first = true;
+			while($j < $n && ($value[$j] !== ']' || $first))
+			{
+				$first = false;
+				if($value[$j] === '-' && $previous !== null && ($value[$j + 1] ?? ']') !== ']')
+				{
+					if($previous || ($value[$j + 1] === '\\' && self::isShorthand($value[$j + 2] ?? '')))
+					{
+						return true;
+					}
+					// past the range's other end, which starts no range itself
+					$j+= $value[$j + 1] !== '\\' ? 2 : (($value[$j + 2] ?? '') === 'x' ? 5 : 3);
+					$previous = null;
+					
+					continue;
+				}
+				if($value[$j] === '\\')
+				{
+					$previous = self::isShorthand($value[$j + 1] ?? '');
+					$j+= ($value[$j + 1] ?? '') === 'x' ? 4 : 2;
+					
+					continue;
+				}
+				$previous = false;
+				$j++;
+			}
+			$i = $j;
+		}
+		
+		return false;
+	}
+	
+	/** whether the letter after a backslash names a shorthand class */
+	protected static function isShorthand(
+		string $letter,
+	): bool
+	{
+		return $letter !== '' && str_contains('dDwWsS', $letter);
+	}
+	
+	/**
+	 * The shapes the gate refuses on the parsed pattern, each with its
+	 * reason: two branches of one alternation that read the same text, an
+	 * empty group, a `{0}` count, a group that can match nothing yet is not
+	 * optional itself, a group repeated a varying number of times up to
+	 * LARGE_COUNT or more, a repeated group of more than
+	 * REPEATED_GROUP_ATOMS_MAX atoms. Null when none is there, or when the
+	 * parser cannot read the pattern (refusal() names that later)
+	 */
+	protected static function shape(
+		string $value,
+		bool $ci,
+	): ?string
+	{
+		$at = 0;
+		$tree = self::parseAlternation($value, $at, $ci);
+		if($tree === null || $at !== strlen($value))
+		{
+			return null;
+		}
+		
+		return self::shapeOf($tree);
+	}
+	
+	/**
+	 * Whether a branch not anchored at the subject's start holds an
+	 * unbounded quantifier behind a group of varying count (varied()); one
+	 * anchored is tried at one position only. False when the parser cannot
+	 * read the pattern
+	 */
+	protected static function behindVarying(
+		string $value,
+		bool $ci,
+	): bool
+	{
+		$at = 0;
+		$tree = self::parseAlternation($value, $at, $ci);
+		if($tree === null || $at !== strlen($value))
+		{
+			return false;
+		}
+		foreach($tree as $sequence)
+		{
+			$anchored = ($sequence[0]['type'] ?? '') === 'zero' && $sequence[0]['anchor'] === '^';
+			if($anchored === false && self::varied($sequence, false)[0])
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * Whether an unbounded quantifier (`*`, `+`, `{n,}`) follows a group
+	 * whose count varies (`?`, `{1,2}`) in a sequence, or stands inside one,
+	 * $varying saying one stood before it already: PCRE's JIT gives up its
+	 * early exit from a failed start past such a group, so the quantifier
+	 * reads to the end of its run from every start (`(?:a)?\S+=` over
+	 * 256 KiB of `a`: 15 s; `(?:[a-z]*?\t|\s)??\s` over 64 KiB 1 s). Also
+	 * whether the sequence holds such a group, for what follows it
+	 *
+	 * @param list<array> $sequence
+	 * @return array{bool, bool}
+	 */
+	protected static function varied(
+		array $sequence,
+		bool $varying,
+	): array
+	{
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				continue;
+			}
+			if($item['type'] === 'set')
+			{
+				if($varying && $item['reach'] === null)
+				{
+					return [true, true];
+				}
+				
+				continue;
+			}
+			$inside = false;
+			foreach($item['branches'] as $branch)
+			{
+				[$found, $holds] = self::varied($branch, $varying || $item['min'] !== $item['max']);
+				if($found)
+				{
+					return [true, true];
+				}
+				$inside = $inside || $holds;
+			}
+			$varying = $varying || $inside || $item['min'] !== $item['max'];
+		}
+		
+		return [false, $varying];
+	}
+	
+	/**
+	 * shape() over a parsed alternation, the groups inside it included
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function shapeOf(
+		array $branches,
+	): ?string
+	{
+		if(self::repeats($branches))
+		{
+			return 'two branches that can read the same text (`(?:a|a)`, `(?:ab|a[bc])`) are tried at every way into them — drop the one the other covers';
+		}
+		foreach($branches as $sequence)
+		{
+			foreach($sequence as $item)
+			{
+				if($item['type'] === 'zero')
+				{
+					continue;
+				}
+				if($item['type'] === 'group' && array_filter($item['branches']) === [])
+				{
+					return 'an empty group (`()`, `(?:)`) matches nothing — drop it';
+				}
+				if($item['max'] === 0)
+				{
+					return 'a `{0}` count matches nothing — drop the item it counts';
+				}
+				if($item['type'] !== 'group')
+				{
+					continue;
+				}
+				// its skip is then plain to see: the cost model weighs every way past an optional item
+				if($item['min'] > 0 && self::matchesNothing($item['branches']))
+				{
+					return 'a group that can match nothing (`(a|)`, `(a?)`) must be optional itself — write `(a)?`';
+				}
+				if($item['reach'] !== null && $item['reach'] >= self::LARGE_COUNT && $item['min'] !== $item['reach'])
+				{
+					return 'a group repeated up to ' . self::LARGE_COUNT . ' times or more (`(?:ab){0,100}`) is tried again at every repetition by PCRE — repeat a class, or count to ' . (self::LARGE_COUNT - 1) . ' at most';
+				}
+				if(($item['max'] === null || $item['max'] > 1) && self::atomsOf($item['branches']) > self::REPEATED_GROUP_ATOMS_MAX)
+				{
+					return 'a repeated group (`(…){n}`, `(…)+`) of more than ' . self::REPEATED_GROUP_ATOMS_MAX . ' atoms reads them all again at every repetition — repeat a class, or write the atoms out';
+				}
+				$inner = self::shapeOf($item['branches']);
+				if($inner !== null)
+				{
+					return $inner;
+				}
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * Whether two branches of an alternation can read the same text
+	 * (texts()): each is a way into what follows, so `(?:,|,|,)` makes every
+	 * way that reaches it three. Branches with a count or a group inside are
+	 * left to the cost model
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function repeats(
+		array $branches,
+	): bool
+	{
+		$texts = array_values(array_filter(array_map(self::texts(...), $branches), static fn(?array $text): bool => $text !== null));
+		foreach($texts as $i => $text)
+		{
+			foreach(array_slice($texts, $i + 1) as $other)
+			{
+				if(self::alike($text, $other))
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * Whether a branch of a group matches the empty string with no anchor
+	 * in it: every item optional, `\b` or a group that does. A branch
+	 * holding `^` or `$` (`(?:^|/)`, `(?:[:/]|$)`) only matches where the
+	 * subject starts or ends, which the drafts use and the cost model weighs
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function matchesNothing(
+		array $branches,
+	): bool
+	{
+		foreach($branches as $sequence)
+		{
+			$nothing = true;
+			foreach($sequence as $item)
+			{
+				// an anchor, or an item that must read a byte, keeps the branch from matching nothing anywhere
+				$holds = $item['type'] === 'zero'
+					? $item['anchor'] !== ''
+					: $item['min'] > 0 && ($item['type'] !== 'group' || self::matchesNothing($item['branches']) === false);
+				if($holds)
+				{
+					$nothing = false;
+					
+					break;
+				}
+			}
+			if($nothing)
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * The atoms of a group's widest branch: an item its count's own max, 1
+	 * when it has none or no count, a group inside its own widest branch, a
+	 * zero-width item none
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function atomsOf(
+		array $branches,
+	): int
+	{
+		$widest = 0;
+		foreach($branches as $sequence)
+		{
+			$atoms = 0;
+			foreach($sequence as $item)
+			{
+				// a count past the saturation stops there, so the product stays an integer
+				$count = min(max(1, $item['reach'] ?? 1), self::COST_SATURATION);
+				$atoms = min($atoms + match($item['type'])
+				{
+					'zero' => 0,
+					'group' => self::atomsOf($item['branches']) * $count,
+					default => $count,
+				}, self::COST_SATURATION);
+			}
+			$widest = max($widest, $atoms);
+		}
+		
+		return $widest;
 	}
 	
 	/**
@@ -3026,7 +3564,8 @@ final class RegexGate
 	 * BOUNDED_CHOICES_MAX, or forty `\w{1,15}` in 600 bytes would be the
 	 * same hang without a single large count; and the counts' own choices
 	 * in such a run, an alternation's branches and an unbounded item aside,
-	 * may not pass COUNT_CHOICES_MAX.
+	 * may not pass COUNT_CHOICES_MAX. One start's cost (cost()) is asked
+	 * only where these found nothing, so each keeps its own reason.
 	 *
 	 * Conservative: a set the parser cannot read exactly is every byte, a
 	 * repeated group is the union of everything inside it, `ci` folds the
@@ -3047,10 +3586,268 @@ final class RegexGate
 			return null;
 		}
 		
-		$conflict = '';
-		self::walkAlternation($tree, self::emptyChain(), $conflict);
+		$seen = ['conflict' => '', 'cost' => 1, 'total' => 1, 'unbounded' => self::UNBOUNDED_REACH];
+		self::walkAlternation($tree, self::emptyChain(), $seen);
 		
-		return $conflict;
+		return $seen['conflict'];
+	}
+	
+	/**
+	 * What a near-miss costs a byte of the subject: the most one start of a
+	 * pattern can be made to read, the runs it reads one after another added
+	 * up (`\w{0,15}-` sixty times: 961). A run is items that can match the
+	 * same byte (the overlap walk's run), and costs the product of what each
+	 * reads — a count its max, one more when it may read nothing (`?` 2,
+	 * `{0,200}` 201, `{1,8}` 8, an exact `{32}` 32), an unbounded one
+	 * $unbounded, a group run once its inside walked, a repeated group its
+	 * count times its widest branch's atoms — times the row the run's ways
+	 * read after it (row()): its single atoms, and every optional byte or
+	 * group they pass over. A count's reach is weighed (weight()): a class
+	 * reads slower than a shorthand, and each step of its backtrack tests
+	 * what follows it. Past a byte the run cannot swallow only the ways that
+	 * stood at one position go on (`\w{1,4}\w{1,4}-` leaves four); an
+	 * optional count the run cannot swallow adds its ways for the way at the
+	 * run's end, every way there comparing it (`a{0,15}b{0,15}…z{0,15}!`
+	 * 5291). An alternation pays what every branch adds (walkAlternation()),
+	 * its ways out those of the branches that can match from one start
+	 * (fanned()). A count right behind a required, exactly counted byte set
+	 * it cannot match (`\.`, `=`) takes its run times SEPARATED_WAYS, or its
+	 * own reach where that is more. Conservative: two exact counts in a row
+	 * multiply (`\w{40}\w{40}` 1600) though they only add.
+	 *
+	 * Two credits, both sound on a subject an attacker writes: a top-level
+	 * branch anchored at `^` starts once (ANCHORED_BYTES), so it costs its
+	 * one start over a KiB; a branch that must open with a literal prefix
+	 * (`src=`, `(?:href|src)=`) starts past it at most once every period()
+	 * bytes, every other start failing inside it, so it costs its start over
+	 * the period plus the prefix's atoms (rule 109: 2818 a start, 716 a
+	 * byte). The branches neither applies to are walked together and added.
+	 * Null for a pattern the parser cannot follow
+	 */
+	public static function cost(
+		string $value,
+		bool $ci = true,
+		int $unbounded = self::UNBOUNDED_REACH,
+	): ?int
+	{
+		$at = 0;
+		$tree = $value === '' ? null : self::parseAlternation($value, $at, $ci);
+		if($tree === null || $at !== strlen($value))
+		{
+			return null;
+		}
+		// the branches no credit applies to, walked as one alternation: what those that start on one byte add adds up
+		$plain = [];
+		$total = 0;
+		foreach($tree as $sequence)
+		{
+			if(($sequence[0]['type'] ?? '') === 'zero' && $sequence[0]['anchor'] === '^')
+			{
+				$cost = self::walked([$sequence], self::ANCHORED_BYTES);
+				$total+= $cost >= self::COST_SATURATION ? self::COST_SATURATION : intdiv($cost + self::ANCHORED_BYTES - 1, self::ANCHORED_BYTES);
+				
+				continue;
+			}
+			// weighed as the budgets weigh it, an unbounded quantifier reads to the subject's end from every start past the prefix
+			[$period, $width] = $unbounded >= self::RUN_COST_MAX && self::holdsUnbounded($sequence) ? [1, 0] : self::period($sequence);
+			if($period > 1)
+			{
+				$cost = self::walked([$sequence], $unbounded);
+				$total+= $cost >= self::COST_SATURATION ? self::COST_SATURATION : min($cost, intdiv($cost + $period - 1, $period) + $width);
+				
+				continue;
+			}
+			$plain[] = $sequence;
+		}
+		
+		return min($total + ($plain === [] ? 0 : self::walked($plain, $unbounded)), self::COST_SATURATION);
+	}
+	
+	/**
+	 * What one start of an alternation reads, the runs one after another
+	 * added up, an unbounded quantifier weighing $unbounded (cost())
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function walked(
+		array $branches,
+		int $unbounded,
+	): int
+	{
+		$seen = ['conflict' => '', 'cost' => 1, 'total' => 1, 'unbounded' => $unbounded];
+		self::walkAlternation($branches, self::emptyChain(), $seen);
+		
+		return $seen['total'];
+	}
+	
+	/**
+	 * How far apart two starts of a branch that pass its required literal
+	 * prefix must be, and the most atoms of it a start compares, as
+	 * [period, width]. The prefix is the branch's opening atoms, a byte set
+	 * each (`\b` reads none): one text per way an optional atom or a group of
+	 * literal branches (texts()) makes, cut at PREFIX_ATOMS_MAX atoms and
+	 * PREFIX_TEXTS_MAX texts. Two starts d bytes apart both pass only where a
+	 * text shifted by d agrees with one at every byte they share, `ci`
+	 * folding the sets: `src=` never does (4), `aa` does at 1. [1, 0] for a
+	 * branch that may open with no atom
+	 *
+	 * @param list<array> $sequence
+	 * @return array{int, int}
+	 */
+	protected static function period(
+		array $sequence,
+	): array
+	{
+		$texts = [[]];
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				// an anchor ends the prefix
+				if($item['anchor'] !== '')
+				{
+					break;
+				}
+				
+				continue;
+			}
+			$ways = match(true)
+			{
+				$item['type'] === 'set' && $item['max'] === 1 => $item['min'] === 0 ? [[], [$item['set']]] : [[$item['set']]],
+				$item['type'] === 'group' && $item['min'] === 1 && $item['max'] === 1 => self::branchTexts($item['branches']),
+				default => null,
+			};
+			if($ways === null || count($texts) * count($ways) > self::PREFIX_TEXTS_MAX)
+			{
+				break;
+			}
+			$longer = [];
+			foreach($texts as $text)
+			{
+				foreach($ways as $way)
+				{
+					$longer[] = array_slice([...$text, ...$way], 0, self::PREFIX_ATOMS_MAX);
+				}
+			}
+			$texts = $longer;
+		}
+		$lengths = array_map(count(...), $texts);
+		$period = min($lengths);
+		foreach($texts as $text)
+		{
+			foreach($texts as $other)
+			{
+				// the nearest $other can start behind $text with both passing; past $text's end it always can
+				for($shift = 1; $shift < $period && $shift < count($text); $shift++)
+				{
+					if(self::shifted($text, $other, $shift))
+					{
+						$period = $shift;
+						
+						break;
+					}
+				}
+			}
+		}
+		
+		return $period === 0 ? [1, 0] : [$period, max($lengths)];
+	}
+	
+	/**
+	 * Every text the branches of a group of literal branches can read
+	 * (texts()); null when one branch is no such branch
+	 *
+	 * @param list<list<array>> $branches
+	 * @return list<list<string>>|null
+	 */
+	protected static function branchTexts(
+		array $branches,
+	): ?array
+	{
+		$all = [];
+		foreach($branches as $sequence)
+		{
+			$texts = self::texts($sequence);
+			if($texts === null)
+			{
+				return null;
+			}
+			$all = [...$all, ...$texts];
+		}
+		
+		return $all;
+	}
+	
+	/**
+	 * Whether $other can be read $shift bytes after $text begins: every byte
+	 * set of it that overlaps $text shares a byte with $text's there
+	 *
+	 * @param list<string> $text
+	 * @param list<string> $other
+	 */
+	protected static function shifted(
+		array $text,
+		array $other,
+		int $shift,
+	): bool
+	{
+		for($at = 0; $at + $shift < count($text) && $at < count($other); $at++)
+		{
+			if(self::intersects($text[$at + $shift], $other[$at]) === false)
+			{
+				return false;
+			}
+		}
+		
+		return true;
+	}
+	
+	/**
+	 * Whether PCRE's JIT runs a pattern without its early exit from a
+	 * failed start, so a quantifier reads to the end of its run from every
+	 * start: a group repeated without a bound (`(?:ab)+`; `(?:aaa)*y` over
+	 * 64 KiB of `a`: 1.1 s, past that its stack gives out) or a count of two
+	 * or more without a max (`[a-f0-9]{3,}!` over 64 KiB: 0.9 s). A kernel
+	 * reads such a pattern as without the JIT (Kernel::weighs()). False for a
+	 * pattern the parser cannot follow
+	 */
+	public static function loops(
+		string $value,
+		bool $ci = true,
+	): bool
+	{
+		$at = 0;
+		$tree = $value === '' ? null : self::parseAlternation($value, $at, $ci);
+		
+		return $tree !== null && $at === strlen($value) && self::loopsIn($tree);
+	}
+	
+	/**
+	 * loops() over a parsed alternation, the groups inside it included
+	 *
+	 * @param list<list<array>> $branches
+	 */
+	protected static function loopsIn(
+		array $branches,
+	): bool
+	{
+		foreach($branches as $sequence)
+		{
+			foreach($sequence as $item)
+			{
+				$unbounded = $item['type'] !== 'zero' && $item['reach'] === null;
+				if($unbounded && ($item['type'] === 'group' || $item['min'] >= 2))
+				{
+					return true;
+				}
+				if($item['type'] === 'group' && self::loopsIn($item['branches']))
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
 	}
 	
 	/**
@@ -3113,41 +3910,245 @@ final class RegexGate
 	 * quantifier still in reach could swallow; `chain`, the bytes of the
 	 * small counts in the current overlapping run, and `choices`, the
 	 * product of their choices; `countSet` and `counts`, the same run read
-	 * for its counts' own choices alone
+	 * for its counts' own choices alone; `costSet` and `cost`, the same run
+	 * read for what one start of it reads (cost()), `spent`, what the runs
+	 * it ended read, and `sep`, the bytes of the separator right before,
+	 * null when none is. The row the cost run reads since its ways last
+	 * changed (row()): `atoms`, its required single atoms, `first` the first
+	 * one's bytes, `like` how many of them share a byte with it, `extra` the
+	 * items every way passed over without a choice, and `base` the ways.
+	 * `ways`, the ways the cost run's choices make, and `dup`, the most of
+	 * them that can end at one position: past a byte the run cannot swallow
+	 * only those go on, each reading all that follows; `start`, the cost the
+	 * run had when it began, which it has read only once it grows past
 	 *
-	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
 	 */
 	protected static function emptyChain(): array
 	{
-		return ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1, 'countSet' => str_repeat("\0", 256), 'counts' => 1];
+		return ['open' => str_repeat("\0", 256), 'chain' => str_repeat("\0", 256), 'choices' => 1, 'countSet' => str_repeat("\0", 256), 'counts' => 1,
+			'costSet' => str_repeat("\0", 256), 'cost' => 1, 'spent' => 0, 'sep' => null, 'atoms' => 0, 'first' => null, 'like' => 0, 'extra' => 0, 'base' => 1, 'ways' => 1, 'dup' => 1, 'start' => 1];
 	}
 	
 	/**
 	 * Each branch from the same entry; the exit is the union of the
-	 * branches' sets and the worst of their choices
+	 * branches' sets and the worst of their choices. $seen carries the
+	 * first conflict met, the highest cost of one run (`cost`) and of the
+	 * runs one after another (`total`), and what an unbounded item weighs.
+	 * A start tries every branch, so what the branches that can start on the
+	 * same byte add to the entry's cost adds up (`\w{1000}!|\w{1000}#` 1999),
+	 * and so do their ways out; branches that cannot (`\.\./|%2e%2e`) never
+	 * both go past their first byte at one position. A row (row()) goes on
+	 * past the alternation where any branch ends on one, read by the ways
+	 * out of all of them: `(?:a|b)` or `(?:a|-)` 250 times behind
+	 * `\w{0,1023}` is a row of 250. $after, the items that follow the
+	 * alternation, for what a count's backtrack tests (weight())
 	 *
 	 * @param list<list<array>> $branches
-	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
-	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @param list<array> $after
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
 	 */
 	protected static function walkAlternation(
 		array $branches,
 		array $state,
-		string &$conflict,
+		array &$seen,
+		array $after = [],
 	): array
 	{
 		$out = self::emptyChain();
+		[$peak, $peakTotal] = [$seen['cost'], $seen['total']];
+		$entry = self::total($state);
+		// by each byte a branch can start on: what the branches add to the entry's cost and to its total
+		$grown = array_fill(0, 256, 0);
+		$grownTotal = array_fill(0, 256, 0);
+		// per branch its first bytes, the texts it can read, its ways out, the ways a row after it is read by, the ways its
+		// runs make and the most of them it leaves at one position
+		$exits = [];
+		// what every branch's runs ended read, and whether each left its ways where its last run began
+		[$spent, $fresh] = [null, true];
 		foreach($branches as $sequence)
 		{
-			$exit = self::walkSequence($sequence, $state, $conflict);
+			// each branch's own highest cost and total, counted from the entry's
+			[$seen['cost'], $seen['total']] = [$state['cost'], $entry];
+			$exit = self::walkSequence($sequence, $state, $seen, $after);
+			$first = self::firstOf($sequence);
+			$rowed = $exit['atoms'] + $exit['extra'] > 0;
+			$spent = min($spent ?? $exit['spent'], $exit['spent']);
+			$fresh = $fresh && $exit['cost'] === $exit['start'];
+			for($byte = 0; $byte < 256; $byte++)
+			{
+				if($first[$byte] === "\1")
+				{
+					$grown[$byte]+= $seen['cost'] - $state['cost'];
+					$grownTotal[$byte]+= $seen['total'] - $entry;
+				}
+			}
+			$exits[] = [$first, self::texts($sequence), $exit['cost'], $rowed ? $exit['base'] : $exit['cost'], $exit['ways'], $exit['dup']];
 			$out['open'] |= $exit['open'];
 			$out['chain'] |= $exit['chain'];
 			$out['choices'] = max($out['choices'], $exit['choices']);
 			$out['countSet'] |= $exit['countSet'];
 			$out['counts'] = max($out['counts'], $exit['counts']);
+			$out['costSet'] |= $exit['costSet'];
+			// a separator holds only where every way ends on it: one branch
+			$out['sep'] = count($branches) === 1 ? $exit['sep'] : null;
+			if($rowed)
+			{
+				[$out['atoms'], $out['like'], $out['extra']] = [max($out['atoms'], $exit['atoms']), max($out['like'], $exit['like']), max($out['extra'], $exit['extra'])];
+				$out['first'] = self::union($out['first'], $exit['first']);
+			}
 		}
+		$seen['cost'] = max($peak, min($state['cost'] + max($grown), self::COST_SATURATION));
+		$seen['total'] = max($peakTotal, min($entry + max($grownTotal), self::COST_SATURATION));
+		[$out['cost'], $bases, $paths, $out['dup']] = self::fanned($exits);
+		// what the branches read stays spent, but for the ways out that go on reading, and never less than every branch ended
+		$out['start'] = $fresh ? $out['cost'] : 1;
+		$out['spent'] = min(max($spent, $entry + max($grownTotal) - ($out['cost'] > $out['start'] ? $out['cost'] : 0)), self::COST_SATURATION);
+		$out['base'] = $out['atoms'] + $out['extra'] > 0 ? $bases : 1;
+		$out['ways'] = $paths;
 		
 		return $out;
+	}
+	
+	/**
+	 * What an alternation's branches hand on, as [its ways out, the ways a
+	 * row after it is read by, the ways its runs make, the most of them at
+	 * one position]: a branch's own and those of every branch that can
+	 * match from the same start — for the ways the same text (`,|,` twice as
+	 * many), else a text the one begins the other with (`aa|aaa`). Branches
+	 * of single atoms read only their texts, so `action|asyncsrc` never
+	 * both match at one start; any other branch goes with every branch that
+	 * starts on a byte it starts on
+	 *
+	 * @param list<array{string, ?list<list<string>>, int, int, int, int}> $exits
+	 * @return array{int, int, int, int}
+	 */
+	protected static function fanned(
+		array $exits,
+	): array
+	{
+		$most = [1, 1, 1, 1];
+		foreach($exits as [$first, $texts])
+		{
+			$sums = [0, 0, 0, 0];
+			foreach($exits as [$otherFirst, $otherTexts, $cost, $base, $ways, $dup])
+			{
+				if(self::intersects($first, $otherFirst) === false)
+				{
+					continue;
+				}
+				$either = $texts === null || $otherTexts === null;
+				if($either || self::alike($texts, $otherTexts, true))
+				{
+					$sums = [$sums[0] + $cost, $sums[1] + $base, $sums[2] + $ways, $sums[3]];
+				}
+				if($either || self::alike($texts, $otherTexts))
+				{
+					$sums[3]+= $dup;
+				}
+			}
+			$most = array_map(static fn(int $a, int $b): int => max($a, min($b, self::COST_SATURATION)), $most, $sums);
+		}
+		
+		return $most;
+	}
+	
+	/**
+	 * The texts a branch of single atoms can read, each a list of byte
+	 * sets: one per way its optional atoms (`?`, at most three) are taken
+	 * or skipped. Null for any other branch
+	 *
+	 * @param list<array> $sequence
+	 * @return list<list<string>>|null
+	 */
+	protected static function texts(
+		array $sequence,
+	): ?array
+	{
+		$texts = [[]];
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				continue;
+			}
+			if($item['type'] !== 'set' || $item['max'] !== 1 || count($texts) > 4)
+			{
+				return null;
+			}
+			$taken = array_map(static fn(array $text): array => [...$text, $item['set']], $texts);
+			$texts = $item['min'] === 0 ? [...$texts, ...$taken] : $taken;
+		}
+		
+		return $texts;
+	}
+	
+	/**
+	 * Whether two branches can read the same text: a text of each as long
+	 * as the other whose sets share a byte at every place — or, with
+	 * $begins, a text of one the other's begins with
+	 *
+	 * @param list<list<string>> $a
+	 * @param list<list<string>> $b
+	 */
+	protected static function alike(
+		array $a,
+		array $b,
+		bool $begins = false,
+	): bool
+	{
+		foreach($a as $text)
+		{
+			foreach($b as $other)
+			{
+				if(count($text) !== count($other) && $begins === false)
+				{
+					continue;
+				}
+				[$shorter, $longer] = count($text) <= count($other) ? [$text, $other] : [$other, $text];
+				$same = true;
+				foreach($shorter as $at => $set)
+				{
+					$same = $same && self::intersects($set, $longer[$at]);
+				}
+				if($same)
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * The bytes a sequence can start on: its items' up to the first that
+	 * cannot be skipped, every byte where all of them can (a group's whole
+	 * set stands for its first bytes)
+	 *
+	 * @param list<array> $sequence
+	 */
+	protected static function firstOf(
+		array $sequence,
+	): string
+	{
+		$first = str_repeat("\0", 256);
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				continue;
+			}
+			$first |= $item['set'];
+			if($item['nullable'] === false)
+			{
+				return $first;
+			}
+		}
+		
+		return str_repeat("\1", 256);
 	}
 	
 	/**
@@ -3155,44 +4156,48 @@ final class RegexGate
 	 * overlapping small counts past BOUNDED_CHOICES_MAX, or its counts past
 	 * COUNT_CHOICES_MAX. An optional or zero-width item leaves the runs
 	 * open; a required item ends a run only when that run cannot swallow
-	 * the item's bytes
+	 * the item's bytes. $after, the items that follow the sequence
 	 *
 	 * @param list<array> $sequence
-	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
-	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @param list<array> $after
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
 	 */
 	protected static function walkSequence(
 		array $sequence,
 		array $state,
-		string &$conflict,
+		array &$seen,
+		array $after = [],
 	): array
 	{
-		foreach($sequence as $item)
+		foreach($sequence as $index => $item)
 		{
 			if($item['type'] === 'zero')
 			{
 				continue;
 			}
+			$follows = [...array_slice($sequence, $index + 1), ...$after];
 			
 			// a group that runs once (or not at all) is followed inside
 			if($item['type'] === 'group' && $item['max'] !== null && $item['max'] <= 1)
 			{
-				$inner = self::walkAlternation($item['branches'], $state, $conflict);
+				$inner = self::walkAlternation($item['branches'], $state, $seen, $follows);
 				if($item['min'] === 0 || $item['nullable'])
 				{
-					$inner['open'] |= $state['open'];
-					$inner['chain'] |= $state['chain'];
-					$inner['choices'] = max($inner['choices'], $state['choices']);
-					$inner['countSet'] |= $state['countSet'];
-					$inner['counts'] = max($inner['counts'], $state['counts']);
+					$inner = self::skipped($inner, $state, $item['min'] === 0, $seen);
 				}
 				// and is a choice itself: one way per branch, one more when it may
 				// be skipped — forty `(?:x)?` before a `y` are 2^40 ways on a near-miss;
-				// to the counts' run only the skip is a choice
+				// to the counts' run only the skip is a choice, and the cost's ways out are the walk's above
 				$ways = count($item['branches']) + ($item['min'] === 0 ? 1 : 0);
 				if($ways > 1)
 				{
-					$inner = self::counted($inner, $item['set'], $ways, $item['min'] === 0 ? 2 : 1, $item['min'] > 0 && $item['nullable'] === false, $conflict);
+					// the group's own work is its alternation's peak; the ways out only weigh with what follows,
+					// as `%2f|%5c` both start on `%` but never both end
+					[$peak, $total] = [$seen['cost'], $seen['total']];
+					$inner = self::counted($inner, $item['set'], $ways, $item['min'] === 0 ? 2 : 1, $item['min'] > 0 && $item['nullable'] === false, $seen);
+					[$seen['cost'], $seen['total']] = [$peak, $total];
 				}
 				$state = $inner;
 				
@@ -3207,7 +4212,7 @@ final class RegexGate
 			{
 				if($overlapsOpen)
 				{
-					$conflict = $conflict === '' ? self::CONFLICT_OVERLAP : $conflict;
+					$seen['conflict'] = $seen['conflict'] === '' ? self::CONFLICT_OVERLAP : $seen['conflict'];
 				}
 				// an optional one keeps the earlier runs in reach; a required one is the only run left
 				$state['open'] = $item['min'] === 0 ? $state['open'] | $set : $set;
@@ -3223,18 +4228,328 @@ final class RegexGate
 			// unbounded ones meeting each other are `open`'s business — and nothing
 			// among the counts' own choices
 			$choices = $item['max'] === null ? 1 : $item['max'] - $item['min'] + 1;
-			$state = self::counted($state, $set, $item['max'] === null ? self::LARGE_COUNT : $choices, $choices, $required, $conflict);
+			// what one start reads through it: a count its max, a repeated group that many times its widest branch's
+			// atoms, one more when it may read nothing; an unbounded one what $seen weighs it
+			$width = $item['type'] === 'group' ? max(1, self::atomsOf($item['branches'])) : 1;
+			$reach = $item['reach'] === null
+				? $seen['unbounded']
+				: min(min($item['reach'], self::COST_SATURATION) * $width + ($item['min'] === 0 ? 1 : 0), self::COST_SATURATION);
+			// as one start pays it: its set, its laziness or what each step of its backtrack tests (weight()); a reach of two
+			// (`?`, `{1,2}`) gives back one byte at most, which the count before it pays for
+			$reach = $reach > 2 ? min(intdiv($reach * self::weight($item, $follows) + 7, 8), self::COST_SATURATION) : $reach;
+			// right behind a separator it cannot match, a count only moves where its run goes on
+			$separated = $state['sep'] !== null && self::intersects($state['sep'], $set) === false;
+			// a required single atom the cost run can swallow is compared by every way of the run (row())
+			$atom = $item['type'] === 'set' && $item['min'] === 1 && $item['reach'] === 1 && self::intersects($state['costSet'], $set);
+			[$before, $ways] = [$state['cost'], $state['ways']];
+			// with no run going on there is no row, and nothing to end
+			$open = str_contains($state['costSet'], "\1");
+			$ends = $required && $open && self::intersects($state['costSet'], $set) === false;
+			$beside = $open && $required === false && $reach > 1 && self::intersects($state['costSet'], $set) === false;
+			// the ways it makes: a count's choices, a large one's too; an unbounded one what $seen weighs it
+			$spread = $item['reach'] === null ? $seen['unbounded'] : max(1, min($item['reach'], self::COST_SATURATION) - $item['min'] + 1);
+			$state = self::counted($state, $set, $item['max'] === null ? self::LARGE_COUNT : $choices, $choices, $required, $seen, $reach, $separated, $spread);
+			if($atom)
+			{
+				$state = self::row($state, $set, $seen);
+			}
+			elseif($open && $ends === false && $state['cost'] === $before)
+			{
+				// every way of the run compares it and goes on as it was: one more item of the row
+				$state = self::row($state, null, $seen);
+			}
+			elseif($beside)
+			{
+				// an optional count beside the run adds ways where it ended, and every way there compared it:
+				// `a{0,15}b{0,15}c{0,15}…` reads each count with every way the ones before it made
+				$state['spent'] = min($state['spent'] + $ways, self::COST_SATURATION);
+				$seen['total'] = max($seen['total'], self::total($state));
+			}
+			// a required byte set counted exactly (`\.`, `=`, `-{2}`) is the next count's separator
+			$state['sep'] = $item['type'] === 'set' && $item['min'] >= 1 && $item['reach'] === $item['min'] ? $set : null;
 		}
 		
 		return $state;
 	}
 	
 	/**
-	 * The runs after one more item with $choices ways through it, $counts
-	 * of them its counts' own (run())
+	 * What one unit of a count's reach weighs, in eighths (WEIGHTS): the
+	 * most of its own set's, its laziness's and what each step of its
+	 * backtrack tests on the byte it gave back — the items that follow it
+	 * ($after) up to the first that must read a byte, the costliest of them;
+	 * each test's weight holds behind a class's count too. Where none of
+	 * those items can start on a byte its set holds, it gives back nothing
+	 * they could take and weighs its set alone. A count behind it is entered
+	 * at every step, which a small one's few ways do not dwarf
+	 * (`\w{0,255}[a-z]{1,2}x` 5 to 7 times the unit, `\w{1,4}\w{0,255}x`
+	 * once). Behind an unbounded quantifier, whose run PCRE's JIT leaves
+	 * early, a count weighs its ways alone, as UNBOUNDED_REACH allows four
+	 * (`\w+\d{0,3}=`), and so does a byte (`.*\.phar` 1 ms a MiB)
 	 *
-	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int} $state
-	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int}
+	 * @param list<array> $after
+	 */
+	protected static function weight(
+		array $item,
+		array $after,
+	): int
+	{
+		$tests = self::WEIGHTS['unit'];
+		$first = str_repeat("\0", 256);
+		foreach($after as $index => $next)
+		{
+			if($next['type'] === 'zero')
+			{
+				// `\b` and `$` fail at every step of a near-miss, whatever follows them
+				$tests = max($tests, $next['anchor'] === '' ? self::WEIGHTS['boundary'] : self::WEIGHTS['end']);
+				$first = str_repeat("\1", 256);
+				
+				break;
+			}
+			// the bytes it can start on: a group's are its branches' first ones
+			$first |= $next['type'] === 'group' ? array_reduce($next['branches'], static fn(string $bytes, array $branch): string => $bytes | self::firstOf($branch), str_repeat("\0", 256)) : $next['set'];
+			$tests = max($tests, match(true)
+			{
+				// each way into an alternation
+				$next['type'] === 'group' && $next['max'] !== null && $next['max'] <= 1
+					=> self::WEIGHTS['group'] + self::WEIGHTS['way'] * (count($next['branches']) + ($next['min'] === 0 ? 1 : 0)),
+				// a small count it enters at every step; a large one, or one behind `+`, weighs its own reach
+				$next['reach'] === null || $next['reach'] > 1
+					=> $item['reach'] !== null && $next['reach'] !== null && $next['reach'] < self::LARGE_COUNT ? self::WEIGHTS['count'] : self::WEIGHTS['unit'],
+				$next['min'] === 0 && $next['kind'] === 'byte' => self::WEIGHTS['optional'],
+				// a byte the pattern ends on is only scanned for, matching it being a match
+				$next['kind'] === 'byte' => $item['reach'] !== null && self::reads(array_slice($after, $index + 1))
+					? self::shared(self::WEIGHTS['test'], self::rowLength($item['set'], array_slice($after, $index))) : self::WEIGHTS['unit'],
+				default => self::WEIGHTS['test'],
+			});
+			if($next['nullable'] === false)
+			{
+				break;
+			}
+		}
+		$own = match($item['kind'])
+		{
+			'class' => self::WEIGHTS['class'],
+			'group' => self::WEIGHTS['repeat'],
+			default => self::WEIGHTS['unit'],
+		};
+		$weight = self::intersects($item['set'], $first) ? max($own, $tests) : $own;
+		
+		return max($weight, $item['lazy'] ? self::WEIGHTS['lazy'] : 0);
+	}
+	
+	/**
+	 * The compares a row of single atoms at the head of $items costs a way of
+	 * a count over $set, as row() counts them: the atoms the count holds, at
+	 * most one more than those that share a byte with the first
+	 *
+	 * @param list<array> $items
+	 */
+	protected static function rowLength(
+		string $set,
+		array $items,
+	): int
+	{
+		[$atoms, $like, $first] = [0, 0, null];
+		foreach($items as $item)
+		{
+			if($item['type'] !== 'set' || $item['min'] !== 1 || $item['reach'] !== 1 || self::intersects($set, $item['set']) === false)
+			{
+				break;
+			}
+			$first ??= $item['set'];
+			$atoms++;
+			$like+= self::intersects($first, $item['set']) ? 1 : 0;
+		}
+		
+		return max(1, min($atoms, $like + 1));
+	}
+	
+	/** a weight shared over $compares, rounded up and never under the unit */
+	protected static function shared(
+		int $weight,
+		int $compares,
+	): int
+	{
+		return max(self::WEIGHTS['unit'], intdiv($weight + $compares - 1, $compares));
+	}
+	
+	/**
+	 * Whether items must still match something: a zero-width assertion, or
+	 * an item that must read a byte
+	 *
+	 * @param list<array> $items
+	 */
+	protected static function reads(
+		array $items,
+	): bool
+	{
+		foreach($items as $item)
+		{
+			if($item['type'] === 'zero' || $item['nullable'] === false)
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * Whether a sequence holds an unbounded quantifier (`*`, `+`, `{n,}`), in
+	 * a group inside it too
+	 *
+	 * @param list<array> $sequence
+	 */
+	protected static function holdsUnbounded(
+		array $sequence,
+	): bool
+	{
+		foreach($sequence as $item)
+		{
+			if($item['type'] === 'zero')
+			{
+				continue;
+			}
+			if($item['reach'] === null)
+			{
+				return true;
+			}
+			foreach($item['type'] === 'group' ? $item['branches'] : [] as $branch)
+			{
+				if(self::holdsUnbounded($branch))
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * The ways out of a group that may match nothing: the ones through it
+	 * ($inner) and, past a group marked optional, the one that skips it
+	 * ($state); a branch that matches nothing is already one of the ways
+	 * through. Each set keeps both ways' bytes. Both ways read what follows:
+	 * a row goes on, read by the ways of both, every one of which compared
+	 * the group — one more item of it. What the two have read is the larger,
+	 * and what the runs they ended read no less than either keeps
+	 *
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $inner
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
+	 */
+	protected static function skipped(
+		array $inner,
+		array $state,
+		bool $optional,
+		array &$seen,
+	): array
+	{
+		$through = $inner['atoms'] + $inner['extra'] > 0 ? $inner['base'] : $inner['cost'];
+		$skip = $state['atoms'] + $state['extra'] > 0 ? $state['base'] : $state['cost'];
+		$read = max(self::total($inner), self::total($state));
+		$spent = min($inner['spent'], $state['spent']);
+		$inner['open'] |= $state['open'];
+		$inner['chain'] |= $state['chain'];
+		$inner['choices'] = max($inner['choices'], $state['choices']);
+		$inner['countSet'] |= $state['countSet'];
+		$inner['counts'] = max($inner['counts'], $state['counts']);
+		$inner['costSet'] |= $state['costSet'];
+		// the way that skips it ends on no separator
+		$inner['sep'] = null;
+		if($optional === false)
+		{
+			$inner['cost'] = max($inner['cost'], $state['cost']);
+			$inner['spent'] = max($inner['spent'], $state['spent']);
+			[$inner['ways'], $inner['dup']] = [max($inner['ways'], $state['ways']), max($inner['dup'], $state['dup'])];
+			$inner['start'] = min($inner['cost'], max($inner['start'], $state['start']));
+			
+			return $inner;
+		}
+		[$inner['ways'], $inner['dup']] = [min($inner['ways'] + $state['ways'], self::COST_SATURATION), min($inner['dup'] + $state['dup'], self::COST_SATURATION)];
+		$inner['first'] = self::union($inner['first'], $state['first']);
+		[$inner['atoms'], $inner['like'], $inner['extra']] = [max($inner['atoms'], $state['atoms']), max($inner['like'], $state['like']), max($inner['extra'], $state['extra']) + 1];
+		[$inner['base'], $inner['spent'], $inner['start']] = [min($through + $skip, self::COST_SATURATION), $spent, 1];
+		$inner = self::read($inner, $seen);
+		$inner['spent'] = max($spent, $read - $inner['cost']);
+		$seen['total'] = max($seen['total'], self::total($inner));
+		
+		return $inner;
+	}
+	
+	/**
+	 * The cost run after one more item of its row: a required single atom
+	 * the run can swallow ($set), or an item every way of it compares and
+	 * goes on past without a choice (null). Each way reads the row from
+	 * where it ends, so 250 `\w` behind `\w{0,1023}` cost 1024 × 250, as
+	 * `\w{250}` does (JIT 68 s a MiB). A position goes past the first atom
+	 * only where its byte matches it, so the atoms count at most one more
+	 * than those that share a byte with the first (`\.php` behind `[^/]+`
+	 * counts 2, not 4); every other item counts one, an optional byte or
+	 * group the run skips included. The row starts where the run's ways last
+	 * changed, its ways then the cost (`base`)
+	 *
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
+	 */
+	protected static function row(
+		array $state,
+		?string $set,
+		array &$seen,
+	): array
+	{
+		if($state['atoms'] + $state['extra'] === 0)
+		{
+			[$state['first'], $state['like'], $state['base']] = [null, 0, $state['cost']];
+		}
+		if($set === null)
+		{
+			$state['extra']++;
+		}
+		else
+		{
+			$state['first'] ??= $set;
+			$state['atoms']++;
+			$state['like']+= self::intersects($state['first'], $set) ? 1 : 0;
+		}
+		
+		return self::read($state, $seen);
+	}
+	
+	/**
+	 * The cost run as its row has it: the row's ways times its atoms, at
+	 * most one more than those like the first, and its other items
+	 *
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
+	 */
+	protected static function read(
+		array $state,
+		array &$seen,
+	): array
+	{
+		$state['cost'] = min($state['base'] * (min($state['atoms'], $state['like'] + 1) + $state['extra']), self::COST_SATURATION);
+		$seen['cost'] = max($seen['cost'], $state['cost']);
+		$seen['total'] = max($seen['total'], self::total($state));
+		
+		return $state;
+	}
+	
+	/**
+	 * The runs after one more item with $choices ways through it, $counts
+	 * of them its counts' own, $reach what one start reads through it
+	 * (run()); $separated, whether it stands right behind a separator its
+	 * set cannot match, $spread the ways it makes. A required item the cost
+	 * run cannot swallow ends it, what it read then spent; a row ends with
+	 * the run or where its ways change
+	 *
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 * @param array{conflict: string, cost: int, total: int, unbounded: int} $seen
+	 * @return array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int}
 	 */
 	protected static function counted(
 		array $state,
@@ -3242,18 +4557,48 @@ final class RegexGate
 		int $choices,
 		int $counts,
 		bool $required,
-		string &$conflict,
+		array &$seen,
+		int $reach = 1,
+		bool $separated = false,
+		int $spread = 1,
 	): array
 	{
 		[$state['chain'], $state['choices']] = self::run($state['chain'], $state['choices'], $set, $choices, $required);
 		[$state['countSet'], $state['counts']] = self::run($state['countSet'], $state['counts'], $set, $counts, $required);
-		if($conflict === '' && $state['choices'] > self::BOUNDED_CHOICES_MAX)
+		$cost = $state['cost'];
+		$open = str_contains($state['costSet'], "\1");
+		$overlaps = self::intersects($state['costSet'], $set);
+		$ends = $required && $open && $overlaps === false;
+		[$state['costSet'], $state['cost']] = self::costRun($state['costSet'], $state['cost'], $set, $reach, $required, $separated, $state['dup']);
+		// past a byte that ends the run only the ways that stood at one position go on; a count the run overlaps, or
+		// one with no run going on, stacks at most its choices of them on one position, one behind a separator none;
+		// one the run cannot reach spreads only the ways at the run's end
+		[$state['ways'], $state['dup']] = match(true)
 		{
-			$conflict = self::CONFLICT_OVERLAP;
+			$ends => [min($state['dup'] * $spread, self::COST_SATURATION), $state['dup']],
+			$spread === 1 => [$state['ways'], $state['dup']],
+			$overlaps || $open === false => [min($state['ways'] * $spread, self::COST_SATURATION), $separated ? $state['dup'] : min($state['dup'] * $spread, $state['ways'])],
+			default => [min($state['ways'] + $state['dup'] * ($spread - 1), self::COST_SATURATION), $state['dup']],
+		};
+		if($ends || $state['cost'] !== $cost)
+		{
+			$state['spent'] = $ends && $cost > 1 ? min($state['spent'] + $cost, self::COST_SATURATION) : $state['spent'];
+			[$state['atoms'], $state['extra'], $state['like'], $state['first']] = [0, 0, 0, null];
 		}
-		if($conflict === '' && $state['counts'] > self::COUNT_CHOICES_MAX)
+		if($ends)
 		{
-			$conflict = self::CONFLICT_COUNTS;
+			// the ways that go on have read nothing past the byte yet; a count that ends the run reads at once
+			$state['start'] = $reach > 1 ? 1 : $state['cost'];
+		}
+		$seen['cost'] = max($seen['cost'], $state['cost']);
+		$seen['total'] = max($seen['total'], self::total($state));
+		if($seen['conflict'] === '' && $state['choices'] > self::BOUNDED_CHOICES_MAX)
+		{
+			$seen['conflict'] = self::CONFLICT_OVERLAP;
+		}
+		if($seen['conflict'] === '' && $state['counts'] > self::COUNT_CHOICES_MAX)
+		{
+			$seen['conflict'] = self::CONFLICT_COUNTS;
 		}
 		
 		return $state;
@@ -3289,6 +4634,66 @@ final class RegexGate
 		}
 		
 		return $required && $overlaps === false ? [str_repeat("\0", 256), 1] : [$bytes, $product];
+	}
+	
+	/**
+	 * The cost run — its bytes and what one start reads — after one more
+	 * item reading $reach: one the run overlaps multiplies it (behind a
+	 * separator ($separated) by SEPARATED_WAYS, or the item's own where that
+	 * is more); with no run going on, every way goes on into it. A required
+	 * item the run cannot swallow ends it, the $dup ways that stood at one
+	 * position going on; an optional one adds its reach for those ways
+	 *
+	 * @return array{string, int}
+	 */
+	protected static function costRun(
+		string $bytes,
+		int $product,
+		string $set,
+		int $reach,
+		bool $required,
+		bool $separated,
+		int $dup,
+	): array
+	{
+		if($reach <= 1)
+		{
+			$ends = $required && str_contains($bytes, "\1") && self::intersects($bytes, $set) === false;
+			
+			return $ends ? [str_repeat("\0", 256), $dup] : [$bytes, $product];
+		}
+		if(self::intersects($bytes, $set) || str_contains($bytes, "\1") === false)
+		{
+			$product = $separated && self::intersects($bytes, $set) ? max($product * self::SEPARATED_WAYS, $reach) : $product * $reach;
+			
+			return [$bytes | $set, min($product, self::COST_SATURATION)];
+		}
+		
+		return $required ? [$set, min($dup * $reach, self::COST_SATURATION)] : [$bytes | $set, min($product + $dup * ($reach - 1), self::COST_SATURATION)];
+	}
+	
+	/**
+	 * What one start has read so far: the runs ended and the one going on,
+	 * once it read past what it began with — a run without a choice
+	 * nothing (the items it passes are dwarfed by the runs with one), nor
+	 * the ways a run that ended left at the end of the pattern
+	 *
+	 * @param array{open: string, chain: string, choices: int, countSet: string, counts: int, costSet: string, cost: int, spent: int, sep: ?string, atoms: int, first: ?string, like: int, extra: int, base: int, ways: int, dup: int, start: int} $state
+	 */
+	protected static function total(
+		array $state,
+	): int
+	{
+		return min($state['spent'] + ($state['cost'] > $state['start'] ? $state['cost'] : 0), self::COST_SATURATION);
+	}
+	
+	/** two rows' first atoms as one: either one where the other is none */
+	protected static function union(
+		?string $a,
+		?string $b,
+	): ?string
+	{
+		return $a === null || $b === null ? $a ?? $b : $a | $b;
 	}
 	
 	/** whether two byte sets (256 bytes of "\0" or "\1") share a byte */
@@ -3331,7 +4736,11 @@ final class RegexGate
 	
 	/**
 	 * Items up to a `|`, a `)` or the end: each a byte set (or a group, or a
-	 * zero-width assertion) with its quantifier's min and max (null = no max)
+	 * zero-width assertion) with its quantifier's min and max (null = no max,
+	 * a large count's too), its reach, the count's own max (null = none),
+	 * whether it is lazy, and its kind: how a set was written — `byte` one
+	 * byte (`a`, `\.`, `[a]`), `short` a shorthand, `.` or every byte but one
+	 * (`[^/]`), `class` any other class — or `group`
 	 *
 	 * @return list<array>|null
 	 */
@@ -3348,7 +4757,7 @@ final class RegexGate
 			$char = $value[$at];
 			if($char === '^' || $char === '$')
 			{
-				$items[] = ['type' => 'zero'];
+				$items[] = ['type' => 'zero', 'anchor' => $char];
 				$at++;
 				
 				continue;
@@ -3378,24 +4787,32 @@ final class RegexGate
 					return null;
 				}
 				$at++;
-				$item = ['type' => 'group', 'branches' => $branches, 'set' => self::unionOf($branches), 'nullable' => self::nullableOf($branches)];
+				$item = ['type' => 'group', 'branches' => $branches, 'set' => self::unionOf($branches), 'nullable' => self::nullableOf($branches), 'kind' => 'group'];
 			}
 			else
 			{
+				$kind = match(true)
+				{
+					$char === '[' => preg_match(self::ONE_MEMBER, $value, $member, 0, $at) === 1 ? ($member[1] === '^' ? 'short' : 'byte') : 'class',
+					$char === '.' || ($char === '\\' && self::isShorthand($value[$at + 1] ?? '')) => 'short',
+					default => 'byte',
+				};
 				$set = self::parseAtom($value, $at, $ci);
 				// `\b`, `\B`: zero-width, and no quantifier is read after them
 				if($set === null)
 				{
-					$items[] = ['type' => 'zero'];
+					$items[] = ['type' => 'zero', 'anchor' => ''];
 					
 					continue;
 				}
-				$item = ['type' => 'set', 'set' => $set, 'nullable' => false];
+				$item = ['type' => 'set', 'set' => $set, 'nullable' => false, 'kind' => $kind];
 			}
 			
-			[$min, $max] = self::parseQuantifier($value, $at);
+			[$min, $max, $reach, $lazy] = self::parseQuantifier($value, $at);
 			$item['min'] = $min;
 			$item['max'] = $max;
+			$item['reach'] = $reach;
+			$item['lazy'] = $lazy;
 			$item['nullable'] = $item['nullable'] || $min === 0;
 			$items[] = $item;
 		}
@@ -3415,10 +4832,12 @@ final class RegexGate
 	}
 	
 	/**
-	 * `* + ? {n} {n,} {n,m}`, a lazy `?` after any of them; [1, 1] when
-	 * none follows (a `{` that is no count is a literal, read as an atom)
+	 * `* + ? {n} {n,} {n,m}`, a lazy `?` after any of them, as [min, max,
+	 * reach, lazy]: max null for none and for a large count, reach the
+	 * count's own max (null for none); [1, 1, 1, false] when none follows (a
+	 * `{` that is no count is a literal, read as an atom)
 	 *
-	 * @return array{0: int, 1: int|null}
+	 * @return array{0: int, 1: int|null, 2: int|null, 3: bool}
 	 */
 	protected static function parseQuantifier(
 		string $value,
@@ -3428,9 +4847,9 @@ final class RegexGate
 		$char = $value[$at] ?? '';
 		$quantifier = match($char)
 		{
-			'*' => [0, null],
-			'+' => [1, null],
-			'?' => [0, 1],
+			'*' => [0, null, null],
+			'+' => [1, null, null],
+			'?' => [0, 1, 1],
 			default => null,
 		};
 		if($quantifier !== null)
@@ -3444,19 +4863,17 @@ final class RegexGate
 			$max = ($match[3] ?? '') === '' ? null : (int)$match[3];
 			// a large count backtracks like an unbounded one: read as one
 			$quantifier = isset($match[2]) === false
-				? [$min, $min]
-				: [$min, self::isUnboundedMax($max) ? null : $max];
+				? [$min, $min, $min]
+				: [$min, self::isUnboundedMax($max) ? null : $max, $max];
 		}
 		else
 		{
-			return [1, 1];
+			return [1, 1, 1, false];
 		}
-		if(($value[$at] ?? '') === '?')
-		{
-			$at++;
-		}
+		$lazy = ($value[$at] ?? '') === '?';
+		$at+= $lazy ? 1 : 0;
 		
-		return $quantifier;
+		return [...$quantifier, $lazy];
 	}
 	
 	/**
@@ -4207,6 +5624,9 @@ final class Kernel
 	/** the key the stored record is sealed under (Ruleset::seal()): given, or derived from the API key (sealKey()) */
 	protected string $sealKey;
 	
+	/** @var array<string, array{width: ?int, cost: int}> what each pattern weighs (weighs()), by its `ci` and value */
+	protected static array $weights = [];
+	
 	/**
 	 * @param string $url codesafe instance base URL
 	 * @param string $key the project api_key
@@ -4578,7 +5998,8 @@ final class Kernel
 	 * A rule's predicate over the request: the fragment of the first of the
 	 * field's subjects (Facts::subjects()) it matches, or null; $unread says
 	 * whether PCRE gave up on a subject that matched nothing (its JIT stack,
-	 * its backtrack or recursion limit)
+	 * its backtrack or recursion limit) — never the subject cut without the
+	 * JIT, which a match rule reads as no match (Facts::REGEX_SUBJECT_CAP)
 	 */
 	protected function matched(
 		array $rule,
@@ -4589,12 +6010,23 @@ final class Kernel
 		$unread = false;
 		foreach($facts->subjects((string)$rule['field']) as $subject)
 		{
+			if(($rule['op'] ?? '') === Ruleset::OP_REGEX)
+			{
+				// the request's budget lets a long subject be read whole without the JIT
+				$found = self::regexFind((string)($rule['value'] ?? ''), ($rule['ci'] ?? true) === true, $subject, false, $facts);
+				if($found['found'] !== null)
+				{
+					return $found['found'];
+				}
+				$unread = $unread || $found['error'];
+				
+				continue;
+			}
 			$matched = self::match($rule, $subject);
 			if($matched !== null)
 			{
 				return $matched;
 			}
-			$unread = $unread || (($rule['op'] ?? '') === Ruleset::OP_REGEX && preg_last_error() !== PREG_NO_ERROR);
 		}
 		
 		return null;
@@ -5669,7 +7101,8 @@ final class Kernel
 		}
 		// unreadable: an upload the host could not read — the host's failure, never a cap; $fileCut: one past the upload budget
 		[$values, $unreadable, $fileCut] = $upload !== null
-			? self::contents($facts, $upload, Facts::fileWeight($test, self::widthOf($condition))) : [self::values($target, $facts), false, false];
+			? self::contents($facts, $upload, Facts::fileWeight($test, self::patternOf($condition), ($condition['ci'] ?? true) === true))
+			: [self::values($target, $facts), false, false];
 		if($test === 'exists')
 		{
 			return $values === [] ? ($formCut ? $cut : null) : ['matched' => $values[0], 'resolved' => true];
@@ -5740,13 +7173,16 @@ final class Kernel
 				{
 					return $cut;
 				}
-				if(self::passes($test, $decoded, $condition, $facts->host()))
+				// an upload's regex runs over all of it, which its weight keeps short; any other value's past Facts::REGEX_SUBJECT_CAP may go unread without the JIT
+				$passed = $test === 'regex' || $test === 'not_regex'
+					? self::regexAnswer($test, $decoded, $condition, $upload !== null, $facts) : self::passes($test, $decoded, $condition, $facts->host());
+				if($passed === true)
 				{
 					return ['matched' => $decoded, 'resolved' => true];
 				}
 				// a pattern PCRE gave up on (its JIT stack, its backtrack or recursion limit) answered neither yes nor no, whatever it read:
-				// `(ab)+c` does on 16 KiB of `ab` under the JIT
-				$short = $short || (($test === 'regex' || $test === 'not_regex') && preg_last_error() !== PREG_NO_ERROR);
+				// `(ab)+c` does on 16 KiB of `ab` under the JIT; so did one that read only the first KiB of a value without the JIT
+				$short = $short || $passed === null;
 			}
 		}
 		// what a step left unread, an upload past the budget or a value past a pattern's reach may hold
@@ -5782,15 +7218,14 @@ final class Kernel
 		return $platform !== null && method_exists($platform, 'unread') && $platform->unread($target, $facts) === true;
 	}
 	
-	/** the atoms a regex test's pattern reads at one start where it holds no quantifier (RegexGate::width()); null for any other test or pattern */
-	protected static function widthOf(
+	/** a regex test's pattern, what Facts::fileWeight() weighs it by; null for any other test */
+	protected static function patternOf(
 		array $condition,
-	): ?int
+	): ?string
 	{
 		$test = (string)($condition['test'] ?? '');
 		
-		return ($test === 'regex' || $test === 'not_regex') && is_string($condition['value'] ?? null)
-			? RegexGate::width($condition['value'], ($condition['ci'] ?? true) === true) : null;
+		return ($test === 'regex' || $test === 'not_regex') && is_string($condition['value'] ?? null) ? $condition['value'] : null;
 	}
 	
 	/**
@@ -6356,17 +7791,187 @@ final class Kernel
 		return '~' . (string)preg_replace('#(?<!\\\\)((?:\\\\\\\\)*)~#', '$1\\~', $value) . '~D' . ($ci ? 'i' : '');
 	}
 	
-	/** whether a regex matches, as match() runs it: null when the engine refuses the pattern */
+	/**
+	 * Whether a regex matches, as match() runs it: null when the engine
+	 * refuses the pattern or gives up, or when no match in a subject cut at
+	 * Facts::REGEX_SUBJECT_CAP says nothing of the rest
+	 */
 	protected static function regexes(
 		string $pattern,
 		string $subject,
 		bool $ci,
 	): ?bool
 	{
-		// @: a pattern PCRE refuses warns and returns false
-		$found = @preg_match(self::regexPattern($pattern, $ci), $subject);
+		$found = self::regexFind($pattern, $ci, $subject, false);
 		
-		return $found === false ? null : $found === 1;
+		return $found['unread'] ? null : $found['found'] !== null;
+	}
+	
+	/**
+	 * A regex or not_regex test over a value as a condition reads it
+	 * (regexFind()): true or false, null where the answer is not known,
+	 * which leaves the condition unread; an upload's whole ($whole), within
+	 * its weight
+	 */
+	protected static function regexAnswer(
+		string $test,
+		string $subject,
+		array $condition,
+		bool $whole,
+		Facts $facts,
+	): ?bool
+	{
+		$value = $condition['value'] ?? '';
+		$found = self::regexFind(is_string($value) ? $value : '', ($condition['ci'] ?? true) === true, $subject, $whole, $facts);
+		if($found['unread'])
+		{
+			return null;
+		}
+		
+		return $test === 'regex' ? $found['found'] !== null : $found['found'] === null;
+	}
+	
+	/**
+	 * A regex over a subject: `found`, the fragment it matched, null for
+	 * none; `unread`, whether that answer is not known — PCRE refused the
+	 * pattern or gave up on it (`error` says so), or, without the JIT or for
+	 * a pattern it runs without its early exit (RegexGate::loops()), one with a
+	 * quantifier read only Facts::REGEX_SUBJECT_CAP bytes of a longer
+	 * subject and found nothing there, or a match the cut ended that reads
+	 * the subject's end. `whole` reads all of it, as an upload is read
+	 * within its weight; with the JIT any other pattern, and a pattern
+	 * without a quantifier, reads all of it always; with the request's $facts, a
+	 * pattern with one reads all of it within what the request may still
+	 * spend (Facts::spendRegex()), its bytes weighted by the pattern's cost,
+	 * up to Facts::REGEX_WHOLE_MAX_INTERPRETED, and up to
+	 * Facts::REGEX_WHOLE_BYTES_INTERPRETED bytes whatever the cost
+	 *
+	 * @return array{found: ?string, unread: bool, error: bool}
+	 */
+	protected static function regexFind(
+		string $value,
+		bool $ci,
+		string $subject,
+		bool $whole,
+		?Facts $facts = null,
+	): array
+	{
+		// cut BEFORE the engine sees it: the interpreter's backtracking runs within pcre.backtrack_limit at every start,
+		// and the JIT's too where it has no early exit (RegexGate::loops())
+		$weighs = self::weighs($value, $ci);
+		$cut = $whole === false && strlen($subject) > Facts::REGEX_SUBJECT_CAP && (Facts::jit() === false || $weighs['loops']) && $weighs['width'] === null;
+		if($cut && $facts !== null)
+		{
+			$weighted = self::weighted(strlen($subject), $value, $ci);
+			$cut = strlen($subject) > Facts::REGEX_WHOLE_BYTES_INTERPRETED || $weighted > Facts::REGEX_WHOLE_MAX_INTERPRETED || $facts->spendRegex($weighted) === false;
+		}
+		$pattern = self::regexPattern($value, $ci);
+		// @: a pattern PCRE refuses warns and returns false, as does one it gives up on
+		$found = @preg_match($pattern, $cut ? substr($subject, 0, Facts::REGEX_SUBJECT_CAP) : $subject, $match, PREG_OFFSET_CAPTURE);
+		if($found === false)
+		{
+			return ['found' => null, 'unread' => true, 'error' => true];
+		}
+		if($found !== 1)
+		{
+			return ['found' => null, 'unread' => $cut, 'error' => false];
+		}
+		// the cut is not the subject's end: a match that reaches it stands only for a pattern that never reads the end —
+		// `\.php$` must not match a value whose first KiB happens to end in .php
+		if($cut && $match[0][1] + strlen($match[0][0]) >= Facts::REGEX_SUBJECT_CAP && self::readsTheEnd($value))
+		{
+			return ['found' => null, 'unread' => true, 'error' => false];
+		}
+		
+		return ['found' => $match[0][0], 'unread' => false, 'error' => false];
+	}
+	
+	/**
+	 * Whether a pattern reads the subject's end — an unescaped `$`, or `\b`
+	 * or `\B`, outside a class (the dialect has no lookarounds): only such a
+	 * pattern can match at the cut where it would not on the whole subject
+	 */
+	protected static function readsTheEnd(
+		string $pattern,
+	): bool
+	{
+		$inClass = false;
+		$n = strlen($pattern);
+		for($i = 0; $i < $n; $i++)
+		{
+			$char = $pattern[$i];
+			if($char === '\\')
+			{
+				$next = $pattern[$i + 1] ?? '';
+				if($inClass === false && ($next === 'b' || $next === 'B'))
+				{
+					return true;
+				}
+				$i++;
+			}
+			elseif($inClass)
+			{
+				$inClass = $char !== ']';
+			}
+			elseif($char === '[')
+			{
+				$inClass = true;
+			}
+			elseif($char === '$')
+			{
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * What a pattern weighs, asked once per pattern: `width`, its atoms where
+	 * it holds no quantifier (RegexGate::width()); `cost`, what one start of
+	 * it costs with an unbounded quantifier as RegexGate::RUN_COST_MAX, as a
+	 * byte budget weighs it (RegexGate::cost()); `loops`, whether PCRE's JIT
+	 * runs it as slowly as its interpreter does (RegexGate::loops()). A
+	 * pattern the gate cannot read
+	 * costs RUN_COST_MAX; the cache is dropped past 200
+	 *
+	 * @return array{width: ?int, cost: int, loops: bool}
+	 */
+	public static function weighs(
+		string $value,
+		bool $ci,
+	): array
+	{
+		$name = ($ci ? 'i:' : ':') . $value;
+		if(isset(self::$weights[$name]) === false)
+		{
+			if(count(self::$weights) > 200)
+			{
+				self::$weights = [];
+			}
+			self::$weights[$name] = [
+				'width' => RegexGate::width($value, $ci),
+				'cost' => RegexGate::cost($value, $ci, RegexGate::RUN_COST_MAX) ?? RegexGate::RUN_COST_MAX,
+				'loops' => RegexGate::loops($value, $ci),
+			];
+		}
+		
+		return self::$weights[$name];
+	}
+	
+	/**
+	 * Bytes a pattern reads weighted by what one start of it costs, over
+	 * RegexGate::RUN_COST_MAX and rounded up: one with `+` weighs them at
+	 * least once (`\w+x` 1, `\w{1,4}\w+x` 4), one of counts alone by its cost
+	 * (`\w{1,4}\w{1,4}x` 1/64)
+	 */
+	public static function weighted(
+		int $bytes,
+		string $value,
+		bool $ci,
+	): int
+	{
+		return intdiv($bytes * self::weighs($value, $ci)['cost'] + RegexGate::RUN_COST_MAX - 1, RegexGate::RUN_COST_MAX);
 	}
 	
 	/**
@@ -6467,10 +8072,8 @@ final class Kernel
 			case Ruleset::OP_CIDR:
 				return self::inCidr($value, $subject) ? $subject : null;
 			case Ruleset::OP_REGEX:
-				$pattern = self::regexPattern($value, $ci);
-				
-				// @: a pattern PCRE refuses warns, returns false and matches nothing
-				return @preg_match($pattern, $subject, $m) === 1 ? (string)$m[0] : null;
+				// a pattern PCRE refuses matches nothing, as does one past the cut without the JIT
+				return self::regexFind($value, $ci, $subject, false)['found'];
 			default:
 				return null;
 		}
