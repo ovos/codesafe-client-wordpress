@@ -16,7 +16,7 @@ use function update_option;
  */
 final class Plugin
 {
-	public const VERSION = '1.0.2';
+	public const VERSION = '1.0.3';
 	
 	protected static ?self $instance = null;
 	
