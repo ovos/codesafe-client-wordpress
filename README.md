@@ -224,6 +224,7 @@ With it, every anonymous request is judged before WordPress exists. The settings
 - **A token or XML-RPC.** A REST request with a token another plugin reads (Bearer, JWT, OAuth) and an XML-RPC call meet the rules for anyone here. The rules for anonymous visitors or a capability wait until WordPress has signed the caller in.
 - **Pages that load no plugins.** WordPress's installer pages (`wp-admin/install.php`, `upgrade.php`, `setup-config.php`) and `wp-activate.php` are judged whole here, cookie or not, as is a direct hit on a plugin's file.
 - **Update directories.** Before any rule, the layer refuses every PHP file run from WordPress's update working directories (`wp-content/upgrade/`, `upgrade-temp-backup/`); the updater never requests them over HTTP.
+- **Uploads.** Before any rule, the layer refuses every script run from under uploads, whatever its name, with 403 and `X-Shield-Guard: uploads`; nothing honest requests PHP there. An uploads directory at or above the site root, the content or the plugins directory is never guarded, so a broken `upload_dir` filter cannot lock the site out. `define('CODESAFE_UPLOADS_GUARD', false);` turns this guard off alone. A `.user.ini` or `.htaccess` under uploads, or above it, that switches the prepend off is an urgent integrity-scan finding.
 
 What the layer leaves on your server, and what it never touches:
 

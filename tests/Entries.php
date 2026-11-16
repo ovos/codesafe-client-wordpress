@@ -12,7 +12,9 @@ use Ovos\Codesafe\Shield\Prepend;
 use Ovos\Test;
 use Ovos\Test\Internal;
 
+use function array_column;
 use function array_diff;
+use function array_filter;
 use function array_key_exists;
 use function array_keys;
 use function array_replace;
@@ -23,15 +25,19 @@ use function escapeshellarg;
 use function exec;
 use function file_get_contents;
 use function file_put_contents;
+use function in_array;
 use function is_dir;
 use function md5;
 use function mkdir;
+use function preg_grep;
+use function preg_match;
 use function preg_match_all;
 use function realpath;
 use function rmdir;
 use function scandir;
 use function str_contains;
 use function str_replace;
+use function str_starts_with;
 use function substr;
 use function sys_get_temp_dir;
 use function uniqid;
@@ -729,6 +735,149 @@ class Entries extends Test
 			&& str_contains($detail, 'GET');
 	}
 	
+	/**
+	 * RULE: a hit the guard refused is counted apart from the runs, on the
+	 * same record: n stays every hit, `refused` the refused ones; a record an
+	 * older plugin wrote, without `refused`, ran every time. Falsify: count
+	 * a refused hit as a run — the console reads a shell that never ran as
+	 * one that did.
+	 */
+	public function aRefusedHitIsCountedApartFromTheRuns(): bool
+	{
+		$this->clearQueue();
+		$consent = $this->consent();
+		$path = 'wp-content/uploads/2026/09/x.php';
+		Prepend::entry($this->dir, $this->server($path), $consent, 1789390000, true);
+		$one = Prepend::seen($this->dir)['paths'][$path] ?? [];
+		Prepend::entry($this->dir, $this->server($path), $consent, 1789390060);
+		Prepend::entry($this->dir, $this->server($path), $consent, 1789390120, true);
+		$three = Prepend::seen($this->dir)['paths'][$path] ?? [];
+		
+		return ($one['n'] ?? 0) === 1 && ($one['refused'] ?? -1) === 1
+			&& ($three['n'] ?? 0) === 3 && ($three['refused'] ?? -1) === 2
+			&& BaseEntries::runs($three) === [1, 2]
+			&& BaseEntries::runs(['n' => 4]) === [4, 0]
+			&& BaseEntries::runs(['n' => 2, 'refused' => 9]) === [0, 2];
+	}
+	
+	/**
+	 * RULE: a file under uploads every request of which the guard refused
+	 * stays executed_uploads URGENT — it is there and someone knows its
+	 * path — and its line opens "refused N×, no run recorded", the finding
+	 * carrying the runs and the refusals for codesafe; one that also ran
+	 * says both; a record without refusals reads as before and carries
+	 * neither count. Falsify: word a refused file as executed — the console
+	 * advises on a shell that never ran as on one that did; lower its tier —
+	 * an uploaded shell waits for the scan.
+	 */
+	public function aRefusedFileSaysItNeverRanAndStaysUrgent(): bool
+	{
+		$relative = 'wp-content/uploads/2026/09/x.php';
+		$refused = $this->judge($relative, ['refused' => 3] + $this->record(md5('x')))['finding'] ?? [];
+		$both = $this->judge($relative, ['refused' => 1] + $this->record(md5('x')))['finding'] ?? [];
+		$ran = $this->judge($relative, $this->record(md5('x')))['finding'] ?? [];
+		
+		return ($refused['detector'] ?? '') === 'executed_uploads' && $refused['tier'] === 'urgent'
+			&& str_starts_with((string)$refused['detail'], 'refused 3×, no run recorded · first 14.09. 12:46 · last 14.09. 12:48 UTC · from ' . self::IP)
+			&& ($refused['ran'] ?? -1) === 0 && ($refused['refused'] ?? 0) === 3
+			&& ($both['tier'] ?? '') === 'urgent' && str_starts_with((string)$both['detail'], 'ran 2×, refused 1× · first ')
+			&& ($both['ran'] ?? -1) === 2 && ($both['refused'] ?? 0) === 1
+			&& str_starts_with((string)($ran['detail'] ?? ''), 'executed 3× · first ')
+			&& array_key_exists('refused', $ran) === false && array_key_exists('ran', $ran) === false;
+	}
+	
+	/**
+	 * RULE: through a drain, the security event of a file the guard refused
+	 * every time says so in its line, not "ran", and counts the refusals in
+	 * its extra beside the hits. Falsify: keep the line's "ran 3×" — the
+	 * offender bar reads an attempt as a run.
+	 */
+	public function theEventOfARefusedFileSaysItNeverRan(): bool
+	{
+		$GLOBALS['wp']['options'][Config::OPTION] = ['enabled' => true, 'url' => 'https://codesafe.example', 'api_key' => 'k'];
+		$sender = new class(new Config) extends Sender
+		{
+			/** @var list<array<string, mixed>> what the flushes would have posted */
+			public array $sent = [];
+			
+			public function flush(): void
+			{
+				$this->sent = [...$this->sent, ...$this->queue];
+				$this->queue = [];
+			}
+		};
+		$drained = $this->entries(true, $sender)->drain($this->dir, ['paths' => [
+			'wp-content/uploads/2026/09/x.php' => ['refused' => 3] + $this->record(md5('x')),
+		], 'dropped' => 0]);
+		$event = $sender->sent[0] ?? [];
+		
+		return $drained['sent'] === 202
+			&& ($drained['findings'][0]['refused'] ?? 0) === 3
+			&& ($event['message'] ?? '') === 'wp-content/uploads/2026/09/x.php refused 3×, no run recorded — PHP under uploads, refused by the uploads guard'
+			&& ($event['extra']['refused'] ?? 0) === 3
+			&& ($event['extra']['hits'] ?? 0) === 3;
+	}
+	
+	/**
+	 * RULE: a file a guard refused every time never reads as one that ran,
+	 * whatever the judge calls it — a root stranger, a hidden path, loose in
+	 * wp-content, a leftover, a foreign or modified core or plugin file, one
+	 * gone since: its line says "no run recorded" and never "ran", and its
+	 * security event wears the words of what it is; the same leftover that
+	 * ran still says "code ran", a modified file "md5 as it ran". Falsify:
+	 * keep "· code ran" on a refused leftover, or "md5 as it ran" on a
+	 * refused file; word a refused hidden file's event with LABELS — it
+	 * says "ran".
+	 */
+	public function aRefusedFileNeverReadsAsOneThatRan(): bool
+	{
+		$refused = fn(string $md5 = ''): array => ['refused' => 3] + $this->record($md5);
+		$paths = ['about.php' => '', 'tools/app.php' => '', 'wp-admin/evil.php' => '', 'wp-includes/version.php' => md5('an eval appended'),
+			'wp-content/x.php' => '', 'wp-content/.hidden/s.php' => '', 'wp-content/uploads/2026/09/x.php' => '', 'wp-content/gone.php' => '',
+			'wp-content/plugins/akismet/inc.php' => '', 'wp-content/plugins/akismet/akismet.php' => md5('an eval appended'),
+			'wp-content/plugins/leftover/inc.php' => '', 'wp-content/wp-rocket-config/site.php' => ''];
+		$details = [];
+		$detectors = [];
+		foreach($paths as $path => $md5)
+		{
+			$finding = $this->judge($path, $refused($md5))['finding'] ?? [];
+			$details[$path] = (string)($finding['detail'] ?? '');
+			$detectors[$path] = (string)($finding['detector'] ?? '');
+		}
+		$ranWord = array_filter($details, static fn(string $detail): bool => $detail === '' || preg_match('~\bran\b~', $detail) === 1
+			|| str_starts_with($detail, 'refused 3×, no run recorded · ') === false);
+		$ranLeftover = (string)($this->judge('wp-content/wp-rocket-config/site.php', $this->record())['finding']['detail'] ?? '');
+		$ranModified = (string)($this->judge('wp-includes/version.php', $this->record(md5('an eval appended')))['finding']['detail'] ?? '');
+		$GLOBALS['wp']['options'][Config::OPTION] = ['enabled' => true, 'url' => 'https://codesafe.example', 'api_key' => 'k'];
+		$sender = new class(new Config) extends Sender
+		{
+			/** @var list<array<string, mixed>> what the flushes would have posted */
+			public array $sent = [];
+			
+			public function flush(): void
+			{
+				$this->sent = [...$this->sent, ...$this->queue];
+				$this->queue = [];
+			}
+		};
+		$this->entries(true, $sender)->drain($this->dir, ['paths' => [
+			'wp-content/.hidden/s.php' => $refused(),
+			'wp-content/wp-rocket-config/site.php' => $refused(),
+		], 'dropped' => 0]);
+		$messages = array_column($sender->sent, 'message');
+		
+		return $ranWord === []
+			&& $detectors['wp-content/.hidden/s.php'] === 'executed_hidden' && $detectors['wp-content/gone.php'] === 'executed_vanished'
+			&& $detectors['wp-includes/version.php'] === 'executed_core_modified' && $detectors['wp-content/plugins/akismet/akismet.php'] === 'executed_plugin_modified'
+			&& $detectors['wp-content/wp-rocket-config/site.php'] === 'executed_leftover'
+			&& str_contains($details['wp-includes/version.php'], 'md5 as first seen differs')
+			&& str_contains($details['wp-content/wp-rocket-config/site.php'], 'in wp-rocket-config/ (wp-rocket, not installed)')
+			&& str_contains($ranLeftover, 'in wp-rocket-config/ (wp-rocket, not installed) · code ran')
+			&& str_contains($ranModified, 'md5 as it ran differs')
+			&& in_array('wp-content/.hidden/s.php refused 3×, no run recorded — PHP in a hidden path', $messages, true)
+			&& in_array('wp-content/wp-rocket-config/site.php refused 3×, no run recorded — a file inside a directory of software the site does not run', $messages, true);
+	}
+	
 	public function learnAddsToTheKnownSetBesideTheCoreEntries(): bool
 	{
 		$this->entries()->learnNow($this->dir, ['wp-content/plugins/akismet/akismet.php', 'wp-content/plugins/premium/api.php']);
@@ -881,8 +1030,10 @@ class Entries extends Test
 	/**
 	 * RULE: every word the judge answers has its words for the security
 	 * event's line — the listed ones and every executed_ word written in the
-	 * judge's source — except inert_php, the scan's own. Falsify: drop
-	 * executed_leftover's label — its event names the raw word.
+	 * judge's source — except inert_php, the scan's own; and the same words
+	 * for a file a guard refused every time, none of which says it ran.
+	 * Falsify: drop executed_leftover's label — its event names the raw
+	 * word; drop a refused label, or let one say "ran".
 	 */
 	public function everyVerdictHasALabel(): bool
 	{
@@ -894,7 +1045,9 @@ class Entries extends Test
 		
 		return array_diff($words, array_keys(BaseEntries::LABELS)) === []
 			&& array_key_exists('inert_php', BaseEntries::LABELS) === false
-			&& count($written[1]) > 0;
+			&& count($written[1]) > 0
+			&& array_keys(BaseEntries::REFUSED_LABELS) === array_keys(BaseEntries::LABELS)
+			&& preg_grep('~\bran\b~', BaseEntries::REFUSED_LABELS) === [];
 	}
 	
 	/**

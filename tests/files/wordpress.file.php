@@ -37,6 +37,10 @@ function wp_shim_reset(): void
 		// one, the user's id (is_super_admin), and the main site's options
 		'multisite' => false,
 		'main_site' => true,
+		// is_main_network(): whether the current network is the installation's first
+		'main_network' => true,
+		// wp_get_upload_dir()'s basedir: '' answers as a site without the function did
+		'upload_basedir' => '',
 		'user_id' => 0,
 		'main_options' => [],
 		// .sig and zip downloads, by URL
@@ -343,6 +347,17 @@ function is_multisite(): bool
 function is_main_site(): bool
 {
 	return $GLOBALS['wp']['main_site'];
+}
+
+function is_main_network(): bool
+{
+	return $GLOBALS['wp']['main_network'];
+}
+
+/** the upload directory as WordPress resolves it, without making it */
+function wp_get_upload_dir(): array
+{
+	return ['basedir' => $GLOBALS['wp']['upload_basedir'], 'error' => false];
 }
 
 function get_main_site_id(): int

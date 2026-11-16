@@ -134,14 +134,16 @@ class Scan extends Test
 	 * @param array{store: string, stub: string, legacy: string} $store
 	 * @param array<string, string> $versions plugin directory => version, for the checksum lists
 	 * @param array<string, int> $limits walk bounds lowered for the test, by name
+	 * @param string $userIni the name user_ini.filename gives the per-directory ini, '' for PHP's own setting
 	 */
 	protected function scanner(
 		array $store,
 		array $versions = [],
 		array $limits = [],
+		string $userIni = '',
 	): PluginScan
 	{
-		return new class(new Config, $this->roots, $store, $versions, $limits) extends PluginScan
+		return new class(new Config, $this->roots, $store, $versions, $limits, $userIni) extends PluginScan
 		{
 			public function __construct(
 				Config $config,
@@ -149,9 +151,15 @@ class Scan extends Test
 				protected array $own,
 				protected array $versions,
 				protected array $limits,
+				protected string $renamedIni,
 			)
 			{
 				parent::__construct($config);
+			}
+			
+			protected function userIniName(): string
+			{
+				return $this->renamedIni === '' ? parent::userIniName() : $this->renamedIni;
 			}
 			
 			public function roots(): array
@@ -1057,6 +1065,148 @@ class Scan extends Test
 		
 		return $this->verdicts($orphaned, 'cache/docket-cache/abc-def.php') === ['cache_php high']
 			&& $this->skippedUnder($walked, 'content:cache') === false;
+	}
+	
+	/**
+	 * RULE: under uploads, an auto_prepend_file that is not this plugin's
+	 * stub replaces the root's prepend for the scripts there, and with it the
+	 * uploads guard: `none`, `off`, empty, another file, a plugin's own file —
+	 * in a .user.ini, a php.ini, an .htaccess php_value or SetEnv PHP_VALUE /
+	 * PHP_ADMIN_VALUE line, and the file user_ini.filename names — is
+	 * prepend_off_uploads URGENT, naming the file it points at, never the
+	 * line. The stub itself stays directive_owned INFO, an auto_append_file
+	 * stays what it was, a file by another name is no directive file, and
+	 * outside uploads a `none` is still nothing. Falsify: keep calling
+	 * `none` harmless under uploads — the guard's off switch is never seen;
+	 * vouch for the whole store directory instead of the stub — a planted
+	 * prepend beside it passes; skip the renamed ini — PHP reads it, the
+	 * scan does not.
+	 */
+	public function aPrependSwitchedOffUnderUploadsIsUrgent(): bool
+	{
+		$content = $this->roots['content'];
+		$own = $content . '/ovos-codesafe';
+		$store = ['store' => $own, 'stub' => $own, 'legacy' => $content . '/ovos-console'];
+		mkdir($this->roots['plugins'] . '/ovos-codesafe', 0700, true);
+		mkdir($this->roots['plugins'] . '/wordfence', 0700, true);
+		$off = ['prepend_off_uploads urgent'];
+		$planted = [
+			'a/.user.ini' => ["auto_prepend_file = none\n", $off],
+			'b/.user.ini' => ["auto_prepend_file = off\n", $off],
+			'c/.user.ini' => ["auto_prepend_file =\n", $off],
+			'd/.user.ini' => ["auto_prepend_file = \"/tmp/x.php\"\n", $off],
+			'e/.user.ini' => ["auto_prepend_file = \"" . $this->roots['plugins'] . "/wordfence/waf.php\"\n", $off],
+			'f/.htaccess' => ["php_value auto_prepend_file none\n", $off],
+			'g/.htaccess' => ["SetEnv PHP_VALUE \"auto_prepend_file=none\"\n", $off],
+			'h/.htaccess' => ["SetEnv PHP_ADMIN_VALUE \"auto_prepend_file=/tmp/x.php\"\n", $off],
+			'i/php.ini' => ["auto_prepend_file = \"\"\n", $off],
+			'j/.site.ini' => ["; renamed by user_ini.filename\nauto_prepend_file = none\n", $off],
+			'own/.user.ini' => ["auto_prepend_file = \"" . $own . '/' . Prepend::STUB . "\"\n", ['directive_owned info']],
+			'beside/.user.ini' => ["auto_prepend_file = \"" . $own . "/other.php\"\n", $off],
+			'append/.user.ini' => ["auto_append_file = none\n", []],
+			'k/.other.ini' => ["auto_prepend_file = none\n", []],
+		];
+		foreach($planted as $path => [$source])
+		{
+			$this->write($this->roots['uploads'] . '/' . $path, $source);
+		}
+		$this->write($content . '/elsewhere/.user.ini', "auto_prepend_file = none\n");
+		$scan = $this->scanner($store, userIni: '.site.ini');
+		$state = $scan->start('manual');
+		$state['phases'] = array_values(array_filter($state['phases'], static fn(array $phase): bool => in_array($phase[0], ['uploads', 'content'], true)));
+		$state['checksums']['core'] = 'unavailable';
+		$walked = $scan->advance($state, 10_000);
+		// a store that cannot be named vouches for no stub: a bare name at the top is no stub of this plugin's
+		$this->write($this->roots['uploads'] . '/top/.user.ini', 'auto_prepend_file = "/' . Prepend::STUB . "\"\n");
+		$unnamed = $this->walk(['store' => '', 'stub' => '', 'legacy' => ''], ['uploads']);
+		
+		foreach($planted as $path => [, $expected])
+		{
+			if($this->verdicts($walked, $path) !== $expected)
+			{
+				return false;
+			}
+		}
+		
+		return $this->verdicts($unnamed, 'top/.user.ini') === $off
+			&& $this->verdicts($walked, 'elsewhere/.user.ini') === []
+			&& $this->detail($walked, 'a/.user.ini') === 'auto_prepend_file switched off under uploads'
+			&& $this->detail($walked, 'h/.htaccess') === 'auto_prepend_file under uploads → x.php'
+			&& $this->line($walked, 'j/.site.ini') === 2;
+	}
+	
+	/**
+	 * RULE: a directive spelled to slip past a line-by-line reading is read
+	 * as PHP and Apache read it — quotes around the setting's name, an
+	 * .htaccess line continued with a backslash, one the file ends on — and a
+	 * directive file whose settings reach uploads and that runs past what the
+	 * scan reads is URGENT itself, without a line. A joined directive keeps
+	 * its first line's number and the lines after it keep theirs; a .user.ini
+	 * line is never joined, nor is a comment. Above uploads the switch
+	 * reaches uploads too: in wp-content any prepend but the stub is
+	 * prepend_off_uploads, at the site root only switching it off is — another
+	 * target there, the operator's own site-wide prepend, keeps its word —
+	 * and the stub stays directive_owned at either. Falsify: judge the line
+	 * with its quotes — the quoted name runs past; skip the join, or the
+	 * flush at the end — the split name runs past; join .user.ini lines or
+	 * comments — a directive after a comment runs past; drop the size check
+	 * — a padded .user.ini runs past; judge by area alone — wp-content's and
+	 * the root's switch read harmless; read the root as wp-content —
+	 * Wordfence's root prepend turns URGENT.
+	 */
+	public function aDirectiveSpelledOrPlacedToSlipPastIsStillFound(): bool
+	{
+		$root = $this->roots['root'];
+		$content = $this->roots['content'];
+		$uploads = $this->roots['uploads'];
+		$own = $content . '/ovos-codesafe';
+		$store = ['store' => $own, 'stub' => $own, 'legacy' => $content . '/ovos-console'];
+		mkdir($this->roots['plugins'] . '/ovos-codesafe', 0700, true);
+		mkdir($this->roots['plugins'] . '/wordfence', 0700, true);
+		$padding = str_repeat("; a line of padding\n", 4000);
+		$this->write($uploads . '/q/.htaccess', "php_value \"auto_prepend_file\" none\n");
+		$this->write($uploads . '/c/.htaccess', "# split\nphp_value auto_prepend_\\\nfile none\nphp_flag engine on\n");
+		$this->write($uploads . '/e/.htaccess', "php_value auto_prepend_file none\\");
+		$this->write($uploads . '/n/.user.ini', "; a comment \\\nauto_prepend_file = none\n");
+		$this->write($uploads . '/k/.htaccess', "# a comment \\\nphp_value auto_prepend_file none\n");
+		$this->write($uploads . '/pad/.user.ini', $padding . "auto_prepend_file = none\n");
+		$this->write($content . '/.user.ini', "auto_prepend_file = \"" . $this->roots['plugins'] . "/wordfence/waf.php\"\n");
+		$this->write($content . '/.htaccess', "php_value auto_prepend_file \"" . $own . '/' . Prepend::STUB . "\"\n");
+		$this->write($root . '/.user.ini', "auto_prepend_file = none\n");
+		$this->write($root . '/.htaccess', "php_value auto_prepend_file \"" . $root . "/wordfence-waf.php\"\n" . $padding);
+		$walked = $this->walk($store, ['uploads', 'content', 'root']);
+		// the operator's own site-wide prepend, naming the stub
+		$this->write($root . '/.user.ini', "auto_prepend_file = \"" . $own . '/' . Prepend::STUB . "\"\n");
+		$stub = $this->walk($store, ['root']);
+		$at = static function(array $state, string $area, string $path, string $field = ''): array
+		{
+			$found = [];
+			foreach($state['findings'] as $finding)
+			{
+				if($finding['area'] === $area && $finding['path'] === $path)
+				{
+					$found[] = $field !== '' ? (string)($finding[$field] ?? '') : $finding['detector'] . ' ' . $finding['tier'] . ' ' . (int)($finding['line'] ?? 0);
+				}
+			}
+			
+			return $found;
+		};
+		$off = ['prepend_off_uploads urgent 1'];
+		
+		return $at($walked, 'uploads', 'q/.htaccess') === $off
+			&& $at($walked, 'uploads', 'c/.htaccess') === ['prepend_off_uploads urgent 2', 'engine_on_uploads urgent 4']
+			&& $at($walked, 'uploads', 'e/.htaccess') === $off
+			&& $at($walked, 'uploads', 'n/.user.ini') === ['prepend_off_uploads urgent 2']
+			&& $at($walked, 'uploads', 'k/.htaccess') === ['prepend_off_uploads urgent 2']
+			&& $at($walked, 'uploads', 'pad/.user.ini') === ['prepend_off_uploads urgent 0']
+			&& $at($walked, 'uploads', 'pad/.user.ini', 'detail') === ['over 64 KB, read only that far: the rest can switch the prepend off for uploads']
+			&& $at($walked, 'content', '.user.ini') === $off
+			&& $at($walked, 'content', '.user.ini', 'detail') === ['auto_prepend_file here and for uploads below → waf.php']
+			&& $at($walked, 'content', '.htaccess') === ['directive_owned info 1']
+			&& $at($walked, 'root', '.user.ini') === $off
+			&& $at($walked, 'root', '.user.ini', 'detail') === ['auto_prepend_file switched off here and for uploads below']
+			&& $at($walked, 'root', '.htaccess') === ['prepend_off_uploads urgent 0', 'directive_owned info 1']
+			&& $at($stub, 'root', '.user.ini') === ['directive_owned info 1'];
 	}
 	
 	/**

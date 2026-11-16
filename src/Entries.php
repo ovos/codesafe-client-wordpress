@@ -36,6 +36,7 @@ use function mb_substr;
 use function md5;
 use function md5_file;
 use function microtime;
+use function min;
 use function preg_match;
 use function random_bytes;
 use function realpath;
@@ -132,6 +133,23 @@ class Entries
 		'executed_leftover' => 'a file ran inside a directory of software the site does not run',
 		'executed_inactive' => 'a file of a plugin or theme active on no site ran directly',
 		'executed_vanished' => 'a file ran and is gone since',
+	];
+	
+	/** LABELS for a file every request of which a guard refused: what the file is, never that it ran */
+	public const REFUSED_LABELS = [
+		'executed_uploads' => 'PHP under uploads, refused by the uploads guard',
+		'executed_root' => 'PHP in the document root that core did not ship',
+		'executed_root_owned' => 'a plugin\'s root file',
+		'executed_hidden' => 'PHP in a hidden path',
+		'executed_content' => 'PHP in wp-content outside any plugin or theme',
+		'executed_core_foreign' => 'a file under core that wordpress.org never shipped',
+		'executed_core_modified' => 'a core file differing from what wordpress.org shipped',
+		'executed_plugin_foreign' => 'a file in a wp.org plugin that its release never shipped',
+		'executed_plugin_modified' => 'a plugin file differing from what wordpress.org shipped',
+		'executed_unverified' => 'a file no list vouches for',
+		'executed_leftover' => 'a file inside a directory of software the site does not run',
+		'executed_inactive' => 'a file of a plugin or theme active on no site, requested directly',
+		'executed_vanished' => 'a file requested and gone since',
 	];
 	
 	protected int $fetches = 0;
@@ -727,7 +745,9 @@ class Entries
 			return self::verdict(null, true);
 		}
 		
-		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record, $lead . 'md5 as it ran differs from the wordpress.org list for this version');
+		// the md5 is taken when the file is first seen, which for a refused file is no run
+		return $this->finding('executed_' . $kind . '_modified', Scan::TIER_URGENT, $area, $path, $record,
+			$lead . 'md5 ' . (self::runs($record)[0] === 0 ? 'as first seen' : 'as it ran') . ' differs from the wordpress.org list for this version');
 	}
 	
 	/**
@@ -748,7 +768,8 @@ class Entries
 	{
 		return $this->ranInert($file, $record)
 			? $this->finding('executed_leftover', Scan::TIER_INFO, $area, $path, $record, $place . ' · stops before any code runs', true)
-			: $this->finding('executed_leftover', $tier, $area, $path, $record, $place . ' · code ran');
+			// a guard that refused every request kept the code from running: the detail already opens with that
+			: $this->finding('executed_leftover', $tier, $area, $path, $record, $place . (self::runs($record)[0] === 0 ? '' : ' · code ran'));
 	}
 	
 	/**
@@ -982,7 +1003,32 @@ class Entries
 			}
 		}
 		
+		[$ran, $refused] = self::runs($record);
+		
+		// the guard's share, for codesafe to tell a file that never ran from one that did
+		if($refused > 0)
+		{
+			$finding['ran'] = $ran;
+			$finding['refused'] = $refused;
+		}
+		
 		return self::verdict($finding, $learn);
+	}
+	
+	/**
+	 * How many of a record's hits ran and how many a guard refused; a record
+	 * without `refused` (an older plugin's) ran every time
+	 *
+	 * @return array{0: int, 1: int}
+	 */
+	public static function runs(
+		array $record,
+	): array
+	{
+		$n = max(1, (int)($record['n'] ?? 1));
+		$refused = min($n, max(0, (int)($record['refused'] ?? 0)));
+		
+		return [$n - $refused, $refused];
 	}
 	
 	/**
@@ -999,20 +1045,28 @@ class Entries
 	
 	/**
 	 * The row's line: how often, when, from where — the request's own facts
-	 * ride the security event, this is the file's story in 160 characters
+	 * ride the security event, this is the file's story in 160 characters.
+	 * A file a guard refused says so first: "refused N×, no run recorded"
+	 * (codesafe's FILES advice keys on those words), or "ran M×, refused N×"
 	 */
 	protected function detail(
 		array $record,
 		string $more = '',
 	): string
 	{
-		$n = max(1, (int)($record['n'] ?? 1));
+		[$ran, $refused] = self::runs($record);
 		$first = (int)($record['first'] ?? 0);
 		$last = (int)($record['last'] ?? $first);
 		$context = is_array($record['context'] ?? null) ? $record['context'] : [];
 		$ip = (string)($context['ip'] ?? '');
 		$method = (string)($context['method'] ?? '');
-		$text = sprintf('executed %d× · first %s · last %s UTC', $n, gmdate('d.m. H:i', $first), gmdate('d.m. H:i', $last));
+		$runs = match(true)
+		{
+			$refused === 0 => sprintf('executed %d×', $ran),
+			$ran === 0 => sprintf('refused %d×, no run recorded', $refused),
+			default => sprintf('ran %d×, refused %d×', $ran, $refused),
+		};
+		$text = sprintf('%s · first %s · last %s UTC', $runs, gmdate('d.m. H:i', $first), gmdate('d.m. H:i', $last));
 		
 		if($ip !== '')
 		{
@@ -1143,11 +1197,19 @@ class Entries
 			
 			$record = $row['record'];
 			$n = max(1, (int)($record['n'] ?? 1));
+			[$ran, $refused] = self::runs($record);
 			$context = is_array($record['context'] ?? null) ? $record['context'] : [];
 			$context['at'] = (int)($record['last'] ?? time());
+			$label = self::LABELS[$finding['detector']] ?? $finding['detector'];
 			
 			$this->sender->reportRefusal(self::KIND,
-				sprintf('%s ran %d× — %s', $row['relative'], $n, self::LABELS[$finding['detector']] ?? $finding['detector']),
+				match(true)
+				{
+					$refused === 0 => sprintf('%s ran %d× — %s', $row['relative'], $ran, $label),
+					$ran === 0 => sprintf('%s refused %d×, no run recorded — %s', $row['relative'], $refused,
+						self::REFUSED_LABELS[$finding['detector']] ?? $finding['detector']),
+					default => sprintf('%s ran %d×, refused %d× — %s', $row['relative'], $ran, $refused, $label),
+				},
 				[
 					// under uploads, or under the site and shipped by nobody (Sender::sourceFor's two words worth a look)
 					'source' => $finding['area'] === 'uploads' ? 'uploads' : 'unknown',
@@ -1155,6 +1217,7 @@ class Entries
 					'detector' => $finding['detector'],
 					'tier' => $finding['tier'],
 					'hits' => $n,
+					'refused' => $refused,
 					'md5' => (string)($record['md5'] ?? ''),
 					'layer' => 'prepend',
 				],

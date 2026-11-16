@@ -675,6 +675,47 @@ rule in the server's own configuration, is what closes the directories.
 OpenLiteSpeed reads a new `.htaccess` only after a restart unless its
 `.htaccess` auto-load is switched on.
 
+**Uploads.** Before any rule, the layer refuses every script run from under
+uploads, whatever its name: if the layer runs, PHP is already running the
+file, so a `.phtml`, a `.phar` or a `.jpg` a handler runs as PHP is refused
+like a `.php`. Nothing honest requests PHP there — the data files and
+listing stubs plugins keep under uploads are included, never requested, and
+only scanners ask for them, so a probe for AIOS's `settings.php` becomes a
+visible refusal. The refusal is a 403 with `X-Shield-Guard: uploads`,
+reported as `shield_block` with the message *shield guard refused a script
+under uploads* (`guard` and `action` `uploads`, `matched` the path below the
+uploads directory); it follows the same switches as the update directories'
+guard, and counts on no rollup. Uploads is what the plugin writes into its
+consent at the end of `init`, once every `upload_dir` filter is in place:
+the site's upload base, as written and as resolved (a `current →
+releases/N` deploy is matched either way); on a network the base without
+`/sites/N`, so every site's files are under it, and `wp-content/blogs.dir`
+on a network from before WordPress 3.5. Only the main network's main site
+writes it. A directory written before stays while it exists and is still
+safe to guard, so an `upload_dir` filter that runs on some requests only
+cannot take the real directory off the list in between. Until it is
+written, `<content>/uploads`. The script is matched
+as the server spelled it and as it resolves — a path-info or missing-file
+spelling, a link into uploads, a link under uploads pointing out — without
+case, with `..`, a doubled slash, trailing dots and spaces and Windows
+stream suffixes (`uploads::$INDEX_ALLOCATION`) taken out. A directory that
+is empty, relative, or at or above the site root, `wp-admin`,
+`wp-includes`, the content or the plugins directory is never guarded,
+written or read, so a broken `upload_dir` filter cannot refuse the site.
+`CODESAFE_UPLOADS_GUARD` set to false in wp-config.php (or `'false'`,
+`'off'`, `0`) turns this guard off and leaves every rule and the update
+directories' guard on; a value that reads as no boolean leaves it on. Its limits: it
+needs PHP's `auto_prepend_file` pointed at the stub — a direct hit on a
+script under uploads never loads WordPress, so the mu-plugin never sees
+it; a subsite's own
+`upload_path` outside the network's base is not covered; a script outside
+the document root (an aliased uploads directory) never reads the root's
+`.user.ini`; and a `.user.ini` or `.htaccess` under uploads, or in
+wp-content or the site root above it, can switch the prepend off for the
+scripts there, which the integrity scan reports as `prepend_off_uploads`
+(below). A file the guard refused still waits in the
+executed-file watch: it is there, and someone knows its path.
+
 ## The executed-file watch
 
 The integrity scan below finds the file nobody shipped while it sits on
@@ -760,9 +801,14 @@ not the tree, so codesafe's ledger never reads a missing path as gone from
 it) with the path, size, mtime and a line like *executed 4× · first 25.09.
 03:12 · last 25.09. 03:14 UTC · from 203.0.113.9 · GET*. codesafe's INTEGRITY
 ledger, INBOX case, mail and chat digest, removal advice and it-came-back
-logic are the scan's. Beside it, **one security event per foreign file**
+logic are the scan's. A hit a guard refused is counted apart: the line says
+*refused 3×, no run recorded* when no run is recorded, or *ran 1×, refused
+2×*, the finding carries `ran` and `refused`, and the tier stays as the
+table says. "No run recorded" is all it can say: a run with the prepend
+switched off, an include, or one the watch's last report already took leaves
+no record. Beside it, **one security event per foreign file**
 (kind `file_executed`, `extra.source` uploads or unknown, `extra.file`,
-`extra.hits`, `extra.md5`, `extra.layer: prepend`) wearing the last
+`extra.hits`, `extra.refused`, `extra.md5`, `extra.layer: prepend`) wearing the last
 request's own facts and nothing of the request that sends it, so the address
 that ran it scores as an offender and
 joins the attack waves. Info rows are listed, not scored.
@@ -794,6 +840,7 @@ root is walked into its folders too, `wp-content/cache` is walked, and
 | media file whose first kilobyte carries a PHP opener (`<?php` in any case, `<?=`) whose code up to its closer PHP could compile (`.ico .jpg .png .gif .webp .bmp .pdf .svg`; `.txt .log .csv` under uploads) | urgent | the `favicon_a1b2.ico` family, the image behind an `AddHandler` — the `<?=` that compressed image data happens to contain, followed by a byte PHP refuses, is no opener |
 | PHP in the document root that is not one of core's own root files | urgent | `about.php`, `wp-conflg.php`; Wordfence's `wordfence-waf.php` and AIOS's `aios-bootstrap.php` are recognised when their plugin is installed |
 | `.htaccess` / `.user.ini` / `php.ini` directives: `auto_prepend_file` / `auto_append_file` to a file no installed plugin owns, `AddHandler`/`AddType` mapping PHP to another extension, `SetHandler` to PHP, `engine on` or CGI under uploads, `RewriteRule`/`Redirect`/`ErrorDocument` to another host | urgent / high | persistence, the polyglot's trigger, the redirect hack — reported as directive kind, file and line, never the line's text |
+| under uploads, an `auto_prepend_file` that is not this plugin's stub — `none`, `off`, empty, another file, a plugin's own — in a `.user.ini`, a `php.ini`, the file `user_ini.filename` names, an `.htaccess` `php_value` or a `SetEnv PHP_VALUE` / `PHP_ADMIN_VALUE` line; the same in wp-content or another directory between the site root and uploads, since PHP and Apache apply a directory's settings to every directory below it; at the site root `none`, `off` or empty (another file there is the site's own prepend, judged as above); and a directive file there or under uploads longer than the 64 KB the scan reads | urgent | `prepend_off_uploads`: it replaces the site's prepend for the scripts under uploads, and with it the layer's uploads guard. The name and value are read without their quotes, and an `.htaccess` line ending in a backslash is joined with the next, as Apache does |
 | the live `auto_prepend_file` / `auto_append_file` of the PHP configuration | urgent | the `.user.ini` trick from the running interpreter's point of view |
 | PHP in a hidden path (`.x.php`, `.well-known/…`) | high | the hidden drop — dotfile tool configs in vendored packages are recognised |
 | PHP in `wp-content` outside any plugin, theme, mu-plugin or upload path | high | `wp-content/strange/s.php`; WordPress' own `.l10n.php` translations are recognised while they return literals — a translation's name over code is a stranger too. A file there that only returns or assigns data — Breeze's `breeze-config/`, WP-Optimize's `wpo-cache/config/`, Cache Enabler's `settings/cache-enabler/`, each behind a guard — is `inert_php` (info) |

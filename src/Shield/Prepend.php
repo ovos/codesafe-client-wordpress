@@ -16,6 +16,7 @@ use function array_filter;
 use function array_key_exists;
 use function array_keys;
 use function array_map;
+use function array_pop;
 use function array_reverse;
 use function array_slice;
 use function array_values;
@@ -66,6 +67,7 @@ use function realpath;
 use function register_shutdown_function;
 use function rename;
 use function rtrim;
+use function sort;
 use function sprintf;
 use function stat;
 use function str_contains;
@@ -87,6 +89,7 @@ use function wp_doing_ajax;
 use const DIRECTORY_SEPARATOR;
 use const LOCK_EX;
 use const PHP_SAPI;
+use const SORT_STRING;
 
 // the kernel is one vendored multi-class file; a plain class binds at compile
 // time, so the guard sits at the require, never inside the file
@@ -167,10 +170,16 @@ catch(Throwable)
  * (Entries) judges the record against what wordpress.org shipped on the
  * site's next request and reports what nobody shipped.
  *
- * Before any rule, guard() holds one invariant: a script under WordPress's
+ * Before any rule, guard() holds two invariants: a script under WordPress's
  * update working directories (wp-content/upgrade/, upgrade-temp-backup/) is
- * a staged or parked copy the upgrader never requests over HTTP, so it is
- * refused under the same consent a rule set to block meets, rule or not.
+ * a staged or parked copy the upgrader never requests over HTTP, and a
+ * script under uploads is something a visitor or a plugin wrote there, which
+ * nothing honest requests either; both are refused under the same consent a
+ * rule set to block meets, rule or not. The uploads guard needs PHP's
+ * auto_prepend_file: a direct hit on a script under uploads never loads
+ * WordPress, so the mu-plugin never sees it. A .user.ini or .htaccess under
+ * uploads can switch the prepend off for the scripts there: the integrity
+ * scan reports that (`prepend_off_uploads`).
  *
  * @author Marcin Gil <mg@ovos.at>
  */
@@ -338,6 +347,17 @@ final class Prepend
 	
 	public const GUARD_OBSERVED = 'shield guard observed a script in the upgrade working directory';
 	
+	/** the uploads guard's name: its report's `guard` and `action`, and its refusal's X-Shield-Guard */
+	public const GUARD_UPLOADS = 'uploads';
+	
+	/** the uploads guard's two report messages, fixed like the upgrade guard's */
+	public const GUARD_UPLOADS_REFUSED = 'shield guard refused a script under uploads';
+	
+	public const GUARD_UPLOADS_OBSERVED = 'shield guard observed a script under uploads';
+	
+	/** at most this many uploads directories ride in the consent, each as written and as resolved */
+	public const UPLOADS_MAX = 16;
+	
 	/** the kernel's two report kinds (Verdict::KIND_BLOCK, Verdict::KIND_OBSERVE) restated: the guard runs without the kernel */
 	public const GUARD_KINDS = ['block' => 'shield_block', 'observe' => 'shield_observe'];
 	
@@ -399,17 +419,17 @@ final class Prepend
 				return;
 			}
 			$ip = self::clientIp($_SERVER, $consent['proxy_header'], $consent['proxies']);
-			// the executed-file watch first: it records, whatever the Shield's
-			// boxes say, and a signed-in request is recorded like any other
-			self::entry($dir, $_SERVER, $consent);
-			// WordPress's update working directories, before any rule: nothing honest runs a script there
+			// WordPress's update working directories and uploads, before any rule: nothing honest runs a script there
 			$guard = self::guard($_SERVER, $consent);
+			// the executed-file watch records whatever the Shield's boxes say, a signed-in
+			// request like any other, and whether the guard kept the file from running
+			self::entry($dir, $_SERVER, $consent, null, $guard !== null && $guard['block']);
 			if($guard !== null)
 			{
 				if($guard['block'])
 				{
 					self::queue($dir, $guard['report'], self::contextOf($_SERVER, 403, $ip));
-					self::refuse(0, 403, 0, self::GUARD_UPGRADE);
+					self::refuse(0, 403, 0, $guard['guard']);
 				}
 				// observed: queued with the status the request ends with, and the rules still judge it
 				$report = $guard['report'];
@@ -636,13 +656,17 @@ final class Prepend
 	 * the site's REST prefix (restPrefixOf(), WordPress's default when none),
 	 * `content` the content directory the guard measures against (realpath
 	 * of WP_CONTENT_DIR, '' when unknown: the guard then says nothing),
+	 * `plugins` the plugins directory (realpath of WP_PLUGIN_DIR, '' when
+	 * unknown), `uploads` the uploads directories the uploads guard refuses
+	 * scripts under (uploadsOf(); [] reads as <content>/uploads),
+	 * `uploads_guard` whether that guard runs (on unless switched off),
 	 * `seal` the key the ruleset is sealed under (sealOf(), '' when none:
 	 * the kernel then reads no ruleset), `login_cookie` the site's login
 	 * cookie name while WordPress's own check of it runs (loginCookieSignsIn(),
 	 * '' when it does not or is not known yet: a login cookie then defers as
 	 * it always did)
 	 *
-	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string, seal: string, login_cookie: string}
+	 * @return ?array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, plugins: string, uploads: list<string>, uploads_guard: bool, entries: bool, rules: string, proxy_header: string, proxies: list<string>, rest_prefix: string, seal: string, login_cookie: string}
 	 */
 	public static function consent(
 		string $dir,
@@ -665,6 +689,10 @@ final class Prepend
 			'prefix' => is_string($decoded['prefix'] ?? null) ? $decoded['prefix'] : '',
 			'root' => is_string($decoded['root'] ?? null) ? $decoded['root'] : '',
 			'content' => is_string($decoded['content'] ?? null) ? $decoded['content'] : '',
+			'plugins' => is_string($decoded['plugins'] ?? null) ? $decoded['plugins'] : '',
+			'uploads' => self::uploadsOf($decoded['uploads'] ?? null),
+			// on by default: a consent an older plugin wrote has no such key and keeps the guard
+			'uploads_guard' => ($decoded['uploads_guard'] ?? true) !== false,
 			'entries' => ($decoded['entries'] ?? false) === true,
 			'rules' => $rules,
 			'proxy_header' => $header,
@@ -679,13 +707,13 @@ final class Prepend
 	 * The plugin's half: the consent written when it differs from what is
 	 * there (one small read per request, one write per change). The ruleset's
 	 * name is drawn once and kept: the one there, else the one given, else a
-	 * new one. The REST prefix and the login cookie's name are kept unless
-	 * given: the writer before plugins_loaded cannot know them
-	 * (writeRestPrefix(), writeLoginCookie()). The seal key is the given one,
-	 * '' when none: a writer without the API key leaves the layer no ruleset
-	 * to read
+	 * new one. The REST prefix, the login cookie's name and the uploads
+	 * directories are kept unless given: the writer before plugins_loaded
+	 * cannot know them (writeRestPrefix(), writeLoginCookie(),
+	 * writeUploads()). The seal key is the given one, '' when none: a writer
+	 * without the API key leaves the layer no ruleset to read
 	 *
-	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string, seal?: string, login_cookie?: string} $consent
+	 * @param array{detect: bool, enforce: bool, kill: bool, prefix: string, root?: string, content?: string, plugins?: string, uploads?: list<string>, uploads_guard?: bool, entries?: bool, rules?: string, proxy_header?: string, proxies?: list<string>, rest_prefix?: string, seal?: string, login_cookie?: string} $consent
 	 * @return bool whether the file was (re)written
 	 */
 	public static function writeConsent(
@@ -707,6 +735,10 @@ final class Prepend
 			'prefix' => (string)$consent['prefix'],
 			'root' => (string)($consent['root'] ?? ''),
 			'content' => (string)($consent['content'] ?? ''),
+			'plugins' => (string)($consent['plugins'] ?? ''),
+			// sorted and deduplicated as consent() reads them: the comparison below is order-sensitive
+			'uploads' => self::uploadsOf($consent['uploads'] ?? $current['uploads'] ?? null),
+			'uploads_guard' => ($consent['uploads_guard'] ?? true) !== false,
 			'entries' => ($consent['entries'] ?? false) === true,
 			'rules' => $rules,
 			'proxy_header' => (string)($consent['proxy_header'] ?? ''),
@@ -760,6 +792,119 @@ final class Prepend
 		}
 		
 		return self::writeConsent($dir, ['login_cookie' => $name] + $current);
+	}
+	
+	/**
+	 * The plugin's half at init: the uploads directories, every upload_dir
+	 * filter applied, into the consent — rewritten only when they changed.
+	 * A directory the consent already names stays while it exists and
+	 * safeBase() still passes it: an upload_dir filter that runs on some
+	 * requests only would otherwise swap the list back and forth and leave
+	 * the real directory unguarded in between. Past UPLOADS_MAX the given
+	 * ones are kept first. False when nothing changed, or there is no
+	 * consent to carry them
+	 *
+	 * @param list<string> $bases
+	 */
+	public static function writeUploads(
+		string $dir,
+		array $bases,
+	): bool
+	{
+		$current = self::consent($dir);
+		if($current === null)
+		{
+			return false;
+		}
+		$wanted = self::uploadsOf($bases);
+		foreach($current['uploads'] as $prior)
+		{
+			// the same checks the layer makes before it guards a directory, so a kept one never refuses the site
+			if(in_array($prior, $wanted, true) === false && is_dir($prior)
+				&& self::safeBase($prior, $current['root'], $current['content'], $current['plugins']))
+			{
+				$wanted[] = $prior;
+			}
+		}
+		// cut before the sort, so a kept directory never pushes out a given one
+		$wanted = self::uploadsOf(array_slice($wanted, 0, self::UPLOADS_MAX));
+		if($current['uploads'] === $wanted)
+		{
+			return false;
+		}
+		
+		return self::writeConsent($dir, ['uploads' => $wanted] + $current);
+	}
+	
+	/**
+	 * Uploads directories as the consent keeps them: absolute, spelled by
+	 * lexicalPath(), deduplicated and sorted, at most UPLOADS_MAX; anything
+	 * else is dropped. Only the shape: whether a directory is safe to guard
+	 * is asked where it matches (safeBase())
+	 *
+	 * @return list<string>
+	 */
+	public static function uploadsOf(
+		mixed $bases,
+	): array
+	{
+		$kept = [];
+		foreach(is_array($bases) ? $bases : [] as $base)
+		{
+			$path = is_string($base) ? self::lexicalPath($base) : '';
+			if(self::absolute($path))
+			{
+				$kept[$path] = true;
+			}
+		}
+		$kept = array_keys($kept);
+		sort($kept, SORT_STRING);
+		
+		return array_slice($kept, 0, self::UPLOADS_MAX);
+	}
+	
+	/**
+	 * A path spelled the way a request's file is compared: forward slashes,
+	 * no empty, `.` or `..` segment, and each segment cut at its first colon
+	 * and stripped of trailing dots and spaces — Windows opens
+	 * `uploads::$INDEX_ALLOCATION` and `uploads.` as `uploads`. A drive
+	 * letter and a UNC host's leading `//` are kept; no trailing slash
+	 */
+	public static function lexicalPath(
+		string $path,
+	): string
+	{
+		$path = str_replace('\\', '/', trim($path));
+		$lead = str_starts_with($path, '//') ? '//' : (str_starts_with($path, '/') ? '/' : '');
+		$segments = [];
+		foreach(explode('/', $path) as $at => $segment)
+		{
+			// a drive letter is the one segment whose colon is no stream name
+			if($at === 0 && preg_match('~^[A-Za-z]:$~', $segment) === 1)
+			{
+				$segments[] = $segment;
+				
+				continue;
+			}
+			if($segment === '..')
+			{
+				// never above the drive or the top
+				if($segments !== [] && preg_match('~^[A-Za-z]:$~', $segments[count($segments) - 1]) !== 1)
+				{
+					array_pop($segments);
+				}
+				
+				continue;
+			}
+			$colon = strpos($segment, ':');
+			$segment = rtrim($colon === false ? $segment : substr($segment, 0, $colon), '. ');
+			if($segment !== '')
+			{
+				$segments[] = $segment;
+			}
+		}
+		
+		return $lead . implode('/', $segments);
 	}
 	
 	/** a REST prefix as the consent keeps it: without its slashes, WordPress's default when there is none */
@@ -1325,7 +1470,9 @@ final class Prepend
 	 * to record — the request that is the site (index.php) costs a realpath
 	 * and one isset() and never reads a file; a wp-admin page or a plugin's
 	 * own endpoint reads the known set; only a stranger writes. Never
-	 * throws, never refuses: this half is a recorder
+	 * throws, never refuses: this half is a recorder. $refused says a guard
+	 * refuses this request, so the file does not run: the record counts it
+	 * apart from the runs
 	 *
 	 * @param array<string, mixed> $server
 	 * @param array{root: string, entries: bool} $consent
@@ -1335,6 +1482,7 @@ final class Prepend
 		array $server,
 		array $consent,
 		?int $now = null,
+		bool $refused = false,
 	): ?string
 	{
 		try
@@ -1367,7 +1515,7 @@ final class Prepend
 				return null;
 			}
 			$context = self::record($dir, $relative, $file, $server, $now ?? time(),
-				self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])));
+				self::clientIp($server, (string)($consent['proxy_header'] ?? ''), (array)($consent['proxies'] ?? [])), $refused);
 			if($context !== null)
 			{
 				// the status exists only once the file ran: written at this request's end
@@ -1383,16 +1531,18 @@ final class Prepend
 	}
 	
 	/**
-	 * The guard before every rule: a script run from one of WordPress's
-	 * update working directories (UPGRADE_DIRS) is refused while the
-	 * blocking box is ticked and observed while it is not, as a rule set to
-	 * block is; nothing with detection off or the kill constant set. Null
-	 * when it has nothing to say, else whether it refuses and the report
-	 * it queues. Needs neither the kernel nor a ruleset
+	 * The guards before every rule: a script run from one of WordPress's
+	 * update working directories (UPGRADE_DIRS), or from under uploads
+	 * (uploaded()), is refused while the blocking box is ticked and observed
+	 * while it is not, as a rule set to block is; nothing with detection off
+	 * or the kill constant set, and nothing from the uploads guard while
+	 * `uploads_guard` is off. Null when neither has anything to say, else
+	 * which guard, whether it refuses and the report it queues. Needs
+	 * neither the kernel nor a ruleset
 	 *
 	 * @param array<string, mixed> $server
-	 * @param array{detect?: bool, enforce?: bool, kill?: bool, content?: string} $consent
-	 * @return ?array{block: bool, report: array{0: string, 1: string, 2: array<string, string>}}
+	 * @param array{detect?: bool, enforce?: bool, kill?: bool, root?: string, content?: string, plugins?: string, uploads?: list<string>, uploads_guard?: bool} $consent
+	 * @return ?array{block: bool, guard: string, report: array{0: string, 1: string, 2: array<string, string>}}
 	 */
 	public static function guard(
 		array $server,
@@ -1403,26 +1553,156 @@ final class Prepend
 		{
 			return null;
 		}
-		$staged = self::staged($server, $consent['content'] ?? '');
-		if($staged === null)
-		{
-			return null;
-		}
 		$block = ($consent['enforce'] ?? false) === true;
+		$staged = self::staged($server, $consent['content'] ?? '');
+		if($staged !== null)
+		{
+			return self::guarded(self::GUARD_UPGRADE, $block, $block ? self::GUARD_REFUSED : self::GUARD_OBSERVED, $staged);
+		}
+		// the guard's own switch (CODESAFE_UPLOADS_GUARD), narrower than the blocking box
+		$uploaded = ($consent['uploads_guard'] ?? true) === false ? null : self::uploaded($server, $consent);
+		if($uploaded !== null)
+		{
+			return self::guarded(self::GUARD_UPLOADS, $block, $block ? self::GUARD_UPLOADS_REFUSED : self::GUARD_UPLOADS_OBSERVED, $uploaded);
+		}
 		
+		return null;
+	}
+	
+	/**
+	 * One guard's answer: whether it refuses, its name, and the report it
+	 * queues with the path it matched
+	 *
+	 * @return array{block: bool, guard: string, report: array{0: string, 1: string, 2: array<string, string>}}
+	 */
+	protected static function guarded(
+		string $guard,
+		bool $block,
+		string $message,
+		string $matched,
+	): array
+	{
 		return [
 			'block' => $block,
+			'guard' => $guard,
 			'report' => [
 				self::GUARD_KINDS[$block ? 'block' : 'observe'],
-				$block ? self::GUARD_REFUSED : self::GUARD_OBSERVED,
+				$message,
 				[
-					'guard' => self::GUARD_UPGRADE,
+					'guard' => $guard,
 					// the event's sub-kind: codesafe files the guard's reports apart from every rule's
-					'action' => self::GUARD_UPGRADE,
-					'matched' => self::capped($staged, self::CONTEXT_FIELD_MAX),
+					'action' => $guard,
+					'matched' => self::capped($matched, self::CONTEXT_FIELD_MAX),
 				],
 			],
 		];
+	}
+	
+	/**
+	 * The path of a script this request runs from under one of the uploads
+	 * directories (the consent's `uploads`, <content>/uploads when it has
+	 * none), as `<the directory's name>/<the path below it>`; null for any
+	 * other script. Matched on the script as the server spelled it, so a
+	 * path-info or missing-file spelling that realpath() fails on still
+	 * matches, and on its realpath(), so a link into uploads does too; both
+	 * lexicalPath()'d and without case. A directory matched is guarded only
+	 * when safeBase() says so: a broken upload_dir filter must never refuse
+	 * the site's own entry points. Null without the site root and the
+	 * content directory, which that check needs
+	 *
+	 * @param array<string, mixed> $server
+	 * @param array{root?: string, content?: string, plugins?: string, uploads?: list<string>} $consent
+	 */
+	public static function uploaded(
+		array $server,
+		array $consent,
+	): ?string
+	{
+		$root = self::lexicalPath((string)($consent['root'] ?? ''));
+		$content = self::lexicalPath((string)($consent['content'] ?? ''));
+		$script = $server['SCRIPT_FILENAME'] ?? '';
+		if(self::absolute($root) === false || self::absolute($content) === false || is_string($script) === false || $script === '')
+		{
+			return null;
+		}
+		$bases = self::uploadsOf($consent['uploads'] ?? null);
+		$bases = $bases === [] ? [$content . '/uploads'] : $bases;
+		$spellings = [self::lexicalPath($script)];
+		$real = realpath($script);
+		if($real !== false)
+		{
+			$spellings[] = self::lexicalPath($real);
+		}
+		foreach($bases as $base)
+		{
+			$prefix = strtolower(rtrim($base, '/')) . '/';
+			foreach($spellings as $file)
+			{
+				if(strlen($file) > strlen($prefix) && str_starts_with(strtolower($file), $prefix)
+					&& self::safeBase($base, $root, $content, (string)($consent['plugins'] ?? '')))
+				{
+					return basename($base) . '/' . substr($file, strlen($prefix));
+				}
+			}
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * Whether an uploads directory may be guarded: absolute, and neither as
+	 * written nor resolved the site root, the content directory, the plugins
+	 * directory, wp-admin or wp-includes, nor above any of them — an empty
+	 * `basedir` or an `upload_path` of `wp-content` would otherwise refuse
+	 * every request, and WordPress would never boot to write a better one.
+	 * Never resolves an empty or relative path: realpath() reads those
+	 * against the working directory
+	 */
+	public static function safeBase(
+		string $base,
+		string $root,
+		string $content,
+		string $plugins = '',
+	): bool
+	{
+		// resolved as given: lexicalPath() renames a directory whose real name ends in a dot or holds a colon,
+		// and collapses `..` across a link, before realpath() could read it
+		$given = str_replace('\\', '/', $base);
+		$base = self::lexicalPath($base);
+		$root = self::lexicalPath($root);
+		if(self::absolute($base) === false || self::absolute($root) === false)
+		{
+			return false;
+		}
+		$spellings = [$base];
+		$real = self::absolute($given) ? realpath($given) : false;
+		if($real !== false)
+		{
+			$spellings[] = self::lexicalPath($real);
+		}
+		$kept = [$root, $root . '/wp-admin', $root . '/wp-includes', self::lexicalPath($content), self::lexicalPath($plugins)];
+		foreach($spellings as $spelling)
+		{
+			$prefix = strtolower(rtrim($spelling, '/')) . '/';
+			foreach($kept as $dir)
+			{
+				// the directory itself or one below it; a directory not known is left out, never read as the top
+				if($dir !== '' && str_starts_with(strtolower(rtrim($dir, '/')) . '/', $prefix))
+				{
+					return false;
+				}
+			}
+		}
+		
+		return true;
+	}
+	
+	/** whether a lexicalPath() is absolute: a leading slash, or a drive letter and a slash */
+	protected static function absolute(
+		string $path,
+	): bool
+	{
+		return str_starts_with($path, '/') || preg_match('~^[A-Za-z]:/~', $path) === 1;
 	}
 	
 	/**
@@ -1505,10 +1785,12 @@ final class Prepend
 	}
 	
 	/**
-	 * What waits for the judge: per path the hit count, first and last
-	 * time, the file as it was when first run (size, mtime, md5 — the
-	 * evidence that survives its deletion) and the last request's own
-	 * facts (contextOf); `dropped` counts hits past SEEN_MAX
+	 * What waits for the judge: per path the hit count, how many of those
+	 * hits a guard refused (`refused`, absent from a record an older plugin
+	 * wrote), first and last time, the file as it was when first seen
+	 * (size, mtime, md5 — the evidence that survives its deletion) and the
+	 * last request's own facts (contextOf); `dropped` counts hits past
+	 * SEEN_MAX
 	 *
 	 * @return array{paths: array<string, array>, dropped: int}
 	 */
@@ -1545,7 +1827,8 @@ final class Prepend
 	/**
 	 * One executed stranger onto the queue: a path seen before counts one
 	 * more hit and takes this request's facts; a new one is measured as it
-	 * is right now, before whatever it does
+	 * is right now, before whatever it does. $refused counts the hit as one
+	 * a guard kept from running
 	 *
 	 * @param array<string, mixed> $server
 	 * @return ?array<string, mixed> the facts it stored (contextOf()), null when the queue was full
@@ -1557,6 +1840,7 @@ final class Prepend
 		array $server,
 		int $now,
 		string $ip = '',
+		bool $refused = false,
 	): ?array
 	{
 		$path = $dir . DIRECTORY_SEPARATOR . self::SEEN;
@@ -1565,6 +1849,7 @@ final class Prepend
 		if(isset($seen['paths'][$relative]))
 		{
 			$seen['paths'][$relative]['n'] = (int)($seen['paths'][$relative]['n'] ?? 0) + 1;
+			$seen['paths'][$relative]['refused'] = (int)($seen['paths'][$relative]['refused'] ?? 0) + ($refused ? 1 : 0);
 			$seen['paths'][$relative]['last'] = $now;
 			$seen['paths'][$relative]['context'] = $context;
 		}
@@ -1578,6 +1863,7 @@ final class Prepend
 			$md5 = @md5_file($file);
 			$seen['paths'][$relative] = [
 				'n' => 1,
+				'refused' => $refused ? 1 : 0,
 				'first' => $now,
 				'last' => $now,
 				'size' => is_array($stat) ? (int)$stat['size'] : null,

@@ -39,6 +39,7 @@ use function file_put_contents;
 use function function_exists;
 use function get_current_user_id;
 use function get_option;
+use function get_site_option;
 use function get_user_by;
 use function has_filter;
 use function hash;
@@ -52,6 +53,9 @@ use function is_dir;
 use function is_email;
 use function is_file;
 use function is_int;
+use function is_main_network;
+use function is_main_site;
+use function is_multisite;
 use function is_string;
 use function is_user_logged_in;
 use function is_wp_error;
@@ -80,6 +84,7 @@ use function user_can;
 use function wp_check_password;
 use function wp_date;
 use function wp_die;
+use function wp_get_upload_dir;
 use function wp_is_application_passwords_available;
 use function wp_is_application_passwords_available_for_user;
 use function wp_is_serving_rest_request;
@@ -994,13 +999,15 @@ final class Adapter
 					Prepend::removeMuPlugin((string)constant('WPMU_PLUGIN_DIR'));
 				}
 			}
-			// the REST prefix the early layers tell a REST request by, and the login
-			// cookie the must-use stage checks: known only once the other plugins
-			// and the theme have added their filters and pluggable functions
+			// the REST prefix the early layers tell a REST request by, the login
+			// cookie the must-use stage checks and the uploads directories the
+			// guard refuses scripts under: known only once the other plugins and
+			// the theme have added their filters and pluggable functions
 			if($judges)
 			{
 				add_action('init', [self::class, 'syncRestPrefix'], PHP_INT_MAX);
 				add_action('init', [self::class, 'syncLoginCookie'], PHP_INT_MAX);
+				add_action('init', [self::class, 'syncUploads'], PHP_INT_MAX);
 			}
 		}
 		catch(Throwable)
@@ -1016,7 +1023,7 @@ final class Adapter
 	 * key — a settings save, a Connect, a constant — reaches the file on the
 	 * next one, whose shutdown pull seals the store under that key
 	 *
-	 * @return array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, entries: bool, proxy_header: string, proxies: list<string>, seal: string}
+	 * @return array{detect: bool, enforce: bool, kill: bool, prefix: string, root: string, content: string, plugins: string, uploads_guard: bool, entries: bool, proxy_header: string, proxies: list<string>, seal: string}
 	 */
 	public static function consentOf(
 		Config $config,
@@ -1033,6 +1040,10 @@ final class Adapter
 			'root' => Entries::root(),
 			// the update working directories the layer's guard refuses scripts in lie below it
 			'content' => self::contentRoot(),
+			// an uploads directory at or above it is never guarded (Prepend::safeBase())
+			'plugins' => self::pluginsRoot(),
+			// the uploads directories themselves are written at init (syncUploads()), never here
+			'uploads_guard' => $config->uploadsGuard(),
 			'entries' => $config->entryWatch() && $connected,
 			// the visitor's address behind a proxy the site trusts
 			'proxy_header' => $config->trustedProxyHeader(),
@@ -1065,6 +1076,104 @@ final class Adapter
 		$content = realpath(WP_CONTENT_DIR);
 		
 		return $content === false ? '' : rtrim(str_replace('\\', '/', $content), '/');
+	}
+	
+	/** WP_PLUGIN_DIR resolved as contentRoot() resolves WP_CONTENT_DIR; '' when unknown */
+	public static function pluginsRoot(): string
+	{
+		if(defined('WP_PLUGIN_DIR') === false)
+		{
+			return '';
+		}
+		
+		$plugins = realpath((string)constant('WP_PLUGIN_DIR'));
+		
+		return $plugins === false ? '' : rtrim(str_replace('\\', '/', $plugins), '/');
+	}
+	
+	/**
+	 * init, last: the uploads directories (uploadBases()) into the consent the
+	 * early layers read, written only when they changed — by now every
+	 * upload_dir filter is in place, which syncPrepend(), before
+	 * plugins_loaded, cannot see. On a network only the main network's main
+	 * site writes them, so no other site's own directory can flap the file.
+	 * $dir is the store, storeDir() when empty. Never throws
+	 */
+	public static function syncUploads(
+		string $dir = '',
+	): bool
+	{
+		try
+		{
+			$network = function_exists('is_multisite') && is_multisite();
+			if($network && (function_exists('is_main_network') === false || is_main_network() === false || is_main_site() === false))
+			{
+				return false;
+			}
+			$dir = $dir === '' ? self::storeDir() : $dir;
+			// the variant that makes no directory
+			$basedir = function_exists('wp_get_upload_dir') ? (string)(wp_get_upload_dir()['basedir'] ?? '') : '';
+			// a network whose sites keep their files apart from uploads (ms_files_rewriting, from before WordPress 3.5)
+			$blogs = $network && (bool)get_site_option('ms_files_rewriting')
+				? (defined('UPLOADBLOGSDIR') && defined('ABSPATH') ? (string)constant('ABSPATH') . (string)constant('UPLOADBLOGSDIR') : (string)WP_CONTENT_DIR . '/blogs.dir')
+				: '';
+			
+			return $dir !== '' && Prepend::writeUploads($dir, self::uploadBases($basedir, $network, $blogs, Entries::root(), self::contentRoot(), self::pluginsRoot()));
+		}
+		catch(Throwable)
+		{
+			return false;
+		}
+	}
+	
+	/**
+	 * The uploads directories the guard refuses scripts under, each as
+	 * written and as resolved: the site's upload base — on a network its
+	 * base without `/sites/N`, so every site's files are under it — and
+	 * where given the old network's blogs.dir. A directory Prepend::safeBase()
+	 * refuses is left out whole, both spellings; none at all (an unknown site
+	 * root or content directory) leaves the layer its own <content>/uploads,
+	 * which it checks the same way
+	 *
+	 * @return list<string>
+	 */
+	public static function uploadBases(
+		string $basedir,
+		bool $network,
+		string $blogs,
+		string $root,
+		string $content,
+		string $plugins,
+	): array
+	{
+		if($root === '' || $content === '')
+		{
+			return [];
+		}
+		$bases = [];
+		foreach([$basedir, $blogs] as $base)
+		{
+			// slashes only: lexicalPath() renames a directory whose real name ends in a dot or holds a colon,
+			// and collapses `..` across a link, before realpath() could read it; uploadsOf() spells it after
+			$written = rtrim(str_replace('\\', '/', trim($base)), '/');
+			if($network)
+			{
+				$written = (string)preg_replace('~/sites/\d+$~', '', $written);
+			}
+			// safeBase() turns down an empty or relative one before anything resolves it
+			if(Prepend::safeBase($written, $root, $content, $plugins) === false)
+			{
+				continue;
+			}
+			$bases[] = $written;
+			$resolved = realpath($written);
+			if($resolved !== false)
+			{
+				$bases[] = $resolved;
+			}
+		}
+		
+		return Prepend::uploadsOf($bases);
 	}
 	
 	/** where ovos-console wrote its prepend stub, wp-content/ovos-console/prepend.php */

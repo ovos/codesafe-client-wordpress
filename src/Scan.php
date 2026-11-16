@@ -54,6 +54,7 @@ use function home_url;
 use function implode;
 use function in_array;
 use function ini_get;
+use function intdiv;
 use function is_admin;
 use function is_array;
 use function is_dir;
@@ -612,6 +613,9 @@ class Scan
 	protected array $roots = [];
 	
 	protected ?string $host = null;
+	
+	/** user_ini.filename's base name, lower case, read once (userIniName()) */
+	protected ?string $userIni = null;
 	
 	protected ?Checksums $sums = null;
 	
@@ -1625,7 +1629,7 @@ class Scan
 		
 		// a cache holds pages by the thousand: only a name that can run, or point PHP elsewhere, is worth a stat
 		if(($flags['bound'] ?? '') === 'cache' && preg_match(self::EXECUTABLE, $name) !== 1
-			&& in_array($lower, self::DIRECTIVE_FILES, true) === false && in_array(self::extension($lower), self::MEDIA, true) === false)
+			&& $this->isDirectiveFile($lower) === false && in_array(self::extension($lower), self::MEDIA, true) === false)
 		{
 			$state['areas'][$area]['files']++;
 			
@@ -1652,7 +1656,7 @@ class Scan
 			return $answer;
 		}
 		
-		if(in_array($lower, self::DIRECTIVE_FILES, true))
+		if($this->isDirectiveFile($lower))
 		{
 			$this->inspectDirectives($state, $area, $path, $meta);
 			
@@ -1662,6 +1666,22 @@ class Scan
 		$this->inspectPolyglot($state, $area, $path, $lower, $size, $meta);
 		
 		return $answer;
+	}
+	
+	/** whether PHP or the web server reads directives from a file by this lower-case name: DIRECTIVE_FILES, or the name user_ini.filename gives the per-directory ini */
+	protected function isDirectiveFile(
+		string $lower,
+	): bool
+	{
+		return in_array($lower, self::DIRECTIVE_FILES, true) || ($lower !== '' && $lower === $this->userIniName());
+	}
+	
+	/** the per-directory ini's name when the PHP configuration renamed it, lower case; '' for the default or none */
+	protected function userIniName(): string
+	{
+		$this->userIni ??= strtolower(basename(trim((string)ini_get('user_ini.filename'))));
+		
+		return $this->userIni === '.user.ini' ? '' : $this->userIni;
 	}
 	
 	/**
@@ -2747,7 +2767,9 @@ class Scan
 	 * .htaccess / .user.ini / php.ini: the directives that make a foreign
 	 * file execute (a prepend, an image handler, engine on under uploads)
 	 * or send visitors elsewhere. The finding names the directive, the file
-	 * and the line — never the line's text.
+	 * and the line — never the line's text. A file whose settings reach
+	 * uploads and that is longer than the scan reads is a finding itself:
+	 * PHP and the web server read all of it.
 	 */
 	protected function inspectDirectives(
 		array &$state,
@@ -2756,7 +2778,8 @@ class Scan
 		array $meta,
 	): void
 	{
-		$content = @file_get_contents($path, false, null, 0, self::DIRECTIVE_BYTES);
+		// one byte past the cap tells a file that goes on from one that ends there
+		$content = @file_get_contents($path, false, null, 0, self::DIRECTIVE_BYTES + 1);
 		
 		if(is_string($content) === false)
 		{
@@ -2764,6 +2787,19 @@ class Scan
 		}
 		
 		$uploads = $area === 'uploads';
+		$above = $uploads ? '' : $this->aboveUploads(dirname($path));
+		
+		if(strlen($content) > self::DIRECTIVE_BYTES)
+		{
+			$content = substr($content, 0, self::DIRECTIVE_BYTES);
+			
+			// padding ahead of a directive would hide it from the scan, never from PHP
+			if($uploads || $above !== '')
+			{
+				$this->finding($state, $area, $path, 'prepend_off_uploads', self::TIER_URGENT,
+					'over ' . intdiv(self::DIRECTIVE_BYTES, 1024) . ' KB, read only that far: the rest can switch the prepend off for uploads', $meta);
+			}
+		}
 		
 		if($uploads && dirname($path) === $this->roots['uploads'] && basename($path) === '.htaccess')
 		{
@@ -2772,17 +2808,35 @@ class Scan
 		}
 		
 		$found = 0;
+		// Apache joins a line ending in a backslash with the next one; PHP's ini parser does not
+		$joins = strtolower(basename($path)) === '.htaccess';
+		$pending = '';
+		$start = 0;
 		
-		foreach(preg_split('~\r\n|\r|\n~', $content) ?: [] as $index => $line)
+		// the empty line at the end flushes a continuation the file ends on
+		foreach([...(preg_split('~\r\n|\r|\n~', $content) ?: []), ''] as $index => $raw)
 		{
-			$line = trim($line);
+			// a joined directive keeps its first line's number, so its ledger row stays the same row
+			$start = $pending === '' ? $index : $start;
+			
+			// a comment is never continued: the next line is judged on its own
+			if($joins && preg_match('~(?<!\\\\)\\\\$~', $raw) === 1 && str_starts_with(ltrim($pending . $raw), '#') === false)
+			{
+				$pending .= substr($raw, 0, -1);
+				
+				continue;
+			}
+			
+			$line = trim($pending . $raw);
+			$pending = '';
 			
 			if($line === '' || $line[0] === '#' || $line[0] === ';')
 			{
 				continue;
 			}
 			
-			$verdict = $this->judgeDirective($line, $uploads);
+			// quotes around a directive's name or value change nothing for PHP or Apache
+			$verdict = $this->judgeDirective(str_replace(['"', '\''], '', $line), $uploads, $above);
 			
 			if($verdict === null)
 			{
@@ -2792,7 +2846,7 @@ class Scan
 			[$detector, $tier, $detail] = $verdict;
 			
 			$this->finding($state, $area, $path, $detector, $tier, $detail,
-				$meta + ['line' => $index + 1]);
+				$meta + ['line' => $start + 1]);
 			
 			if(++$found >= self::MAX_DIRECTIVES_PER_FILE)
 			{
@@ -2802,18 +2856,37 @@ class Scan
 	}
 	
 	/**
-	 * One directive line → [detector, tier, detail] or null when harmless
+	 * One directive line → [detector, tier, detail] or null when harmless.
+	 * $above is where the file stands to uploads when not under it
+	 * (aboveUploads())
 	 *
 	 * @return array{0: string, 1: string, 2: string}|null
 	 */
 	protected function judgeDirective(
 		string $line,
 		bool $uploads,
+		string $above = '',
 	): ?array
 	{
+		// unanchored: `php_value`, a .user.ini line, and `SetEnv PHP_VALUE` / `PHP_ADMIN_VALUE` carrying the setting alike
 		if(preg_match('~auto_(prepend|append)_file\s*(?:=|\s)\s*["\']?([^"\'\s;]*)~i', $line, $match) === 1)
 		{
 			$target = $match[2];
+			$off = in_array(strtolower($target), ['', 'none', 'off'], true);
+			
+			// any prepend but this plugin's stub replaces the root's for the scripts under uploads, and with it the uploads guard;
+			// at the site root another file is the operator's own site-wide prepend, judged below
+			if(strtolower($match[1]) === 'prepend' && ($uploads || $above === 'content' || ($above === 'root' && $off))
+				&& $this->isOwnStub($target) === false)
+			{
+				return ['prepend_off_uploads', self::TIER_URGENT, match(true)
+				{
+					$uploads && $off => 'auto_prepend_file switched off under uploads',
+					$uploads => 'auto_prepend_file under uploads → ' . basename($target),
+					$off => 'auto_prepend_file switched off here and for uploads below',
+					default => 'auto_prepend_file here and for uploads below → ' . basename($target),
+				}];
+			}
 			
 			if($target === '' || strtolower($target) === 'none')
 			{
@@ -2870,6 +2943,28 @@ class Scan
 		}
 		
 		return null;
+	}
+	
+	/**
+	 * Where a directive file's directory stands to the uploads directory:
+	 * `root` for the site root or a directory above it, `content` for one
+	 * between them (wp-content, a content directory elsewhere), '' when its
+	 * settings never reach uploads. PHP reads a .user.ini, and the web
+	 * server an .htaccess, for every directory below it too
+	 */
+	protected function aboveUploads(
+		string $dir,
+	): string
+	{
+		$dir = $this->normalize($dir);
+		$uploads = $this->roots['uploads'] ?? '';
+		
+		if($uploads === '' || str_starts_with($uploads . '/', $dir . '/') === false)
+		{
+			return '';
+		}
+		
+		return str_starts_with($this->roots['root'] . '/', $dir . '/') ? 'root' : 'content';
 	}
 	
 	/**
@@ -5174,6 +5269,39 @@ class Scan
 		}
 		
 		return null;
+	}
+	
+	/**
+	 * Whether a directive's target is this plugin's prepend stub by one of
+	 * the paths it has (Adapter::storePaths()): beside the data under either
+	 * name, or in the legacy directory. Exactly the file, not any file in
+	 * the store directory as ownerOfPath() allows
+	 */
+	protected function isOwnStub(
+		string $target,
+	): bool
+	{
+		$paths = $this->storePaths();
+		$stubs = [];
+		// a directory that cannot be named names no stub
+		foreach($paths['stub'] === '' ? [] : Prepend::STUB_NAMES as $name)
+		{
+			$stubs[] = $paths['stub'] . '/' . $name;
+		}
+		if($paths['legacy'] !== '')
+		{
+			$stubs[] = $paths['legacy'] . '/' . Prepend::LEGACY_STUB;
+		}
+		
+		foreach($stubs as $stub)
+		{
+			if(strtolower($this->normalize($stub)) === strtolower($this->normalize($target)))
+			{
+				return true;
+			}
+		}
+		
+		return false;
 	}
 	
 	/**

@@ -9,6 +9,7 @@ use function array_unique;
 use function array_values;
 use function constant;
 use function defined;
+use function filter_var;
 use function function_exists;
 use function get_blog_option;
 use function get_main_site_id;
@@ -32,6 +33,8 @@ use function substr;
 use function trim;
 use function wp_get_environment_type;
 
+use const FILTER_NULL_ON_FAILURE;
+use const FILTER_VALIDATE_BOOLEAN;
 use const PREG_SPLIT_NO_EMPTY;
 
 /**
@@ -487,6 +490,19 @@ class Config
 	public function shieldKill(): bool
 	{
 		return (bool)$this->get('shield_kill');
+	}
+	
+	/**
+	 * The before-WordPress layer's uploads guard (Shield\Prepend::guard()):
+	 * on unless CODESAFE_UPLOADS_GUARD is false. A constant only, kept out of
+	 * DEFAULTS so no form or setting stores it: the one switch narrower than
+	 * the blocking box, which stops every rule
+	 */
+	public function uploadsGuard(): bool
+	{
+		// read as a boolean, so 'false' or 'off' turns it off; a value that is no boolean keeps it on
+		return $this->isConstant('uploads_guard') === false
+			|| filter_var(constant($this->constantName('uploads_guard')), FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) !== false;
 	}
 	
 	/**
