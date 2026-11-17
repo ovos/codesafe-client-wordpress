@@ -586,7 +586,7 @@ with every box off, so the layer stops on the next request; on a multisite
 network the store is one for every site, and only the main site — set by a
 super admin — drives it. An observe
 verdict is handed to the plugin to report with the request's full context
-(one verdict, one count, one report per request); a block's report — and an
+(one count and one report for each rule that observed it, four at most); a block's report — and an
 observe verdict on a request WordPress never loads for, such as a direct hit
 on a plugin file — is queued with that request's own URI, address, user agent,
 status and time, and sent on the site's next request wearing them and nothing
