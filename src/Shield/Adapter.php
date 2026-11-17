@@ -312,13 +312,7 @@ final class Adapter
 			// claiming the stash tells the layer's shutdown that it need not queue it
 			if(defined(Prepend::MARK))
 			{
-				$report = Prepend::claim();
-				if($report !== null)
-				{
-					$extra = $report[2];
-					$extra['layer'] = 'prepend';
-					$this->sender->reportRefusal($report[0], $report[1], $extra);
-				}
+				$this->sendClaimed();
 				$this->tallyRequest($request, $caller, $this->sender->clientIp(), $restPrefix, $xmlrpc);
 				
 				return;
@@ -337,6 +331,56 @@ final class Adapter
 		{
 			// fail open: served as if the shield were not there
 		}
+	}
+	
+	/**
+	 * The reports the prepend layer stashed for this request (Prepend::claimAll()),
+	 * each through the Sender with the request's full context, marked as the
+	 * layer's; how many
+	 */
+	public function sendClaimed(): int
+	{
+		// a Prepend.php older than this file, met while an upgrade copies the files, has claim() alone
+		$claimed = method_exists(Prepend::class, 'claimAll') ? Prepend::claimAll() : Prepend::claim();
+		$sent = 0;
+		foreach(self::claimed($claimed) as $report)
+		{
+			$extra = $report[2];
+			$extra['layer'] = 'prepend';
+			$this->sender->reportRefusal($report[0], $report[1], $extra);
+			$sent++;
+		}
+		
+		return $sent;
+	}
+	
+	/**
+	 * Pure: what the prepend layer's claim answered, as a list of reports —
+	 * claimAll()'s list, or the one report, or null, of an older claim();
+	 * anything that is no report is left out
+	 *
+	 * @return list<array{0: string, 1: string, 2: array}>
+	 */
+	public static function claimed(
+		mixed $claimed,
+	): array
+	{
+		if(is_array($claimed) === false)
+		{
+			return [];
+		}
+		// one report starts with its kind, a string; a list starts with a report
+		$reports = is_string($claimed[0] ?? null) ? [$claimed] : $claimed;
+		$kept = [];
+		foreach($reports as $report)
+		{
+			if(is_array($report) && is_string($report[0] ?? null) && is_string($report[1] ?? null))
+			{
+				$kept[] = [$report[0], $report[1], is_array($report[2] ?? null) ? $report[2] : []];
+			}
+		}
+		
+		return $kept;
 	}
 	
 	/**
@@ -500,10 +544,12 @@ final class Adapter
 	 * The held request settled, once, for $caller, else the current user —
 	 * the one WordPress has settled, or never will now. What an earlier layer
 	 * judged is only tallied. A verdict a rule over the request decided, or
-	 * that waited on who the caller is, is judged again: judge() returned it
-	 * before counting any rate rule. A pass, a rate rule's verdict or an
-	 * observed listed address stands, counted, reported and tallied for that
-	 * caller. Without $refuses what would block is the observe it was
+	 * that waited on who the caller is, is judged again (Kernel::rejudge()),
+	 * the rate rules counted only where the first judgement did not count
+	 * them (a held verdict); by judge() where the kernel loaded is older and
+	 * has no rejudge(). A pass, a rate rule's verdict or an observed
+	 * listed address stands, counted, reported and tallied for that caller.
+	 * Without $refuses what would block is the observe it was
 	 */
 	protected function resolve(
 		?array $caller,
@@ -530,7 +576,10 @@ final class Adapter
 		$ruled = $verdict->rule !== null && $verdict->isRate() === false && ($verdict->rule['kind'] ?? '') !== Ruleset::KIND_THREAT;
 		if($ruled || $verdict->reason === Verdict::REASON_UNANSWERED)
 		{
-			$verdict = $this->kernel()->judge($facts, $refuses ? $consent : new Consent($consent->detect, false, $consent->kill));
+			$kernel = $this->kernel();
+			$judgedUnder = $refuses ? $consent : new Consent($consent->detect, false, $consent->kill);
+			// an older kernel loaded first — php-library's, bundled by another plugin, or this one's mid-upgrade — has judge() alone
+			$verdict = method_exists($kernel, 'rejudge') ? $kernel->rejudge($verdict, $facts, $judgedUnder) : $kernel->judge($facts, $judgedUnder);
 		}
 		$this->settle($facts, $verdict);
 	}

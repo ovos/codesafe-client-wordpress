@@ -16,6 +16,7 @@ use Ovos\Codesafe\Shield\Verdict;
 use Ovos\Test;
 use Ovos\Test\Internal;
 
+use function array_map;
 use function count;
 use function hash;
 use function implode;
@@ -290,8 +291,9 @@ class ShieldRest extends Test
 	 * counted or reported until WordPress has settled the user. Judged again
 	 * then (rest_authentication_errors, xmlrpc_call), it is refused for an
 	 * anonymous caller and served for one holding manage_options, once; never
-	 * judged again, WordPress's shutdown reports the observe it was, once.
-	 * Falsify: report the held verdict at once — every JWT call is reported
+	 * judged again, WordPress's shutdown reports the observe it was, once for
+	 * each rule that observed it (21 for anyone anonymous, 22 for anyone
+	 * lacking manage_options). Falsify: report the held verdict at once — every JWT call is reported
 	 * twice; or judge it again with the unknown caller — a forged Bearer
 	 * header turns every block into an observe.
 	 */
@@ -326,7 +328,7 @@ class ShieldRest extends Test
 		return $held === null && $heldReports === 0
 			&& count($refused) === 1 && $refused[0][0] === Verdict::KIND_BLOCK && $refused[0][2]['rule'] === 21 && $once === 1
 			&& $served === 'kept' && $adminReports === 0
-			&& count($settled) === 1 && $settled[0][0] === Verdict::KIND_OBSERVE && $settled[0][2]['rule'] === 21;
+			&& $this->reported($settled) === [[Verdict::KIND_OBSERVE, 21], [Verdict::KIND_OBSERVE, 22]];
 	}
 	
 	/**
@@ -489,10 +491,13 @@ class ShieldRest extends Test
 	 * RULE: an XML-RPC call is settled as the caller its method signed in: on
 	 * xmlrpc_call, after the method's login, as that user; never signed in by
 	 * then — a failed login, a body no method reads — WordPress ran it as
-	 * user 0 throughout, and its shutdown settles it as anonymous. Falsify:
+	 * user 0 throughout, and its shutdown settles it as anonymous, every rule
+	 * that observed it reported and counted, the first served first. Falsify:
 	 * settle the call at plugins_loaded — every password guess against
 	 * xmlrpc.php reads as a signed-in match; or wait for WordPress to serve
-	 * REST — a signed-in call is settled only at shutdown, as no one.
+	 * REST — a signed-in call is settled only at shutdown, as no one; or
+	 * report the first observing rule alone — rule 36's matches never reach
+	 * codesafe.
 	 */
 	public function anXmlRpcCallIsTheCallerItsMethodSignedIn(): bool
 	{
@@ -518,8 +523,9 @@ class ShieldRest extends Test
 		$signedHits = $this->taken($store);
 		
 		return $unknown['known'] === false && $atPluginsLoaded === [[], []]
-			&& count($guess) === 1 && $guess[0][0] === Verdict::KIND_OBSERVE && $guess[0][2]['rule'] === 37 && $guess[0][2]['authed'] === false
-			&& $guessHits === [0 => $this->counts(entry: 1), 36 => $this->counts(entry: 1, match: 1), 37 => $this->counts(observe: 1, entry: 1, match: 1)]
+			&& count($guess) === 2 && $guess[0][0] === Verdict::KIND_OBSERVE && $guess[0][2]['rule'] === 37 && $guess[0][2]['authed'] === false
+			&& $guess[1][0] === Verdict::KIND_OBSERVE && $guess[1][2]['rule'] === 36 && $guess[1][2]['authed'] === false
+			&& $guessHits === [0 => $this->counts(entry: 1), 36 => $this->counts(observe: 1, entry: 1, match: 1), 37 => $this->counts(observe: 1, entry: 1, match: 1)]
 			&& count($signedIn) === 1 && $signedIn[0][2]['rule'] === 36 && $signedIn[0][2]['authed'] === true
 			&& $signedHits === [0 => $this->counts(entry: 1), 36 => $this->counts(observe: 1, entry: 1, match: 1, authed: 1), 37 => $this->counts(entry: 1)];
 	}
@@ -557,6 +563,38 @@ class ShieldRest extends Test
 		return $passed === null && $listed === null && $settled === []
 			&& $next?->isRate() === true && $listedNext?->isRate() === true
 			&& count($reports) === 2 && $reports[0][0] === Verdict::KIND_RATE && $reports[1][0] === Verdict::KIND_RATE;
+	}
+	
+	/**
+	 * RULE: a held request an observing rule matched — a token-carrying REST
+	 * request, signed in only later — is charged to a rate rule once: the
+	 * rate rules counted it at plugins_loaded beside the observe, and judged
+	 * again once WordPress has the user it is counted no more, so settling it
+	 * reports the observe alone and the next request from the address is the
+	 * one past the limit. Falsify: judge the held request again with judge()
+	 * — it is charged twice and meets the limit at half its rate.
+	 */
+	public function aHeldRequestAnObservingRuleMatchedIsChargedOnce(): bool
+	{
+		$request = [['HTTP_AUTHORIZATION' => 'Bearer x'] + $this->server(), [], [], [], []];
+		$unknown = Adapter::caller($request[0], [], [], false, true);
+		$plain = [$this->server(), [], [], [], []];
+		$anonymous = Adapter::caller($plain[0], [], [], false, true);
+		$reports = [];
+		$store = $this->store([$this->vpatch(43, 'observe', 'anyone'), ['id' => 44, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'uri',
+			'op' => 'prefix', 'value' => '/wp-json/fx/v1/', 'ci' => true, 'mode' => 'observe', 'expires_at' => null, 'kind' => 'rate',
+			'rate' => ['key' => 'ip', 'limit' => 1, 'window' => 60]]]);
+		$adapter = $this->adapter($reports, $store);
+		$GLOBALS['wp']['serving_rest'] = true;
+		
+		$held = $adapter->judgeRequest($request, $unknown, '203.0.113.9', 'wp-json');
+		$adapter->judgeAgain(null);
+		$settled = $this->reported($reports);
+		$reports = [];
+		$next = $adapter->judgeRequest($plain, $anonymous, '203.0.113.9', 'wp-json');
+		
+		return $held === null && $settled === [[Verdict::KIND_OBSERVE, 43]]
+			&& ($next?->rule['id'] ?? 0) === 43 && $this->reported($reports) === [[Verdict::KIND_OBSERVE, 43], [Verdict::KIND_RATE, 44]];
 	}
 	
 	/**
@@ -739,6 +777,18 @@ class ShieldRest extends Test
 		ksort($hits);
 		
 		return $hits;
+	}
+	
+	/**
+	 * each report as its kind and its rule
+	 *
+	 * @return list<array{0: string, 1: int}>
+	 */
+	protected function reported(
+		array $reports,
+	): array
+	{
+		return array_map(static fn(array $report): array => [$report[0], (int)$report[2]['rule']], $reports);
 	}
 	
 	/** one rule's counts as the store hands them back, every outcome present */

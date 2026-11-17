@@ -40,9 +40,10 @@ declare(strict_types=1);
  * of the project's live rules under the store's lock, on the host's tick,
  * every INTERVAL seconds, a 304 costs nothing, a failure leaves the cache
  * alone; judge() — pure over the cached ruleset, returns pass | observe |
- * block and never a response; report() — hands the match to a callable the
+ * block and never a response; report() — hands each match to a callable the
  * adapter supplied (the host's sender) as a `shield_observe` /
- * `shield_block` security event, `matched` capped at 200 bytes.
+ * `shield_block` security event, `matched` capped at 200 bytes, at most
+ * Kernel::REPORTS_MAX of one request.
  *
  * Fails open on everything: a missing store, a stored record not sealed
  * under the seal key or pulled by another kernel (read as a missing store;
@@ -76,12 +77,14 @@ declare(strict_types=1);
  * `window` seconds for one address, one user or the route itself, it
  * observes or answers 429 with Retry-After; an IPv6 address counts as its
  * /64, as in the Node twin (Kernel::rateAddress()). The match rules are judged
- * first; a rate rule counts only a request no match rule decided. Counting
- * needs APCu (the file tier cannot count): without it rate rules are
+ * first: one that blocks ends judgement, one that observes does not, and a
+ * rate rule counts every request no rule refused or held (Kernel::judge()).
+ * Counting needs APCu (the file tier cannot count): without it rate rules are
  * skipped, and the limit is per POOL — one server's APCu, not the site's.
- * The pull names `X-Shield-Kinds: match,rate,threat,vpatch,mode-block`, and the door
+ * The pull names `X-Shield-Kinds: match,rate,threat,vpatch,mode-block,observe-all`, and the door
  * serves each kind only to a kernel that names it, so a kernel older than
- * rate rules never reads one as a match rule.
+ * rate rules never reads one as a match rule; `observe-all` says a match
+ * that only observes never ends judgement here.
  *
  * Virtual patches (kind `vpatch`): an entry point, a parameter, a typed test
  * and WHO — `{who, conditions: [{target, decode, test, value, ci}]}`, every
@@ -1672,6 +1675,8 @@ final class Verdict
 	 * @param string $matched the fragment that matched, capped by the kernel
 	 * @param int $count a rate rule's count in its window (the sliding estimate, rounded up)
 	 * @param int $retryAfter a rate rule's seconds to the window's end — the 429's Retry-After
+	 * @param list<Verdict> $also the other rules the request matched in observe, in the order judged, an observed listed address last
+	 * @param bool $rated whether the rate rules were judged for this request, and so counted it
 	 */
 	public function __construct(
 		public readonly string $outcome,
@@ -1680,6 +1685,8 @@ final class Verdict
 		public readonly string $reason = '',
 		public readonly int $count = 0,
 		public readonly int $retryAfter = 0,
+		public readonly array $also = [],
+		public readonly bool $rated = false,
 	)
 	{
 	}
@@ -1689,6 +1696,15 @@ final class Verdict
 	): self
 	{
 		return new self(self::PASS, null, '', $reason);
+	}
+	
+	/** this verdict with the other observations of its request beside it */
+	public function with(
+		array $also,
+		bool $rated,
+	): self
+	{
+		return new self($this->outcome, $this->rule, $this->matched, $this->reason, $this->count, $this->retryAfter, $also, $rated);
 	}
 	
 	public function isPass(): bool
@@ -5541,11 +5557,20 @@ final class Kernel
 	
 	/**
 	 * what this kernel reads — the door serves rate rules only to a pull that
-	 * names them, and says a blocking rule `block` only to one naming `mode-block`
+	 * names them, and says a blocking rule `block` only to one naming `mode-block`;
+	 * `observe-all` tells the door that a match which only observes never ends
+	 * this kernel's judgement (judge())
 	 */
 	public const HEADER_KINDS = 'X-Shield-Kinds';
 	
-	public const KINDS = 'match,rate,threat,vpatch,mode-block';
+	public const KINDS = 'match,rate,threat,vpatch,mode-block,observe-all';
+	
+	/**
+	 * the reports of match rules and vpatches one request sends at most
+	 * (reported()): the counters count every rule, and a sender's minute
+	 * budget for the Shield is shared with the blocks the alarm reads
+	 */
+	public const REPORTS_MAX = 4;
 	
 	/**
 	 * the platform modules this kernel reads — the door serves a rule in a
@@ -5782,24 +5807,60 @@ final class Kernel
 	 * store (and the next tick will pull), when the contract is unknown, when
 	 * the ruleset is past the ceiling; a listed threat address the section
 	 * blocks is refused before any rule (held, as an unanswered vpatch is,
-	 * when the host cannot tell the caller); else the first MATCH or VPATCH rule
-	 * that matches — in the door's order, blocking first — as block (set to
-	 * block AND enforce, a vpatch's who and nonce answered) or observe; a vpatch that
-	 * could not be answered observes unless a later rule blocks; else the
-	 * first RATE rule whose predicate matches and whose key
-	 * is over its limit, the same way; else a listed address the section
-	 * only observes, observed under its pseudo-rule — the rules judge it
-	 * first, so a blocking rule still blocks it and a rule's match is the
-	 * rule's. A regex PCRE gives up on over a value is what the kernel did
-	 * not read whole: a vpatch's condition holds `unread` (patched()), a
-	 * match rule, which nothing pins, observes `unread`, held where it would
-	 * block; a rate rule's counts nothing. The one side effect: a rate rule's
-	 * predicate that matches counts the request
+	 * when the host cannot tell the caller). Then every MATCH and VPATCH rule,
+	 * in the door's order, blocking first: the first that blocks (set to
+	 * block AND enforce, a vpatch's who and nonce answered) is the verdict at
+	 * once; one that would block but could not be answered is held, an
+	 * observe unless a later rule blocks; one that observes is kept, and
+	 * judgement goes on. A held verdict ends judgement there, what observed
+	 * beside it (Verdict::$also), and no rate rule counts the request. Else
+	 * every RATE rule whose predicate matches counts it: the first past its
+	 * limit that blocks is the verdict, a 429 that drops what observed before
+	 * it — a refused request is one report; one that only observes is kept.
+	 * The verdict is the first rule kept, the others beside it, a listed
+	 * address the section only observes last: the rules judge it first, so a
+	 * blocking rule still blocks it and a rule's match is the rule's. A regex
+	 * PCRE gives up on over a value is what the kernel did not read whole: a
+	 * vpatch's condition holds `unread` (patched()), a match rule, which
+	 * nothing pins, observes `unread`, held where it would block; a rate
+	 * rule's counts nothing. The one side effect: a rate rule's predicate that
+	 * matches counts the request
 	 */
 	public function judge(
 		Facts $facts,
 		Consent $consent,
 		?int $now = null,
+	): Verdict
+	{
+		return $this->decide($facts, $consent, $now, null);
+	}
+	
+	/**
+	 * The request judged again, for a caller the host could tell only after
+	 * $first (the WordPress adapter's held request): as judge(), except that
+	 * the rate rules are not counted again where $first counted them — their
+	 * word is $first's
+	 */
+	public function rejudge(
+		Verdict $first,
+		Facts $facts,
+		Consent $consent,
+		?int $now = null,
+	): Verdict
+	{
+		return $this->decide($facts, $consent, $now, $first->rated ? $first : null);
+	}
+	
+	/**
+	 * judge()'s work; $counted is an earlier verdict on this request whose
+	 * judgement counted the rate rules already, whose rate verdicts stand in
+	 * for counting them again
+	 */
+	protected function decide(
+		Facts $facts,
+		Consent $consent,
+		?int $now,
+		?Verdict $counted,
 	): Verdict
 	{
 		try
@@ -5838,8 +5899,10 @@ final class Kernel
 			$facts = $this->readable($facts);
 			// a vpatch that would block but could not be answered: observed unless a later rule blocks
 			$held = null;
-			// a listed address the section only observes: the verdict when no rule decides
+			// a listed address the section only observes: beside the rules' word, the verdict when no rule matched
 			$observed = null;
+			// the rules that matched in observe, in the order judged: the first is the verdict when nothing blocks or is held
+			$seen = [];
 			// a listed address the section blocks is refused before any rule
 			$threat = $this->threatened($ruleset, $facts);
 			if($threat !== null)
@@ -5865,7 +5928,7 @@ final class Kernel
 			// the blocking rules first, whatever order they were served in: their tests read an upload before an observing one spends the budget
 			foreach(self::blockingFirst($ruleset->rules) as $rule)
 			{
-				// rate rules count only a request no match rule decided: judged after this loop
+				// rate rules count only a request no rule refused or held: judged after this loop
 				if(Ruleset::isRate($rule))
 				{
 					$rates[] = $rule;
@@ -5908,9 +5971,14 @@ final class Kernel
 						
 						continue;
 					}
+					if($verdict->isBlock())
+					{
+						return $verdict;
+					}
+					// an observe never ends judgement: every rule after it is heard too
+					$seen[] = $verdict;
 					
-					// an observe after a held vpatch: the earlier, held verdict wins
-					return $verdict->isBlock() ? $verdict : ($held ?? $verdict);
+					continue;
 				}
 				// its own name: $unread holds the modules whose sub-requests went unread, which every vpatch after it asks
 				$gaveUp = false;
@@ -5931,28 +5999,65 @@ final class Kernel
 						
 						continue;
 					}
+					$seen[] = $unreadVerdict;
 					
-					return $held ?? $unreadVerdict;
+					continue;
 				}
 				$verdict = new Verdict($blocks ? Verdict::BLOCK : Verdict::OBSERVE, $rule, substr($matched, 0, self::MATCHED_MAX));
-				
-				return $verdict->isBlock() ? $verdict : ($held ?? $verdict);
-			}
-			if($held !== null)
-			{
-				return $held;
-			}
-			$now ??= time();
-			foreach($rates as $rule)
-			{
-				$verdict = $this->rated($rule, $facts, $consent, $now);
-				if($verdict !== null)
+				if($verdict->isBlock())
 				{
 					return $verdict;
 				}
+				$seen[] = $verdict;
 			}
-
-			return $observed ?? Verdict::pass('no match');
+			// what would block but could not be answered ends judgement here, as a block does: no rate rule counts the request
+			if($held !== null)
+			{
+				return $held->with($seen, false);
+			}
+			if($counted !== null)
+			{
+				// judged again: the rate rules counted this request already, their word is the earlier verdict's
+				foreach([$counted, ...$counted->also] as $earlier)
+				{
+					if($earlier->isRate() && $earlier->isBlock())
+					{
+						return $earlier->with([], true);
+					}
+					if($earlier->isRate())
+					{
+						$seen[] = $earlier->with([], true);
+					}
+				}
+			}
+			else
+			{
+				$now ??= time();
+				foreach($rates as $rule)
+				{
+					$verdict = $this->rated($rule, $facts, $consent, $now);
+					if($verdict === null)
+					{
+						continue;
+					}
+					// a refusal is the request's only report: what it matched in observe before is dropped
+					if($verdict->isBlock())
+					{
+						return $verdict->with([], true);
+					}
+					$seen[] = $verdict;
+				}
+			}
+			if($observed !== null)
+			{
+				$seen[] = $observed;
+			}
+			if($seen === [])
+			{
+				return Verdict::pass('no match')->with([], true);
+			}
+			
+			return $seen[0]->with(array_slice($seen, 1), true);
 		}
 		catch(Throwable $e)
 		{
@@ -6360,8 +6465,70 @@ final class Kernel
 		return false;
 	}
 	
-	/** the match through the adapter's sender as a security event; never throws */
+	/** each match of the request the sender is told of (reported()) through the adapter's sender as a security event; never throws */
 	public function report(
+		Verdict $verdict,
+		Facts $facts,
+		?int $now = null,
+	): void
+	{
+		foreach(self::reported($verdict) as $one)
+		{
+			$this->reportOne($one, $facts, $now);
+		}
+	}
+	
+	/**
+	 * The verdicts of one request that are reported: the verdict, then the
+	 * other vpatches, then the other match rules, REPORTS_MAX in all — the
+	 * vpatches' rows are what codesafe's promotion reads, the counters say
+	 * the rest; every rate verdict after them, each behind its own once-a-
+	 * window gate (reportRate()). A listed address is never reported
+	 *
+	 * @return list<Verdict>
+	 */
+	protected static function reported(
+		Verdict $verdict,
+	): array
+	{
+		$first = [];
+		$vpatches = [];
+		$matches = [];
+		$rates = [];
+		foreach([$verdict, ...$verdict->also] as $at => $one)
+		{
+			// a listed address is counted, never reported, wherever it stands
+			if($one->isPass() || $one->rule === null || ($one->rule['kind'] ?? '') === Ruleset::KIND_THREAT)
+			{
+				continue;
+			}
+			if($one->isRate())
+			{
+				$rates[] = $one;
+				
+				continue;
+			}
+			// the verdict itself first, whatever its kind
+			if($at === 0)
+			{
+				$first[] = $one;
+				
+				continue;
+			}
+			if(Ruleset::isVpatch($one->rule))
+			{
+				$vpatches[] = $one;
+				
+				continue;
+			}
+			$matches[] = $one;
+		}
+		
+		return [...array_slice([...$first, ...$vpatches, ...$matches], 0, self::REPORTS_MAX), ...$rates];
+	}
+	
+	/** one match through the adapter's sender as a security event; never throws */
+	protected function reportOne(
 		Verdict $verdict,
 		Facts $facts,
 		?int $now = null,
@@ -6593,7 +6760,7 @@ final class Kernel
 		return is_array($json) && self::holdsSecret($json) === false;
 	}
 	
-	/** the uncapped per-rule counter for this minute */
+	/** the uncapped per-rule counter for this minute, of the verdict's rule and of every rule beside it */
 	public function count(
 		Verdict $verdict,
 		?int $now = null,
@@ -6605,7 +6772,11 @@ final class Kernel
 		}
 		try
 		{
-			$this->store->hit(intdiv($now ?? time(), 60), (int)$verdict->rule['id'], $verdict->outcome);
+			$minute = intdiv($now ?? time(), 60);
+			foreach([$verdict, ...$verdict->also] as $one)
+			{
+				$this->store->hit($minute, (int)$one->rule['id'], $one->outcome);
+			}
 		}
 		catch(Throwable)
 		{

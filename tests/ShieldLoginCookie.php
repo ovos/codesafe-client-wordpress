@@ -536,7 +536,7 @@ class ShieldLoginCookie extends Test
 	 * a login cookie to WordPress, and the must-use stage checks the cookie.
 	 * A forged one is refused there, 403 with the rule and the layer, the
 	 * block queued as anonymous; passed, the request is marked judged, and
-	 * observed its verdict is stashed — either way plugins_loaded only lends
+	 * observed its verdict is stashed with its report — either way plugins_loaded only lends
 	 * the Sender, never judges it again. A valid cookie leaves nothing marked:
 	 * plugins_loaded judges it whole. Without the prepend the must-use stage
 	 * refuses the forged cookie alone; without the adapter's word the cookie
@@ -589,14 +589,15 @@ class ShieldLoginCookie extends Test
 			$quiet[] = $run($forged, 'action=fx_save')[0];
 			$quiet[] = $run($forged, 'action=fx_save', false)[0];
 		}
-		$untouched = '{"plugins":true,"judged":false,"mark":false,"stash":null,"queries":0}';
+		$untouched = '{"plugins":true,"judged":false,"mark":false,"stash":null,"reports":0,"queries":0}';
 		
 		return str_contains($refused, 'Status: 403') && str_contains($refused, 'X-Shield-Rule: 41') && str_contains($refused, 'X-Shield-Layer: prepend')
 			&& str_contains($refused, '"plugins"') === false
 			&& count($blocks) === 1 && $blocks[0][0] === Verdict::KIND_BLOCK && ($blocks[0][1]['rule'] ?? 0) === 41 && ($blocks[0][1]['authed'] ?? null) === false
-			&& str_contains($passed, '{"plugins":true,"judged":true,"mark":false,"stash":null,"queries":1}') && $none === []
-			&& str_contains($observed, '{"plugins":true,"judged":false,"mark":true,"stash":"observe","queries":1}')
-			&& str_contains($valued, '{"plugins":true,"judged":false,"mark":false,"stash":null,"queries":1}') && $nothing === []
+			&& str_contains($passed, '{"plugins":true,"judged":true,"mark":false,"stash":null,"reports":0,"queries":1}') && $none === []
+			// the observe's report stashed for the adapter to claim
+			&& str_contains($observed, '{"plugins":true,"judged":false,"mark":true,"stash":"observe","reports":1,"queries":1}')
+			&& str_contains($valued, '{"plugins":true,"judged":false,"mark":false,"stash":null,"reports":0,"queries":1}') && $nothing === []
 			&& str_contains($alone, 'Status: 403') && str_contains($alone, 'X-Shield-Rule: 41') && count($aloneBlocks) === 1
 			&& str_contains($unvouched, $untouched)
 			&& count($quiet) === 4 && str_contains(implode('', $quiet), 'Status: 403') === false

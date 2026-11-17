@@ -22,6 +22,8 @@ use Ovos\Test\Exception\SkipException;
 use ReflectionClass;
 
 use function apcu_delete;
+use function array_diff;
+use function basename;
 use function chmod;
 use function class_exists;
 use function clearstatcache;
@@ -30,6 +32,8 @@ use function count;
 use function dirname;
 use function escapeshellarg;
 use function exec;
+use function explode;
+use function fclose;
 use function file_get_contents;
 use function file_put_contents;
 use function function_exists;
@@ -37,15 +41,23 @@ use function getenv;
 use function implode;
 use function is_dir;
 use function is_file;
+use function is_resource;
 use function is_string;
 use function is_writable;
+use function json_decode;
 use function json_encode;
 use function mkdir;
 use function preg_quote;
+use function proc_close;
+use function proc_open;
 use function realpath;
 use function rmdir;
 use function rtrim;
+use function scandir;
 use function sha1_file;
+use function str_contains;
+use function str_replace;
+use function stream_get_contents;
 use function strpos;
 use function substr;
 use function sys_get_temp_dir;
@@ -609,6 +621,122 @@ class Shield extends Test
 			'not ready 0 10.0.0.1', 'not ready 0 10.0.0.1', 'not ready 0 203.0.113.9', 'not ready 0 203.0.113.9'];
 	}
 	
+	/**
+	 * RULE: the adapter hands the Sender every report the prepend layer
+	 * stashed for the request, each marked as the layer's, and claims the
+	 * stash, so the layer's shutdown queues none of them again. Falsify: send
+	 * the first claimed report alone — a second rule's observe before
+	 * WordPress never reaches codesafe.
+	 */
+	public function theAdapterSendsEveryReportThePrependClaimed(): bool
+	{
+		$sender = new class extends Sender
+		{
+			/** @var list<array{0: string, 1: string, 2: array}> */
+			public array $said = [];
+			
+			public function __construct()
+			{
+			}
+			
+			public function reportRefusal(
+				string $kind,
+				string $message = '',
+				array $extra = [],
+				array $context = [],
+				?int $priority = null,
+			): void
+			{
+				$this->said[] = [$kind, $message, $extra];
+			}
+		};
+		$adapter = new Adapter(new Config, $sender, $this->kernel);
+		$GLOBALS[Prepend::STASH] = ['verdict' => new Verdict(Verdict::OBSERVE), 'reports' => [
+			[Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php', ['rule' => 8]],
+			[Verdict::KIND_OBSERVE, 'shield rule 9 observed GET /x.php', ['rule' => 9]],
+		], 'claimed' => false];
+		try
+		{
+			$sent = $adapter->sendClaimed();
+			$again = $adapter->sendClaimed();
+		}
+		finally
+		{
+			unset($GLOBALS[Prepend::STASH]);
+		}
+		
+		return $sent === 2 && $again === 0
+			&& $sender->said === [
+				[Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php', ['rule' => 8, 'layer' => 'prepend']],
+				[Verdict::KIND_OBSERVE, 'shield rule 9 observed GET /x.php', ['rule' => 9, 'layer' => 'prepend']],
+			];
+	}
+	
+	/**
+	 * RULE: through php-cgi, as a site runs it: a request the prepend layer
+	 * judged (Prepend::MARK) is not judged again at plugins_loaded, and every
+	 * report the layer stashed for it reaches the Sender there, marked as the
+	 * layer's, the stash claimed. Falsify: leave the claim out of judge() —
+	 * the layer's shutdown queues the reports for a later request, which
+	 * sends them without this request's user.
+	 */
+	public function aMarkedRequestsReportsReachTheSenderAtPluginsLoaded(): bool
+	{
+		$answer = json_decode($this->stage('marked', $this->cgiBinary()), true);
+		
+		return $answer === ['said' => [[Verdict::KIND_OBSERVE, ['rule' => 8, 'layer' => 'prepend']], [Verdict::KIND_OBSERVE, ['rule' => 9, 'layer' => 'prepend']]],
+			'claimed' => true];
+	}
+	
+	/**
+	 * RULE: a kernel older than the adapter — php-library's, loaded first by
+	 * another plugin, or this plugin's own mid-upgrade — has no rejudge(); a
+	 * held request is then judged again with that kernel's judge(): refused
+	 * once WordPress names an anonymous caller, observed when
+	 * settled at shutdown. Falsify: call rejudge() whatever kernel is loaded
+	 * — the Error is caught, and every held token-carrying REST or XML-RPC
+	 * request goes uncounted, unreported and unrefused.
+	 */
+	public function aHeldRequestIsSettledByAnOlderKernelToo(): bool
+	{
+		$answer = json_decode($this->stage('older-kernel', PHP_BINARY), true);
+		
+		return $answer === ['rejudge' => false, 'held' => true, 'refused' => [[Verdict::KIND_BLOCK, 21]], 'settled' => [[Verdict::KIND_OBSERVE, 21]]];
+	}
+	
+	/**
+	 * RULE: a Prepend.php older than the adapter, met while an upgrade copies
+	 * the plugin file by file, has claim() alone, answering its one report:
+	 * the adapter sends it, once. Falsify: call claimAll() whatever Prepend
+	 * is loaded — the Error is caught at plugins_loaded, and the layer's
+	 * report and the request's tally are lost.
+	 */
+	public function anOlderPrependsOneReportReachesTheSender(): bool
+	{
+		$answer = json_decode($this->stage('older-prepend', PHP_BINARY), true);
+		
+		return $answer === ['claimAll' => false, 'sent' => [1, 0], 'said' => [[Verdict::KIND_OBSERVE, ['rule' => 8, 'layer' => 'prepend']]]];
+	}
+	
+	/**
+	 * RULE: the adapter reads either shape of the layer's claim — the list
+	 * claimAll() answers, or the one report or null an older claim()
+	 * answers — and leaves out what is no report. Falsify: read a single
+	 * report as a list — its kind and message are taken for reports, and
+	 * nothing is sent.
+	 */
+	public function theClaimIsReadInEitherShape(): bool
+	{
+		$first = [Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php', ['rule' => 8]];
+		$second = [Verdict::KIND_OBSERVE, 'shield rule 9 observed GET /x.php', ['rule' => 9]];
+		
+		return Adapter::claimed(null) === [] && Adapter::claimed([]) === []
+			&& Adapter::claimed($first) === [$first]
+			&& Adapter::claimed([$first, $second]) === [$first, $second]
+			&& Adapter::claimed([Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php']) === [[Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php', []]]
+			&& Adapter::claimed([$first, 'junk', [7, 'x', []]]) === [$first];
+	}
+	
 	public function plainRequestPasses(): bool
 	{
 		$plain = Facts::fromServer([
@@ -784,5 +912,59 @@ class Shield extends Test
 		$beside = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR;
 		
 		return is_dir($beside . 'codesafe') ? $beside . 'codesafe' : $beside . 'console';
+	}
+	
+	/** tests/files/adapter-stage.file.php in its $mode, run by $binary — the CLI, or php-cgi with no ini; what it printed, the CGI headers left out */
+	protected function stage(
+		string $mode,
+		string $binary,
+	): string
+	{
+		$file = __DIR__ . DIRECTORY_SEPARATOR . 'files' . DIRECTORY_SEPARATOR . 'adapter-stage.file.php';
+		$dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ovos-adapter-stage-' . uniqid();
+		mkdir($dir, 0700, true);
+		$cgi = str_contains(basename($binary), 'cgi');
+		$environment = ['OVOS_ADAPTER_STAGE' => (string)json_encode(['mode' => $mode, 'dir' => $dir])]
+			+ ($cgi ? ['GATEWAY_INTERFACE' => 'CGI/1.1', 'SCRIPT_FILENAME' => $file, 'REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/x.php'] : []);
+		// Windows' own libraries need it in any process
+		if(getenv('SYSTEMROOT') !== false)
+		{
+			$environment['SYSTEMROOT'] = (string)getenv('SYSTEMROOT');
+		}
+		$command = $cgi ? [$binary, '-n', '-d', 'cgi.force_redirect=0'] : [$binary, '-d', 'opcache.enable_cli=0', $file];
+		$output = '';
+		$process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $dir, $environment);
+		if(is_resource($process))
+		{
+			$output = (string)stream_get_contents($pipes[1]) . (string)stream_get_contents($pipes[2]);
+			fclose($pipes[1]);
+			fclose($pipes[2]);
+			proc_close($process);
+		}
+		// the store directory's guard files among them
+		foreach(array_diff((array)scandir($dir), ['.', '..']) as $left)
+		{
+			unlink($dir . DIRECTORY_SEPARATOR . $left);
+		}
+		rmdir($dir);
+		
+		return $cgi ? (explode("\r\n\r\n", $output, 2)[1] ?? '') : $output;
+	}
+	
+	/** php-cgi beside this PHP — the SAPI a site's plugins_loaded runs in; the test is skipped without one */
+	protected function cgiBinary(): string
+	{
+		$dir = dirname(PHP_BINARY);
+		// Windows ships php-cgi.exe beside php.exe; Debian's packages name it php-cgi8.x beside php8.x
+		foreach([$dir . DIRECTORY_SEPARATOR . 'php-cgi.exe', $dir . DIRECTORY_SEPARATOR . str_replace('php', 'php-cgi', basename(PHP_BINARY)),
+			$dir . DIRECTORY_SEPARATOR . 'php-cgi'] as $candidate)
+		{
+			if(is_file($candidate))
+			{
+				return $candidate;
+			}
+		}
+		
+		throw new SkipException('No php-cgi beside ' . PHP_BINARY . '.');
 	}
 }

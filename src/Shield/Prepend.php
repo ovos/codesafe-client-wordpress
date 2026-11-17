@@ -18,7 +18,9 @@ use function array_keys;
 use function array_map;
 use function array_pop;
 use function array_reverse;
+use function array_shift;
 use function array_slice;
+use function array_splice;
 use function array_values;
 use function basename;
 use function bin2hex;
@@ -158,8 +160,8 @@ catch(Throwable)
  * One verdict per request: the adapter sees Prepend::MARK defined and claims
  * the stash instead of judging again. A request WordPress never loads for
  * (a direct hit on a plugin file, the shape this layer exists for) leaves
- * the stash unclaimed: settle(), at shutdown, queues its report beside the
- * blocks', and the site's next request drains it. Hits are the kernel's
+ * the stash unclaimed: settle(), at shutdown, queues its reports beside the
+ * blocks', and the site's next request drains them. Hits are the kernel's
  * (Store::hit) and ride the traffic rollups like the adapter's own.
  *
  * The same layer carries the executed-file watch (ovos/codesafe
@@ -262,7 +264,7 @@ final class Prepend
 	
 	public const MU_VERSION = 1;
 	
-	/** the global the stash rides in: ['verdict' => Verdict, 'report' => [kind, message, extra]|null, 'claimed' => bool] */
+	/** the global the stash rides in: ['verdict' => Verdict, 'reports' => list of [kind, message, extra], 'claimed' => bool] */
 	public const STASH = 'ovos_codesafe_shield_prepend';
 	
 	public const HEADER_RULE = 'X-Shield-Rule';
@@ -470,8 +472,8 @@ final class Prepend
 	
 	/**
 	 * The request judged and what follows: a block refused here with its
-	 * report queued, an observe stashed for the adapter to claim (or queued at
-	 * shutdown), a pass marked judged. $signedIn is the login cookie's check
+	 * report queued, an observe's reports stashed for the adapter to claim (or
+	 * queued at shutdown), a pass marked judged. $signedIn is the login cookie's check
 	 * made already; inside WordPress the judge makes it otherwise, and before
 	 * WordPress a request left to WordPress for its login cookie is marked for
 	 * the must-use stage
@@ -508,13 +510,14 @@ final class Prepend
 		{
 			define(self::MARK, true);
 		}
-		$GLOBALS[self::STASH] = ['verdict' => $judged['verdict'], 'report' => $judged['report'], 'claimed' => false];
+		$GLOBALS[self::STASH] = ['verdict' => $judged['verdict'], 'reports' => $judged['reports'], 'claimed' => false];
 		$verdict = $judged['verdict'];
 		if($verdict->isBlock() && $verdict->rule !== null)
 		{
-			if($judged['report'] !== null)
+			// a refusal is the request's one report, none where a rate rule reported its window already
+			foreach($judged['reports'] as $report)
 			{
-				self::queue($dir, $judged['report'], self::contextOf($_SERVER, $verdict->status(), $ip));
+				self::queue($dir, $report, self::contextOf($_SERVER, $verdict->status(), $ip));
 			}
 			self::refuse((int)$verdict->rule['id'], $verdict->status(), $verdict->retryAfter);
 		}
@@ -529,8 +532,9 @@ final class Prepend
 	 * the kernel not ready(), no ruleset it can read (the adapter then judges
 	 * the request whole), anything but a block for a request carrying a
 	 * login cookie that may sign its caller in or a REST request with Basic
-	 * credentials); otherwise the verdict and the report the kernel would
-	 * have sent — the adapter sends it, or the queue holds it
+	 * credentials); otherwise the verdict and the reports the kernel would
+	 * have sent, `report` the first of them — the adapter sends them, or the
+	 * queue holds them
 	 *
 	 * @param array<string, mixed> $server
 	 * @param array<string, mixed> $post
@@ -546,7 +550,7 @@ final class Prepend
 	 *     request is judged whole; true leaves a request carrying one to the adapter; null makes the check here where
 	 *     WordPress runs ($wordpress true), once there is a ruleset to judge by, and leaves it to the adapter before
 	 * @param ?bool $left set: whether a login cookie left the request to WordPress, judged here by the rules for anyone alone
-	 * @return ?array{verdict: Verdict, report: ?array{0: string, 1: string, 2: array}}
+	 * @return ?array{verdict: Verdict, report: ?array{0: string, 1: string, 2: array}, reports: list<array{0: string, 1: string, 2: array}>}
 	 */
 	public static function judge(
 		string $dir,
@@ -574,10 +578,11 @@ final class Prepend
 		$loads = $wordpress ?? self::loadsWordPress($server, (string)($consent['root'] ?? ''));
 		$restPrefix = self::restPrefixOf($consent['rest_prefix'] ?? null);
 		$query = $get ?? self::queryOf($server);
-		$report = null;
-		$reporter = static function(string $kind, string $message, array $extra) use (&$report): void
+		// every report the kernel makes of the request: a block is one, an observe one for each rule that observed
+		$reports = [];
+		$reporter = static function(string $kind, string $message, array $extra) use (&$reports): void
 		{
-			$report = [$kind, $message, $extra];
+			$reports[] = [$kind, $message, $extra];
 		};
 		$store = new Store(self::rules($dir, $consent), $consent['prefix']);
 		// the adapter's seal key, not its API key: the record it pulled reads back only under that key and with the
@@ -643,7 +648,7 @@ final class Prepend
 		$counting->count($verdict, $now);
 		$counting->report($verdict, $facts);
 		
-		return ['verdict' => $verdict, 'report' => $report];
+		return ['verdict' => $verdict, 'report' => $reports[0] ?? null, 'reports' => $reports];
 	}
 	
 	/**
@@ -2060,8 +2065,11 @@ final class Prepend
 	}
 	
 	/**
-	 * A block's report, kept for the plugin's next request — the layer has no
-	 * Sender. Capped: past QUEUE_MAX the oldest go, the hits keep the count
+	 * A report, kept for the plugin's next request — the layer has no
+	 * Sender. Capped: past QUEUE_MAX the oldest report that is no block goes,
+	 * a block only when the queue holds nothing else — codesafe's alarm reads
+	 * the blocks, a request may queue several observes, and the hits keep the
+	 * count of every one
 	 *
 	 * @param array{0: string, 1: string, 2: array} $report
 	 * @param array<string, int|string> $context the request's facts (contextOf())
@@ -2076,40 +2084,93 @@ final class Prepend
 		$queued = self::read($path);
 		$queued = is_array($queued) ? array_values(array_filter($queued, 'is_array')) : [];
 		$queued[] = ['kind' => $report[0], 'message' => $report[1], 'extra' => $report[2], 'context' => $context, 'at' => time()];
-		if(count($queued) > self::QUEUE_MAX)
+		while(count($queued) > self::QUEUE_MAX)
 		{
-			$queued = array_slice($queued, -self::QUEUE_MAX);
+			array_splice($queued, self::evicted($queued), 1);
 		}
 		self::write($path, $queued);
 	}
 	
 	/**
-	 * The adapter's claim on this request's verdict: the stashed report, once,
-	 * and the stash marked claimed so settle() leaves it alone. Null when
-	 * this layer did not judge, had nothing to report, or was claimed already
+	 * The report a full queue gives up: the oldest that is no block, the one
+	 * just added among them, else the oldest block
+	 *
+	 * @param list<array<string, mixed>> $queued
+	 */
+	protected static function evicted(
+		array $queued,
+	): int
+	{
+		foreach($queued as $at => $entry)
+		{
+			// the kind restated, as the guard's: this runs where the kernel did not load
+			if(($entry['kind'] ?? '') !== self::GUARD_KINDS['block'])
+			{
+				return $at;
+			}
+		}
+		
+		return 0;
+	}
+	
+	/**
+	 * The claim of an adapter older than this file, which sends one report:
+	 * the first stashed, or null. The others stay in the stash for settle()
+	 * to queue at shutdown, so none is lost while an upgrade has copied this
+	 * file and not yet the adapter
 	 *
 	 * @return ?array{0: string, 1: string, 2: array}
 	 */
 	public static function claim(): ?array
 	{
-		$stash = $GLOBALS[self::STASH] ?? null;
-		if(is_array($stash) === false || ($stash['claimed'] ?? false) === true)
+		$reports = self::claimAll();
+		if($reports === [])
 		{
 			return null;
 		}
-		$GLOBALS[self::STASH]['claimed'] = true;
-		$report = $stash['report'] ?? null;
+		$first = array_shift($reports);
+		if($reports !== [])
+		{
+			$GLOBALS[self::STASH]['reports'] = $reports;
+			$GLOBALS[self::STASH]['claimed'] = false;
+		}
 		
-		return is_array($report) && is_string($report[0] ?? null) && is_string($report[1] ?? null)
-			? [$report[0], $report[1], is_array($report[2] ?? null) ? $report[2] : []]
-			: null;
+		return $first;
+	}
+	
+	/**
+	 * The adapter's claim on this request's verdict: the stashed reports,
+	 * once, and the stash marked claimed so settle() leaves it alone. None
+	 * when this layer did not judge, had nothing to report, or was claimed
+	 * already
+	 *
+	 * @return list<array{0: string, 1: string, 2: array}>
+	 */
+	public static function claimAll(): array
+	{
+		$stash = $GLOBALS[self::STASH] ?? null;
+		if(is_array($stash) === false || ($stash['claimed'] ?? false) === true)
+		{
+			return [];
+		}
+		$GLOBALS[self::STASH]['claimed'] = true;
+		$claimed = [];
+		foreach(is_array($stash['reports'] ?? null) ? $stash['reports'] : [] as $report)
+		{
+			if(is_array($report) && is_string($report[0] ?? null) && is_string($report[1] ?? null))
+			{
+				$claimed[] = [$report[0], $report[1], is_array($report[2] ?? null) ? $report[2] : []];
+			}
+		}
+		
+		return $claimed;
 	}
 	
 	/**
 	 * Shutdown's half: a stash nobody claimed — WordPress never loaded for the
 	 * request, so no adapter ran — goes to the queue for the site's next
-	 * request, with this request's facts and the status it ended with. True
-	 * when a report was queued
+	 * request, each report with this request's facts and the status it ended
+	 * with. True when a report was queued
 	 *
 	 * @param ?array<string, mixed> $server the request, $_SERVER by default
 	 * @param ?int $status the response status, PHP's own by default
@@ -2122,8 +2183,8 @@ final class Prepend
 		?string $ip = null,
 	): bool
 	{
-		$report = self::claim();
-		if($report === null)
+		$reports = self::claimAll();
+		if($reports === [])
 		{
 			return false;
 		}
@@ -2132,7 +2193,10 @@ final class Prepend
 			$code = http_response_code();
 			$status = is_int($code) ? $code : null;
 		}
-		self::queue($dir, $report, self::contextOf($server ?? $_SERVER, $status, $ip));
+		foreach($reports as $report)
+		{
+			self::queue($dir, $report, self::contextOf($server ?? $_SERVER, $status, $ip));
+		}
 		
 		return true;
 	}

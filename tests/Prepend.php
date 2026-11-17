@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace Tests;
 
+use Closure;
 use Ovos\Codesafe\Redactor;
 use Ovos\Codesafe\Shield\Adapter;
 use Ovos\Codesafe\Shield\Kernel;
@@ -523,14 +524,51 @@ class Prepend extends Test
 		return BasePrepend::drain($this->dir, static fn(): null => null) === BasePrepend::QUEUE_MAX;
 	}
 	
+	/**
+	 * RULE: past QUEUE_MAX the oldest report that is no block goes, a block
+	 * only when the queue holds nothing else: two blocks, then a cap's worth
+	 * of observes — the blocks stay, the two oldest observes go; a queue full
+	 * of blocks drops an observe met there, and a block met there takes the
+	 * oldest block's place. Falsify: give up the oldest whatever its kind —
+	 * a request queues up to four observes, and a few dozen observed
+	 * requests between two drains push out the blocks Shield\Alarm reads.
+	 */
+	public function aFullQueueGivesUpObservesBeforeBlocks(): bool
+	{
+		$block = static fn(string $path): array => [Verdict::KIND_BLOCK, 'shield rule 7 refused GET /' . $path, ['rule' => 7]];
+		$observe = static fn(string $path): array => [Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /' . $path, ['rule' => 8]];
+		BasePrepend::queue($this->dir, $block('a'));
+		BasePrepend::queue($this->dir, $block('b'));
+		for($i = 0; $i < BasePrepend::QUEUE_MAX; $i++)
+		{
+			BasePrepend::queue($this->dir, $observe((string)$i));
+		}
+		$mixed = $this->drained();
+		$late = [];
+		foreach([$observe, $block] as $report)
+		{
+			for($i = 0; $i < BasePrepend::QUEUE_MAX; $i++)
+			{
+				BasePrepend::queue($this->dir, $block((string)$i));
+			}
+			BasePrepend::queue($this->dir, $report('late'));
+			$late[] = $this->drained();
+		}
+		$messages = static fn(Closure $report, array $paths): array => array_map(static fn(int|string $path): string => $report((string)$path)[1], $paths);
+		
+		return $mixed === [...$messages($block, ['a', 'b']), ...$messages($observe, range(2, BasePrepend::QUEUE_MAX - 1))]
+			&& $late[0] === $messages($block, range(0, BasePrepend::QUEUE_MAX - 1))
+			&& $late[1] === [...$messages($block, range(1, BasePrepend::QUEUE_MAX - 1)), ...$messages($block, ['late'])];
+	}
+	
 	public function claimHandsTheStashOnceAndSettleThenQueuesNothing(): bool
 	{
 		$observed = $this->observed();
-		$GLOBALS[BasePrepend::STASH] = ['verdict' => $observed['verdict'], 'report' => $observed['report'], 'claimed' => false];
-		$claimed = BasePrepend::claim();
+		$GLOBALS[BasePrepend::STASH] = ['verdict' => $observed['verdict'], 'reports' => $observed['reports'], 'claimed' => false];
+		$claimed = BasePrepend::claimAll();
 		
-		return $claimed === $observed['report']
-			&& BasePrepend::claim() === null
+		return $claimed === [$observed['report']]
+			&& BasePrepend::claimAll() === [] && BasePrepend::claim() === null
 			&& BasePrepend::settle($this->dir) === false
 			&& BasePrepend::drain($this->dir, static fn(): null => null) === 0;
 	}
@@ -542,7 +580,7 @@ class Prepend extends Test
 	public function settleQueuesTheUnclaimedObserveReportWithFactsAndStatus(): bool
 	{
 		$observed = $this->observed();
-		$GLOBALS[BasePrepend::STASH] = ['verdict' => $observed['verdict'], 'report' => $observed['report'], 'claimed' => false];
+		$GLOBALS[BasePrepend::STASH] = ['verdict' => $observed['verdict'], 'reports' => $observed['reports'], 'claimed' => false];
 		$settled = BasePrepend::settle($this->dir, $this->server('Mozilla/5.0', self::PROBE), 200);
 		$handed = [];
 		BasePrepend::drain($this->dir, static function(
@@ -566,8 +604,70 @@ class Prepend extends Test
 	
 	public function withoutStashClaimAndSettleAreNothing(): bool
 	{
-		return BasePrepend::claim() === null
+		return BasePrepend::claim() === null && BasePrepend::claimAll() === []
 			&& BasePrepend::settle($this->dir) === false;
+	}
+	
+	/**
+	 * RULE: an adapter older than this file claims one report (claim()): it
+	 * gets the first stashed, in the one-report shape it reads, and the
+	 * others stay for shutdown, which queues them for the site's next request;
+	 * a stash of one is claimed whole. Falsify: claim the whole stash for the
+	 * first report — while an upgrade has copied Prepend.php and not yet
+	 * Adapter.php, every other rule's report of the request is lost.
+	 */
+	public function anOlderAdaptersClaimTakesTheFirstReportAndShutdownQueuesTheRest(): bool
+	{
+		$first = [Verdict::KIND_OBSERVE, 'shield rule 8 observed GET /x.php', ['rule' => 8]];
+		$second = [Verdict::KIND_OBSERVE, 'shield rule 9 observed GET /x.php', ['rule' => 9]];
+		$GLOBALS[BasePrepend::STASH] = ['verdict' => new Verdict(Verdict::OBSERVE), 'reports' => [$first, $second], 'claimed' => false];
+		$claimed = BasePrepend::claim();
+		$settled = BasePrepend::settle($this->dir, $this->server('Mozilla/5.0', self::PROBE), 200);
+		$handed = $this->drained();
+		$GLOBALS[BasePrepend::STASH] = ['verdict' => new Verdict(Verdict::OBSERVE), 'reports' => [$first], 'claimed' => false];
+		$alone = BasePrepend::claim();
+		
+		return $claimed === $first && $settled === true && $handed === ['shield rule 9 observed GET /x.php']
+			&& $alone === $first && BasePrepend::settle($this->dir) === false;
+	}
+	
+	/**
+	 * RULE: a request two observing rules match before WordPress — which then
+	 * never loads for it — leaves both reports: the layer's judgement keeps
+	 * every report the kernel makes, the stash holds them, and settle() at
+	 * shutdown queues each for the site's next request to drain. Falsify: let
+	 * the layer's reporter keep one slot — the second rule's report is lost.
+	 */
+	public function twoObservingRulesQueueBothReports(): bool
+	{
+		(new Store($this->dir . DIRECTORY_SEPARATOR . self::RULES_NAME, ''))->write(Ruleset::fromPayload([
+			'contract' => 1,
+			'dialect' => 're2-2026',
+			'project' => 'harness',
+			'rules' => [
+				['id' => 8, 'origin' => 'finding', 'finding' => 'f', 'cve' => 'CVE-2099-0001', 'field' => 'uri', 'op' => 'regex', 'value' => '[?&]include=[^&]*\.\./', 'ci' => true,
+					'mode' => 'observe', 'expires_at' => null],
+				['id' => 9, 'origin' => 'manual', 'finding' => '', 'cve' => '', 'field' => 'uri', 'op' => 'contains', 'value' => 'admin-ajax.php', 'ci' => true,
+					'mode' => 'observe', 'expires_at' => null],
+			],
+		], time(), platforms: BasePrepend::platforms())->toRecord(Kernel::sealKey(self::KEY)));
+		$observed = $this->observed();
+		$GLOBALS[BasePrepend::STASH] = ['verdict' => $observed['verdict'], 'reports' => $observed['reports'], 'claimed' => false];
+		$settled = BasePrepend::settle($this->dir, $this->server('Mozilla/5.0', self::PROBE), 200);
+		$handed = [];
+		BasePrepend::drain($this->dir, static function(
+			string $kind,
+			string $message,
+			array $extra,
+			array $context,
+		) use (&$handed): void
+		{
+			$handed[] = [$kind, $extra['rule'] ?? 0, $context['status'] ?? 0];
+		});
+		
+		return ($observed['report'][2]['rule'] ?? 0) === 8
+			&& $settled === true
+			&& $handed === [[Verdict::KIND_OBSERVE, 8, 200], [Verdict::KIND_OBSERVE, 9, 200]];
 	}
 	
 	/**
@@ -2083,6 +2183,21 @@ class Prepend extends Test
 		BasePrepend::writeConsent($this->dir, self::ENFORCE);
 		
 		return BasePrepend::judge($this->dir, $this->server('Mozilla/5.0', self::PROBE));
+	}
+	
+	/** the queued reports' messages, oldest first, the queue drained */
+	protected function drained(): array
+	{
+		$messages = [];
+		BasePrepend::drain($this->dir, static function(
+			string $kind,
+			string $message,
+		) use (&$messages): void
+		{
+			$messages[] = $message;
+		});
+		
+		return $messages;
 	}
 	
 	protected function queueTwoBlocksAndDrain(

@@ -8,8 +8,8 @@ declare(strict_types=1);
  * wp-config's constants, the site root, the mu-plugin), a users table behind
  * $wpdb, ABSPATH, then the mu-plugin. What the request leaves for
  * plugins_loaded is printed: whether an early layer judged and passed it
- * (Prepend::JUDGED), stashed a verdict (Prepend::MARK), that verdict, and
- * how many times the users table was read.
+ * (Prepend::JUDGED), stashed a verdict (Prepend::MARK), that verdict, the
+ * reports stashed with it, and how many times the users table was read.
  *
  * Under tests/files/, so the runner never takes it for a test.
  */
@@ -62,5 +62,6 @@ echo json_encode([
 	'judged' => defined('CODESAFE_SHIELD_JUDGED'),
 	'mark' => defined('CODESAFE_SHIELD_PREPENDED'),
 	'stash' => is_array($stash) ? $stash['verdict']->outcome : null,
+	'reports' => is_array($stash) ? count($stash['reports'] ?? []) : 0,
 	'queries' => $GLOBALS['wpdb']->queries,
 ]);
