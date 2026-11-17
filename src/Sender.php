@@ -36,6 +36,7 @@ use function http_response_code;
 use function in_array;
 use function is_array;
 use function is_int;
+use function is_scalar;
 use function is_string;
 use function is_wp_error;
 use function json_decode;
@@ -44,6 +45,7 @@ use function max;
 use function mb_substr;
 use function min;
 use function preg_match;
+use function preg_replace;
 use function register_shutdown_function;
 use function rtrim;
 use function sanitize_text_field;
@@ -59,6 +61,7 @@ use function stripos;
 use function strlen;
 use function strpos;
 use function strtolower;
+use function strtoupper;
 use function substr;
 use function time;
 use function trim;
@@ -217,6 +220,19 @@ class Sender
 	/** the standard names worth sending; the site's own `x-…` go too (buildHeaders) */
 	protected const REQUEST_HEADERS = ['accept', 'accept-language', 'accept-charset', 'accept-encoding',
 		'content-type', 'x-requested-with'];
+	
+	/**
+	 * The browser's Fetch Metadata, sent first and as tokens (fetchHeaders()):
+	 * codesafe reads them to tell a request a page on another site made a
+	 * visitor's browser send (an image, a script) from one the visitor or a
+	 * scanner sent. They say how the request was made, nothing about who made
+	 * it. Shield\Prepend::FETCH_HEADERS restates them for the layer that runs
+	 * before WordPress; Tests\FetchMetadata holds both equal
+	 */
+	public const FETCH_HEADERS = ['sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user'];
+	
+	/** a Fetch Metadata value's characters at most: each is a short token */
+	public const FETCH_VALUE_MAX = 32;
 	
 	/**
 	 * Never sent. The forwarding family describes the VISITOR — their address,
@@ -1167,13 +1183,14 @@ class Sender
 	 * anything else secret by name, and never the forwarding family, which
 	 * describes the VISITOR (their address, the host they asked for): a
 	 * replay carrying those would claim to come from that person, through
-	 * headers plugins routinely trust for rate limits, geo and access.
+	 * headers plugins routinely trust for rate limits, geo and access. The
+	 * browser's Fetch Metadata goes first, so the cap never pushes it out.
 	 *
 	 * @return array<string, string>
 	 */
 	protected function buildHeaders(): array
 	{
-		$headers = [];
+		$headers = self::fetchHeaders($_SERVER);
 		
 		foreach(array_keys($_SERVER) as $key)
 		{
@@ -1201,6 +1218,32 @@ class Sender
 			}
 			
 			$headers[$name] = substr($this->server($key), 0, self::HEADER_VALUE_MAX);
+		}
+		
+		return $headers;
+	}
+	
+	/**
+	 * FETCH_HEADERS out of a $_SERVER-shaped array, each value a token:
+	 * lowercase, nothing but `[a-z0-9?-]` (a slash WordPress added goes too),
+	 * FETCH_VALUE_MAX characters; a header without a token is left out
+	 *
+	 * @param array<mixed> $server
+	 * @return array<string, string>
+	 */
+	public static function fetchHeaders(
+		array $server,
+	): array
+	{
+		$headers = [];
+		foreach(self::FETCH_HEADERS as $name)
+		{
+			$value = $server['HTTP_' . strtoupper(str_replace('-', '_', $name))] ?? null;
+			$token = is_scalar($value) ? substr((string)preg_replace('~[^a-z0-9?-]~', '', strtolower((string)$value)), 0, self::FETCH_VALUE_MAX) : '';
+			if($token !== '')
+			{
+				$headers[$name] = $token;
+			}
 		}
 		
 		return $headers;

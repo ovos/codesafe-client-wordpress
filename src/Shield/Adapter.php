@@ -56,6 +56,7 @@ use function is_int;
 use function is_main_network;
 use function is_main_site;
 use function is_multisite;
+use function is_scalar;
 use function is_string;
 use function is_user_logged_in;
 use function is_wp_error;
@@ -1314,10 +1315,11 @@ final class Adapter
 	 * read raw and scrubbed of secrets (the people in them left for codesafe
 	 * to mask and keep, like the Sender's own uri), the status and the time as
 	 * integers,
-	 * and the request section rebuilt from the refused URI's query — the
-	 * Sender would otherwise attach the DRAINING request's GET (the body is
-	 * not kept: the kernel's report says whether one was read). Nothing else
-	 * from the file reaches the payload
+	 * and the request section rebuilt from the refused URI's query and the
+	 * refused request's Fetch Metadata — the Sender would otherwise attach
+	 * the DRAINING request's GET and headers (the body is not kept: the
+	 * kernel's report says whether one was read). Nothing else from the file
+	 * reaches the payload
 	 *
 	 * @param array<string, mixed> $context
 	 * @return array<string, mixed>
@@ -1334,6 +1336,26 @@ final class Adapter
 		$uri = $url('uri');
 		$get = [];
 		parse_str((string)(parse_url($uri, PHP_URL_QUERY) ?: ''), $get);
+		$request = $get !== [] ? ['get' => Redactor::scrub($get, identities: false)] : [];
+		// the four names alone, each value a token again: the file is read back, never trusted. An
+		// older layer loaded beside this adapter has no fetchToken() and kept no headers
+		$headers = [];
+		if(is_array($context['headers'] ?? null) && method_exists(Prepend::class, 'fetchToken'))
+		{
+			foreach(Prepend::FETCH_HEADERS as $name)
+			{
+				$value = $context['headers'][$name] ?? null;
+				$token = is_scalar($value) ? Prepend::fetchToken((string)$value) : '';
+				if($token !== '')
+				{
+					$headers[$name] = $token;
+				}
+			}
+		}
+		if($headers !== [])
+		{
+			$request['headers'] = $headers;
+		}
 		$clean = [
 			'uri' => $uri,
 			'method' => $text('method'),
@@ -1344,7 +1366,7 @@ final class Adapter
 			// rebuilt from the uri scrubUrl() answered above: the query names are
 			// [redacted] before the bag is parsed, the people in it kept for
 			// codesafe to mask and vault
-			'request' => $get !== [] ? ['get' => Redactor::scrub($get, identities: false)] : [],
+			'request' => $request,
 		];
 		foreach(['status', 'at'] as $number)
 		{

@@ -1159,6 +1159,16 @@ again on its side as a backstop, but the first cut happens here:
   `=` (`token%3D…`) and inside a URL carried as a value (`redirect_to`, up to
   three levels deep) — in the uri, and in a request field that holds a URL
   or a query, whose nested `pwd=` the query bag used to carry whole.
+- **Headers**: only the ones that change what the site answers
+  (`Accept*`, `Content-Type`, `X-Requested-With`, the site's own `X-…`),
+  never a cookie, an authorization or the forwarding family, and the
+  browser's four `Sec-Fetch-*` headers (`Site`, `Mode`, `Dest`, `User`)
+  with every request a report carries — a Shield report the early layer
+  queued carries the refused request's — each cut to a short word such as
+  `cross-site`, `no-cors` or `image`. They hold no personal data: they say
+  how the browser was asked to send the request, never who sent it.
+  codesafe reads them to tell an image or a script another site's page made
+  a visitor's browser load from a request the visitor sent.
 - **Traffic rollups** carry counts under names WordPress itself defines —
   never a URL, an address, a user agent or a cookie.
 - **The inventory** says what is installed, never where or how it is

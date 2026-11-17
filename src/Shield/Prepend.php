@@ -372,6 +372,19 @@ final class Prepend
 	public const CONTEXT_FIELD_MAX = 512;
 	
 	/**
+	 * The browser's Fetch Metadata a refused request carried, kept with its
+	 * facts (contextOf()) as the Sender keeps them on its own requests:
+	 * codesafe reads them to tell a request a page on another site made a
+	 * visitor's browser send from one the visitor or a scanner sent.
+	 * Sender::FETCH_HEADERS restated: this layer references no other plugin
+	 * class. Tests\FetchMetadata holds both equal
+	 */
+	public const FETCH_HEADERS = ['sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user'];
+	
+	/** a Fetch Metadata value's characters at most: each is a short token */
+	public const FETCH_VALUE_MAX = 32;
+	
+	/**
 	 * Redactor's secret names and query names, restated: this layer references
 	 * no other plugin class, and a queued uri is scrubbed BEFORE it is written
 	 * (M13). Tests\Prepend holds both copies equal to Redactor's
@@ -2231,11 +2244,12 @@ final class Prepend
 	 * are somebody else's; the console's offender score follows the ip. The
 	 * uri and referer are scrubbed HERE, before the file holds them (scrubUri(),
 	 * M13) — the adapter scrubs them again with the Redactor on the drain;
-	 * the rest is raw (no WordPress to sanitize with)
+	 * the rest is raw (no WordPress to sanitize with) but the browser's Fetch
+	 * Metadata, kept as tokens under `headers` (fetchHeaders())
 	 *
 	 * @param array<string, mixed> $server
 	 * @param ?string $ip the visitor's address (clientIp()), REMOTE_ADDR by default
-	 * @return array<string, int|string>
+	 * @return array<string, int|string|array<string, string>>
 	 */
 	public static function contextOf(
 		array $server,
@@ -2257,8 +2271,46 @@ final class Prepend
 		{
 			$context['status'] = $status;
 		}
+		$headers = self::fetchHeaders($server);
+		if($headers !== [])
+		{
+			$context['headers'] = $headers;
+		}
 		
 		return $context;
+	}
+	
+	/**
+	 * FETCH_HEADERS out of a $_SERVER-shaped array, each value a token
+	 * (fetchToken()); a header without a token is left out
+	 *
+	 * @param array<mixed> $server
+	 * @return array<string, string>
+	 */
+	public static function fetchHeaders(
+		array $server,
+	): array
+	{
+		$headers = [];
+		foreach(self::FETCH_HEADERS as $name)
+		{
+			$value = $server['HTTP_' . strtoupper(str_replace('-', '_', $name))] ?? null;
+			$token = is_scalar($value) ? self::fetchToken((string)$value) : '';
+			if($token !== '')
+			{
+				$headers[$name] = $token;
+			}
+		}
+		
+		return $headers;
+	}
+	
+	/** a Fetch Metadata value as it is kept: lowercase, nothing but `[a-z0-9?-]`, FETCH_VALUE_MAX characters; '' for none */
+	public static function fetchToken(
+		string $value,
+	): string
+	{
+		return substr((string)preg_replace('~[^a-z0-9?-]~', '', strtolower($value)), 0, self::FETCH_VALUE_MAX);
 	}
 	
 	/** a value cut to $max bytes, never inside a UTF-8 character: the files are JSON, and a broken one fails the write */
