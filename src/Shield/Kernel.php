@@ -84,7 +84,10 @@ declare(strict_types=1);
  * The pull names `X-Shield-Kinds: match,rate,threat,vpatch,mode-block,observe-all`, and the door
  * serves each kind only to a kernel that names it, so a kernel older than
  * rate rules never reads one as a match rule; `observe-all` says a match
- * that only observes never ends judgement here.
+ * that only observes never ends judgement here. A host adapter adds
+ * `caller` or `caller-unknown` (Kernel::callerTold()): whether it tells who
+ * is signed in; a kernel whose host cannot is served the threat section to
+ * observe.
  *
  * Virtual patches (kind `vpatch`): an entry point, a parameter, a typed test
  * and WHO — `{who, conditions: [{target, decode, test, value, ci}]}`, every
@@ -120,12 +123,14 @@ declare(strict_types=1);
  * a zero and not a site that cannot say.
  *
  * Threat addresses (kind `threat`, served to a kernel that names it): a
- * `threats` section beside the rules — `{mode, pass, addresses}`, the
- * addresses codesafe saw send exploits. They are judged first: a request
- * from one that is not signed in and not to a `pass` path (where a person
- * behind the same NAT signs in) is blocked under enforce when the mode
- * blocks, else observed — counted as hits of the reserved rule 0, never
- * reported as an event, so a refusal never feeds the score that listed it.
+ * `threats` section beside the rules — `{mode, pass, pass_exact,
+ * addresses}`, the addresses codesafe saw send exploits. They are judged
+ * first: a request from one that is not signed in and not on its way to
+ * sign in (where a person behind the same NAT signs in: the script it runs
+ * ends in a `pass` path, or its whole path is a `pass_exact` one) is
+ * blocked under enforce when the mode blocks, else observed — counted as
+ * hits of the reserved rule 0, never reported as an event, so a refusal
+ * never feeds the score that listed it.
  *
  * Platform modules (Platform): what one platform's app makes of a request —
  * WordPress's REST routes and batches, its shortcode and block attributes,
@@ -2072,11 +2077,14 @@ final class Ruleset
 	
 	/**
 	 * The door's threat section, checked: a mode off the list, at most
-	 * PASSES_MAX pass paths (each `/…`, under PASS_MAX bytes), at most
-	 * THREATS_MAX addresses in their canonical form as a lookup map — an
-	 * address PHP cannot read is left out. Null when there is none
+	 * PASSES_MAX pass paths (each `/…`, under PASS_MAX bytes) of each kind —
+	 * `pass` (the end of the script's path) and `pass_exact` (the whole
+	 * path), the second kept only when one is left — at most THREATS_MAX
+	 * addresses in their canonical
+	 * form as a lookup map — an address PHP cannot read is left out. Null
+	 * when there is none
 	 *
-	 * @return ?array{mode: string, pass: list<string>, addresses: array<string, int>}
+	 * @return ?array{mode: string, pass: list<string>, pass_exact?: list<string>, addresses: array<string, int>}
 	 */
 	public static function threats(
 		mixed $section,
@@ -2087,13 +2095,17 @@ final class Ruleset
 		{
 			return null;
 		}
-		$pass = [];
-		foreach(is_array($section['pass'] ?? null) ? $section['pass'] : [] as $path)
+		$passes = ['pass' => [], 'pass_exact' => []];
+		foreach($passes as $kind => $kept)
 		{
-			if(is_string($path) && str_starts_with($path, '/') && strlen($path) <= self::PASS_MAX && count($pass) < self::PASSES_MAX)
+			foreach(is_array($section[$kind] ?? null) ? $section[$kind] : [] as $path)
 			{
-				$pass[] = $path;
+				if(is_string($path) && str_starts_with($path, '/') && strlen($path) <= self::PASS_MAX && count($kept) < self::PASSES_MAX)
+				{
+					$kept[] = $path;
+				}
 			}
+			$passes[$kind] = $kept;
 		}
 		$addresses = [];
 		foreach($section['addresses'] as $address)
@@ -2109,7 +2121,9 @@ final class Ruleset
 			}
 		}
 		
-		return ['mode' => $section['mode'], 'pass' => $pass, 'addresses' => $addresses];
+		// a section without exact paths keeps the shape it had before them
+		return ['mode' => $section['mode'], 'pass' => $passes['pass']]
+			+ ($passes['pass_exact'] === [] ? [] : ['pass_exact' => $passes['pass_exact']]) + ['addresses' => $addresses];
 	}
 	
 	/**
@@ -5566,6 +5580,20 @@ final class Kernel
 	public const KINDS = 'match,rate,threat,vpatch,mode-block,observe-all';
 	
 	/**
+	 * named after KINDS by a kernel whose host tells who is signed in (an
+	 * `authed` answer for every caller): the door serves its threat section
+	 * as the project's mode says
+	 */
+	public const KIND_CALLER = 'caller';
+	
+	/**
+	 * …and by one whose host cannot tell: the door serves it the threat
+	 * section to observe, so a signed-in visitor behind a listed address is
+	 * never refused. A kernel naming neither is served as before the words
+	 */
+	public const KIND_CALLER_UNKNOWN = 'caller-unknown';
+	
+	/**
 	 * the reports of match rules and vpatches one request sends at most
 	 * (reported()): the counters count every rule, and a sender's minute
 	 * budget for the Shield is shared with the blocks the alarm reads
@@ -5649,6 +5677,9 @@ final class Kernel
 	/** the key the stored record is sealed under (Ruleset::seal()): given, or derived from the API key (sealKey()) */
 	protected string $sealKey;
 	
+	/** whether the host tells who is signed in (callerTold()); null = nothing said */
+	protected ?bool $callerTold = null;
+	
 	/** @var array<string, array{width: ?int, cost: int}> what each pattern weighs (weighs()), by its `ci` and value */
 	protected static array $weights = [];
 	
@@ -5663,6 +5694,8 @@ final class Kernel
 	 * @param ?string $sealKey the key the stored record is sealed under, for a layer that holds it without the API key (the
 	 *     plugin's prepend, from its consent file); null derives it from the API key (sealKey()), which gives '' for none —
 	 *     and a kernel with '' reads no store
+	 * @param ?bool $callerTold whether the host tells who is signed in (callerTold()), for a kernel no host adapter is built
+	 *     around that pulls for one — a host's own tick; null says nothing
 	 */
 	public function __construct(
 		protected string $url,
@@ -5676,8 +5709,10 @@ final class Kernel
 		protected int $timeoutMs = self::TIMEOUT_MS,
 		protected array $platforms = [],
 		?string $sealKey = null,
+		?bool $callerTold = null,
 	)
 	{
+		$this->callerTold = $callerTold;
 		$this->sealKey = $sealKey ?? self::sealKey($key);
 		$this->url = rtrim($url, '/');
 		$this->http = $http === null ? null : Closure::fromCallable($http);
@@ -5697,6 +5732,34 @@ final class Kernel
 	public function store(): Store
 	{
 		return $this->store;
+	}
+	
+	/**
+	 * What the host says it can tell of the caller, named at every pull after
+	 * KINDS: true — it answers `authed` for every request (a site where
+	 * nobody signs in answers false for all) — names KIND_CALLER, false — it
+	 * cannot tell — names KIND_CALLER_UNKNOWN, and codesafe then serves the
+	 * threat section to observe; null names nothing (a kernel driven
+	 * directly). A host adapter sets it when it is built
+	 */
+	public function callerTold(
+		?bool $told,
+	): self
+	{
+		$this->callerTold = $told;
+		
+		return $this;
+	}
+	
+	/** what the pull names in X-Shield-Kinds: KINDS, and the caller word when the host said one (callerTold()) */
+	public function kinds(): string
+	{
+		return match($this->callerTold)
+		{
+			true => self::KINDS . ',' . self::KIND_CALLER,
+			false => self::KINDS . ',' . self::KIND_CALLER_UNKNOWN,
+			null => self::KINDS,
+		};
 	}
 	
 	/**
@@ -6070,8 +6133,9 @@ final class Kernel
 	/**
 	 * The threat section's word on this request: the pseudo-rule it is judged
 	 * by (id THREAT_RULE, the section's mode) when the address is listed, the
-	 * request is not signed in and the script it runs ends in none of the pass paths;
-	 * null otherwise
+	 * request is not signed in, the script it runs ends in none of the `pass`
+	 * paths and its path (path()) is none of the `pass_exact` ones; null
+	 * otherwise
 	 *
 	 * @return ?array{id: int, kind: string, mode: string}
 	 */
@@ -6094,6 +6158,11 @@ final class Kernel
 			{
 				return null;
 			}
+		}
+		// a project's own sign-in route, the whole path: an app's router runs another action for /a/b/login or /login/x
+		if(in_array($facts->path(), (array)($threats['pass_exact'] ?? []), true))
+		{
+			return null;
 		}
 		
 		return ['id' => Ruleset::THREAT_RULE, 'kind' => Ruleset::KIND_THREAT, 'mode' => (string)$threats['mode']];
@@ -6894,7 +6963,7 @@ final class Kernel
 		// codesafe reads only X-Console-Key
 		$platforms = implode(',', [self::PLATFORM_CORE, ...$this->platformWords()]);
 		$headers = ['X-Codesafe-Key: ' . $this->key, 'X-Console-Key: ' . $this->key, 'Accept: application/json',
-			self::HEADER_KINDS . ': ' . self::KINDS, self::HEADER_PLATFORMS . ': ' . $platforms];
+			self::HEADER_KINDS . ': ' . $this->kinds(), self::HEADER_PLATFORMS . ': ' . $platforms];
 		// what the last pull left out, so the door knows the site does not hold it
 		if($current !== null && $current->dropped !== [])
 		{
